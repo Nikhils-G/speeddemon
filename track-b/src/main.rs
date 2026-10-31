@@ -173,36 +173,58 @@ fn hash16(key: u128) -> u64 {
     h ^ (h >> 32)
 }
 
+/// Open addressing over (key, id) pairs; key 0 = empty. Key and id share a slot,
+/// so a probe touches one cache line, not one in a key array and one in an id array.
+/// Half of the tokens that reach this table are words no query uses; a 256 KB Bloom
+/// filter in front, which stays in L2, turns most of those away without a probe.
 #[derive(Default)]
 struct ShortTable {
-    keys: Vec<u128>, // 0 = empty
-    ids: Vec<u32>,
+    slots: Vec<(u128, u32)>,
+    bloom: Vec<u64>,
 }
+
+const BLOOM_BITS: u32 = 21;
 
 impl ShortTable {
     fn new(entries: impl Iterator<Item = (u128, u32)> + Clone) -> Self {
-        let slots = (entries.clone().count() * 2).next_power_of_two().max(16);
-        let mut table = ShortTable { keys: vec![0; slots], ids: vec![NOT_A_TERM; slots] };
+        let size = (entries.clone().count() * 2).next_power_of_two().max(16);
+        let mut table = ShortTable { slots: vec![(0, NOT_A_TERM); size], bloom: vec![0; 1 << (BLOOM_BITS - 6)] };
         for (key, id) in entries {
             let i = table.slot(key);
-            table.keys[i] = key;
-            table.ids[i] = id;
+            table.slots[i] = (key, id);
+            for bit in bloom_bits(key) {
+                table.bloom[bit / 64] |= 1 << (bit % 64);
+            }
         }
         table
     }
 
+    fn maybe_contains(&self, key: u128) -> bool {
+        bloom_bits(key).iter().all(|&bit| self.bloom[bit / 64] >> (bit % 64) & 1 == 1)
+    }
+
     fn slot(&self, key: u128) -> usize {
-        let mask = self.keys.len() - 1;
+        let mask = self.slots.len() - 1;
         let mut i = (hash16(key) >> 20) as usize & mask;
-        while self.keys[i] != key && self.keys[i] != 0 {
+        while self.slots[i].0 != key && self.slots[i].0 != 0 {
             i = (i + 1) & mask;
         }
         i
     }
 
     fn get(&self, key: u128) -> u32 {
-        self.ids[self.slot(key)]
+        if !self.maybe_contains(key) {
+            return NOT_A_TERM;
+        }
+        self.slots[self.slot(key)].1
     }
+}
+
+/// Two positions in the Bloom filter, from independent bits of the key's hash.
+fn bloom_bits(key: u128) -> [usize; 2] {
+    let h = hash16(key);
+    let mask = (1 << BLOOM_BITS) - 1;
+    [(h & mask) as usize, ((h >> 40) & mask) as usize]
 }
 
 impl Terms {
@@ -263,52 +285,127 @@ impl Terms {
     }
 }
 
-/// One thread's tokenizer. Word frequencies are Zipfian, so a small direct-mapped
-/// cache of recent token -> term id answers most lookups from L1/L2.
+/// One thread's tokenizer. Word frequencies are Zipfian, so a direct-mapped cache
+/// of recent token -> term id answers most lookups from L1/L2.
 struct Tokenizer<'a> {
     terms: &'a Terms,
-    hot_keys: Vec<u128>,
-    hot_ids: Vec<u32>,
+    /// Per term id, how the scan uses it (see `Plan::info`); empty while sampling.
+    info: &'a [u32],
+    /// (key, term id, info): a hit answers everything about the token at once.
+    hot: Vec<(u128, u32, u32)>,
+    /// The current document, ASCII-lowercased, with 16 bytes of zero padding so a
+    /// 16-byte key load at any token start stays in bounds.
+    lower: Vec<u8>,
+    /// Token boundaries in `lower`: token k is `starts[k]..ends[k]`.
+    starts: Vec<u32>,
+    ends: Vec<u32>,
 }
 
-const HOT_SLOTS: usize = 1 << 13;
+const HOT_SLOTS: usize = 1 << 14;
 
 impl<'a> Tokenizer<'a> {
-    fn new(terms: &'a Terms) -> Self {
-        Tokenizer { terms, hot_keys: vec![0; HOT_SLOTS], hot_ids: vec![0; HOT_SLOTS] }
+    fn new(terms: &'a Terms, info: &'a [u32]) -> Self {
+        Tokenizer { terms, info, hot: vec![(0, NOT_A_TERM, 0); HOT_SLOTS], lower: Vec::new(), starts: Vec::new(), ends: Vec::new() }
     }
 
-    fn lookup(&mut self, key: u128) -> u32 {
+    fn info_of(&self, id: u32) -> u32 {
+        self.info.get(id as usize).copied().unwrap_or(0)
+    }
+
+    fn lookup(&mut self, key: u128) -> (u32, u32) {
         let i = hash16(key) as usize & (HOT_SLOTS - 1);
-        if self.hot_keys[i] != key {
-            self.hot_keys[i] = key;
-            self.hot_ids[i] = self.terms.short.get(key);
+        if self.hot[i].0 != key {
+            let id = self.terms.short.get(key);
+            self.hot[i] = (key, id, self.info_of(id));
         }
-        self.hot_ids[i]
+        (self.hot[i].1, self.hot[i].2)
     }
 
-    /// Calls `f` with each token of `text` (ASCII-lowercased, maximal runs of
-    /// [a-z0-9]), mapped to its query-term id or NOT_A_TERM.
-    fn for_each_token(&mut self, text: &[u8], mut f: impl FnMut(u32)) {
-        let mut buf = [0u8; MAX_TERM];
-        let mut len = 0usize; // length of the current token; it may exceed MAX_TERM
-        for &byte in text.iter().chain(std::iter::once(&b' ')) {
-            let lower = byte | ((byte.is_ascii_uppercase() as u8) << 5);
-            if lower.is_ascii_lowercase() || lower.is_ascii_digit() {
-                if len < MAX_TERM {
-                    buf[len] = lower;
+    /// Calls `f(id, info)` with each token of `text` (ASCII-lowercased, maximal runs
+    /// of [a-z0-9]), mapped to its query-term id or NOT_A_TERM (info 0).
+    fn for_each_token(&mut self, text: &[u8], mut f: impl FnMut(u32, u32)) {
+        self.split(text);
+        let (starts, ends) = (std::mem::take(&mut self.starts), std::mem::take(&mut self.ends));
+        for (&start, &end) in starts.iter().zip(&ends) {
+            let (start, len) = (start as usize, (end - start) as usize);
+            let (id, info) = match len {
+                ..=16 => {
+                    let bytes: [u8; 16] = self.lower[start..start + 16].try_into().unwrap();
+                    let keep = if len == 16 { u128::MAX } else { (1u128 << (8 * len)) - 1 };
+                    self.lookup(u128::from_le_bytes(bytes) & keep)
                 }
-                len += 1;
-            } else if len > 0 {
-                f(match len {
-                    ..=16 => self.lookup(key16(&buf[..len])),
-                    ..=MAX_TERM => self.terms.get(&buf[..len]).unwrap_or(NOT_A_TERM),
-                    _ => NOT_A_TERM,
-                });
-                len = 0;
-            }
+                ..=MAX_TERM => {
+                    let id = self.terms.get(&self.lower[start..start + len]).unwrap_or(NOT_A_TERM);
+                    (id, self.info_of(id))
+                }
+                _ => (NOT_A_TERM, 0),
+            };
+            f(id, info);
+        }
+        (self.starts, self.ends) = (starts, ends);
+    }
+
+    /// Lowercases `text` into `lower` and records where every token starts and
+    /// ends, 32 bytes at a time: one vector pass classifies the bytes, and the
+    /// token boundaries are the edges of the resulting bitmask.
+    fn split(&mut self, text: &[u8]) {
+        let blocks = text.len().div_ceil(32);
+        self.lower.clear();
+        self.lower.resize(blocks * 32 + 16, 0);
+        self.starts.clear();
+        self.ends.clear();
+        let mut carry = 0u32; // 1 if the byte before this block is a token byte
+        for b in 0..blocks {
+            let at = b * 32;
+            let mut block = [0u8; 32]; // zero is a separator, so padding ends tokens
+            let take = (text.len() - at).min(32);
+            block[..take].copy_from_slice(&text[at..at + take]);
+            let mask = classify(&block, (&mut self.lower[at..at + 32]).try_into().unwrap());
+            let before = mask << 1 | carry;
+            push_bits(&mut self.starts, mask & !before, at);
+            push_bits(&mut self.ends, !mask & before, at);
+            carry = mask >> 31;
+        }
+        if carry == 1 {
+            self.ends.push((blocks * 32) as u32);
         }
     }
+}
+
+/// Appends `at + i` for every set bit i of `bits`, lowest first.
+fn push_bits(out: &mut Vec<u32>, mut bits: u32, at: usize) {
+    while bits != 0 {
+        out.push(at as u32 + bits.trailing_zeros());
+        bits &= bits - 1;
+    }
+}
+
+/// Writes the ASCII-lowercased block to `lower` and returns a mask with bit i set
+/// when byte i is a token byte ([a-z0-9] after lowercasing).
+#[cfg(target_feature = "avx2")]
+fn classify(block: &[u8; 32], lower: &mut [u8; 32]) -> u32 {
+    use std::arch::x86_64::*;
+    // SAFETY: unaligned 32-byte load and store of 32-byte arrays.
+    unsafe {
+        let v = _mm256_loadu_si256(block.as_ptr() as *const __m256i);
+        let between = |x, lo: u8, hi: u8| {
+            _mm256_and_si256(_mm256_cmpgt_epi8(x, _mm256_set1_epi8(lo as i8 - 1)), _mm256_cmpgt_epi8(_mm256_set1_epi8(hi as i8 + 1), x))
+        };
+        // Signed compares: bytes 0x80 and up are negative, so never letters or digits.
+        let low = _mm256_or_si256(v, _mm256_and_si256(between(v, b'A', b'Z'), _mm256_set1_epi8(0x20)));
+        _mm256_storeu_si256(lower.as_mut_ptr() as *mut __m256i, low);
+        _mm256_movemask_epi8(_mm256_or_si256(between(low, b'a', b'z'), between(v, b'0', b'9'))) as u32
+    }
+}
+
+#[cfg(not(target_feature = "avx2"))]
+fn classify(block: &[u8; 32], lower: &mut [u8; 32]) -> u32 {
+    let mut mask = 0;
+    for (i, (&byte, out)) in block.iter().zip(lower.iter_mut()).enumerate() {
+        *out = byte.to_ascii_lowercase();
+        mask |= ((out.is_ascii_lowercase() || out.is_ascii_digit()) as u32) << i;
+    }
+    mask
 }
 
 /// How the scan treats each query term, decided from a sample before it starts.
@@ -322,8 +419,15 @@ struct Plan {
     /// as (phrase, position of t in the phrase).
     anchor_start: Vec<u32>,
     anchored: Vec<(u32, u32)>,
+    /// Per term, everything the scan needs in one word: ANCHOR if some phrase is
+    /// anchored on it, then SPARSE, or DENSE with the bitset index in the low bits.
+    info: Vec<u32>,
 }
 
+const ANCHOR: u32 = 1 << 31;
+const SPARSE_BIT: u32 = 1 << 30;
+const DENSE_BIT: u32 = 1 << 29;
+const DENSE_INDEX: u32 = DENSE_BIT - 1;
 const NOT_BOOL: u32 = u32::MAX;
 const SPARSE: u32 = u32::MAX - 1;
 const SAMPLE_DOCS: u32 = 1000;
@@ -335,11 +439,11 @@ impl Plan {
         let term_count = terms.names.len();
         let mut df = vec![0u32; term_count];
         let mut seen_in = vec![u32::MAX; term_count];
-        let mut tokenizer = Tokenizer::new(terms);
+        let mut tokenizer = Tokenizer::new(terms, &[]);
         let (mut sampled, mut i) = (0u32, 0);
         while i < docs.len() && sampled < SAMPLE_DOCS {
             let (text, end) = document(docs, i)?;
-            tokenizer.for_each_token(text, |t| {
+            tokenizer.for_each_token(text, |t, _| {
                 if t != NOT_A_TERM && seen_in[t as usize] != sampled {
                     seen_in[t as usize] = sampled;
                     df[t as usize] += 1;
@@ -350,7 +454,7 @@ impl Plan {
         }
 
         let mut dense_terms = 0;
-        let storage = (0..term_count)
+        let storage: Vec<u32> = (0..term_count)
             .map(|t| match terms.in_bool[t] {
                 false => NOT_BOOL,
                 true if df[t] * 32 > sampled => {
@@ -379,7 +483,18 @@ impl Plan {
             anchor_start[t + 1] += anchor_start[t];
         }
         let anchored = by_term.into_iter().map(|(_, p, at)| (p, at)).collect();
-        Ok(Plan { storage, dense_terms, docs: doc_count(docs)?, anchor_start, anchored })
+        let info = (0..term_count)
+            .map(|t| {
+                let anchor = if anchor_start[t] != anchor_start[t + 1] { ANCHOR } else { 0 };
+                anchor
+                    | match storage[t] {
+                        NOT_BOOL => 0,
+                        SPARSE => SPARSE_BIT,
+                        d => DENSE_BIT | d,
+                    }
+            })
+            .collect();
+        Ok(Plan { storage, dense_terms, docs: doc_count(docs)?, anchor_start, anchored, info })
     }
 
     fn anchored(&self, term: u32) -> &[(u32, u32)] {
@@ -509,7 +624,7 @@ impl Index {
 
 fn scan(slice: &[u8], terms: &Terms, plan: &Plan, phrases: &[Vec<u32>], bits: &[AtomicU64], words: usize) -> Result<Scan, String> {
     let mut out = Scan { pairs: Vec::new(), counts: vec![0; terms.names.len()], phrase_hits: Vec::new() };
-    let mut tokenizer = Tokenizer::new(terms);
+    let mut tokenizer = Tokenizer::new(terms, &plan.info);
     // The last document that emitted each term and each phrase, to emit once per doc.
     let mut term_doc = vec![u32::MAX; terms.names.len()];
     let mut phrase_doc = vec![u32::MAX; phrases.len()];
@@ -525,21 +640,22 @@ fn scan(slice: &[u8], terms: &Terms, plan: &Plan, phrases: &[Vec<u32>], bits: &[
         }
         tokens.clear();
         anchors.clear();
-        tokenizer.for_each_token(text, |t| {
-            if t != NOT_A_TERM {
-                let storage = plan.storage[t as usize];
-                if storage != NOT_BOOL && term_doc[t as usize] != doc {
-                    term_doc[t as usize] = doc;
-                    if storage == SPARSE {
-                        out.pairs.push((t as u64) << 32 | doc as u64);
-                        out.counts[t as usize] += 1;
-                    } else {
-                        bits[storage as usize * words + doc as usize / 64].fetch_or(1 << (doc % 64), Relaxed);
-                    }
+        tokenizer.for_each_token(text, |t, info| {
+            if info & DENSE_BIT != 0 {
+                // Setting a bit twice is harmless, so dense terms need no per-doc check;
+                // reading first skips the locked write when the bit is already set.
+                let word = &bits[(info & DENSE_INDEX) as usize * words + doc as usize / 64];
+                let bit = 1 << (doc % 64);
+                if word.load(Relaxed) & bit == 0 {
+                    word.fetch_or(bit, Relaxed);
                 }
-                if plan.anchor_start[t as usize] != plan.anchor_start[t as usize + 1] {
-                    anchors.push(tokens.len() as u32);
-                }
+            } else if info & SPARSE_BIT != 0 && term_doc[t as usize] != doc {
+                term_doc[t as usize] = doc;
+                out.pairs.push((t as u64) << 32 | doc as u64);
+                out.counts[t as usize] += 1;
+            }
+            if info & ANCHOR != 0 {
+                anchors.push(tokens.len() as u32);
             }
             tokens.push(t);
         });
