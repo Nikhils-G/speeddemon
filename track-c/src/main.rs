@@ -29,6 +29,7 @@ mod mmap;
 use std::cell::UnsafeCell;
 use std::fs::File;
 use std::io::Write;
+use std::os::unix::fs::FileExt;
 use std::sync::Barrier;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering::Relaxed};
 use std::thread;
@@ -46,6 +47,8 @@ const PARTITIONS: usize = 1 << PARTITION_BITS;
 /// Name-table slots per partition for the first attempt: the spec's 100,000 names
 /// are about 1,560 per partition.
 const FIRST_SLOTS: usize = 1 << 11;
+/// Bytes per read of records.csv.
+const READ: usize = 1 << 17;
 
 fn main() {
     mmap::no_huge_pages();
@@ -59,14 +62,17 @@ fn main() {
 }
 
 fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
-    let open = |name: &str| -> Result<&'static [u8], String> {
+    let open = |name: &str| -> Result<(File, &'static [u8]), String> {
         let path = format!("{data_dir}/{name}");
         let file = File::open(&path).map_err(|e| format!("open {path}: {e}"))?;
-        mmap::map(&file).map_err(|e| format!("mmap {path}: {e}"))
+        let text = mmap::map(&file).map_err(|e| format!("mmap {path}: {e}"))?;
+        Ok((file, text))
     };
     let threads = thread::available_parallelism().map_or(1, |n| n.get());
-    let regions = Regions::parse(open("regions.csv")?, threads)?;
-    let records = open("records.csv")?;
+    let regions = Regions::parse(open("regions.csv")?.1, threads)?;
+    // records.csv is mapped for finding the cuts, which looks at a few bytes each,
+    // and read through small buffers for parsing (see `parse_run`).
+    let (file, records) = open("records.csv")?;
 
     // The header is the first record; everything after it is data.
     let body_start = skip_header(records)?;
@@ -74,14 +80,14 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
     let (mut starts, mut guessed) = (guessed_starts(records, body_start, units), true);
     let mut slots = FIRST_SLOTS;
     let parts = loop {
-        match aggregate(records, &starts, threads, &regions, slots) {
+        match aggregate(&file, records.len(), &starts, threads, &regions, slots) {
             Ok(parts) => break parts,
             Err(ParseError::NamesFull) => slots *= 2,
             // A wrong guessed cut shows up as a misaligned run or as a parse error.
             Err(ParseError::Misaligned | ParseError::Bad(_)) if guessed => {
                 (starts, guessed) = (record_starts(records, body_start, units), false);
             }
-            Err(ParseError::Misaligned) => return Err("records.csv: a record crosses a run boundary".into()),
+            Err(ParseError::Misaligned) => return Err(format!("records.csv: a record is longer than {READ} bytes")),
             Err(ParseError::Bad(message)) => return Err(message),
         }
     };
@@ -120,13 +126,13 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
 
 /// Parses and aggregates every run, one round of `threads` runs at a time, and
 /// returns each thread's totals.
-fn aggregate(text: &[u8], starts: &[usize], threads: usize, regions: &Regions, slots: usize) -> Result<Vec<Vec<Totals>>, ParseError> {
+fn aggregate(file: &File, len: usize, starts: &[usize], threads: usize, regions: &Regions, slots: usize) -> Result<Vec<Vec<Totals>>, ParseError> {
     let groups = regions.keys.len();
     let words = groups.div_ceil(64);
     let partitions: Vec<Turns<Partition>> = (0..PARTITIONS).map(|_| Turns::new(Partition::new(slots, words))).collect();
     // Pairs per thread per partition in one run, with room to spare (records are
     // about 60 bytes), so the buffers are allocated once.
-    let capacity = text.len() / (starts.len() * 60 * PARTITIONS) * 5 / 4 + 16;
+    let capacity = len / (starts.len() * 60 * PARTITIONS) * 5 / 4 + 16;
     let pairs: Vec<Turns<Vec<Vec<u64>>>> = (0..threads).map(|_| Turns::new(vec![Vec::with_capacity(capacity); PARTITIONS])).collect();
     let next_partition: Vec<AtomicUsize> = (0..ROUNDS).map(|_| AtomicUsize::new(0)).collect();
     let barrier = Barrier::new(threads);
@@ -136,6 +142,7 @@ fn aggregate(text: &[u8], starts: &[usize], threads: usize, regions: &Regions, s
                 let (partitions, pairs, next_partition, barrier) = (&partitions, &pairs, &next_partition, &barrier);
                 s.spawn(move || {
                     let mut totals = vec![Totals::default(); groups];
+                    let mut buffer = vec![0; READ];
                     let mut error = None;
                     for round in 0..ROUNDS {
                         let run = round * threads + w;
@@ -143,7 +150,7 @@ fn aggregate(text: &[u8], starts: &[usize], threads: usize, regions: &Regions, s
                             // SAFETY: while parsing, each thread touches only its own buffers.
                             let mine = unsafe { pairs[w].get() };
                             mine.iter_mut().for_each(Vec::clear);
-                            match parse_run(text, starts[run], starts[run + 1], regions, &mut totals, mine) {
+                            match parse_run(file, len, starts[run], starts[run + 1], &mut buffer, regions, &mut totals, mine) {
                                 Ok(end) if end == starts[run + 1] => {}
                                 Ok(_) => error = Some(ParseError::Misaligned),
                                 Err(e) => error = Some(e),
@@ -450,20 +457,45 @@ fn guessed_starts(text: &[u8], from: usize, parts: usize) -> Vec<usize> {
     starts
 }
 
-/// Parses the records in `text[start..end]`, adds them to `totals`, and files each
-/// record's (name hash, group) pair under its partition. Returns where the last
-/// record ended, which is `end` when `start` and `end` are record starts.
-fn parse_run(text: &[u8], start: usize, end: usize, regions: &Regions, totals: &mut [Totals], pairs: &mut [Vec<u64>]) -> Result<usize, ParseError> {
-    let bad = |at: usize, what: &str| ParseError::Bad(format!("records.csv byte {at}: {what}"));
-    let mut scan = Scanner::new(text, start);
-    let mut i = start;
-    while i < end {
+/// Reads `[start, end)` of records.csv through `buffer`, parses its records into
+/// `totals`, and files each record's (name hash, group) pair under its partition.
+/// Returns where parsing stopped, which is `end` when both are record starts.
+/// Reading instead of mapping skips a page fault per 16 pages and, at exit, the
+/// kernel unmapping 50,000 page-cache pages one by one (9 ms on the test server).
+/// The page cache is not charged to this process; only the small buffer is.
+#[allow(clippy::too_many_arguments)]
+fn parse_run(file: &File, len: usize, start: usize, end: usize, buffer: &mut [u8], regions: &Regions, totals: &mut [Totals], pairs: &mut [Vec<u64>]) -> Result<usize, ParseError> {
+    let mut at = start;
+    while at < end {
+        let piece = &mut buffer[..READ.min(end - at)];
+        file.read_exact_at(piece, at as u64).map_err(|e| ParseError::Bad(format!("read records.csv: {e}")))?;
+        match parse_records(piece, at, at + piece.len() == len, regions, totals, pairs)? {
+            // No whole record in the piece: one crosses `end` (a wrong guessed
+            // cut), or is longer than the buffer.
+            0 => return Err(ParseError::Misaligned),
+            used => at += used,
+        }
+    }
+    Ok(at)
+}
+
+/// Parses the whole records at the start of `text`, which sits at byte `base` of
+/// the file, and returns their length. The last record may lack its terminator
+/// only if `text` ends at the end of the file (`last`).
+fn parse_records(text: &[u8], base: usize, last: bool, regions: &Regions, totals: &mut [Totals], pairs: &mut [Vec<u64>]) -> Result<usize, ParseError> {
+    let bad = |at: usize, what: &str| ParseError::Bad(format!("records.csv byte {}: {what}", base + at));
+    let mut scan = Scanner::new(text, 0);
+    let mut i = 0;
+    while i < text.len() {
         let id_start = if text[i..].starts_with(BOM) { i + BOM.len() } else { i }; // not data
         let (id_end, q0) = scan.next();
         let (name_end, q1) = scan.next();
         let (note_end, q2) = scan.next();
         let (region_end, _) = scan.next();
         let (amount_end, _) = scan.next();
+        if amount_end == text.len() && !last {
+            break; // the record goes on past the end of `text`
+        }
         let commas = [id_end, name_end, note_end, region_end].iter().all(|&e| text.get(e) == Some(&b','));
         if !commas || amount_end < text.len() && text[amount_end] != b'\n' {
             return Err(bad(i, "expected five fields and a record terminator"));
