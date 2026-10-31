@@ -81,8 +81,7 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
     if doc_count > 1 << 20 {
         return Err(format!("docs.txt: {doc_count} documents is more than this program supports (2^20)"));
     }
-    // One thread per core: two hyperthreads would share a core's L2.
-    let slices = slices(text, thread::available_parallelism().map_or(1, |n| n.get()).min(6))?;
+    let slices = slices(text, thread::available_parallelism().map_or(1, |n| n.get()))?;
     let nb = vocab.bool_terms as usize;
 
     // Sample the start of every slice for each term's document frequency.
@@ -723,8 +722,8 @@ impl<'a> Scan<'a> {
         if id % 64 == 0 && self.n > 0 {
             self.end_block(id - 64);
         }
-        // At the first id of a slice after the first, this evaluates an empty
-        // superblock: harmless.
+        // At the first id of a slice, this may evaluate an empty superblock:
+        // harmless.
         if id % SUPER == 0 && id > 0 {
             self.end_super(id - SUPER);
         }
@@ -771,7 +770,8 @@ impl<'a> Scan<'a> {
                 for e in &plan.entries[plan.group[t] as usize..plan.group[t + 1] as usize] {
                     let bit = |b: u32| 0u64.wrapping_sub((b & 1) as u64);
                     let r = e.terms.iter().fold(0u64, |r, &word| {
-                        let x = w[(word & TERM) as usize];
+                        // SAFETY: the plan's slots are below w.len().
+                        let x = unsafe { *w.get_unchecked((word & TERM) as usize) };
                         // AND: r & x. NOT: r & !x. OR: (r & !x) | x = r | x.
                         (r & (x ^ bit(word >> 30))) | (x & bit(word >> 31))
                     });
@@ -837,18 +837,22 @@ impl Answers {
 
     /// Adds the documents `base + i` for each bit i of `hits`, which may be 0.
     fn add(&mut self, answer: u32, hits: u64, base: u32) {
-        let s = &mut self.state[answer as usize];
+        // SAFETY: answers index the state; an answer logs at most 10 ids, so
+        // logged <= 10 * answers < log.len().
+        let (s, log) = unsafe { (&mut *self.state.as_mut_ptr().add(answer as usize), self.log.as_mut_ptr()) };
         let count = *s >> SUM_BITS;
         let entry = |bits: u64| (answer as u64) << 32 | (base + bits.trailing_zeros()) as u64;
         // The first id without a branch: always written, kept only if wanted.
-        self.log[self.logged] = entry(hits);
+        // SAFETY: as above.
+        unsafe { *log.add(self.logged) = entry(hits) };
         self.logged += (count < 10 && hits != 0) as usize;
         let mut rest = hits & hits.wrapping_sub(1);
         for _ in count + 1..10 {
             if rest == 0 {
                 break;
             }
-            self.log[self.logged] = entry(rest);
+            // SAFETY: as above.
+            unsafe { *log.add(self.logged) = entry(rest) };
             self.logged += 1;
             rest &= rest - 1;
         }
@@ -864,6 +868,10 @@ impl Answers {
     /// `add` for the 256 documents from `base`, one word of `hits` per 64.
     fn add_wide(&mut self, answer: u32, hits: __m256i, base: u32) {
         if self.state[answer as usize] >> SUM_BITS < 10 {
+            // SAFETY: AVX2 is enabled for the whole build.
+            if unsafe { _mm256_testz_si256(hits, hits) } == 1 {
+                return;
+            }
             // Still logging first ids: a word at a time.
             // SAFETY: __m256i and [u64; 4] have the same size, and any bits are valid.
             let words: [u64; 4] = unsafe { std::mem::transmute(hits) };
@@ -954,23 +962,17 @@ fn movemask(v: __m256i) -> u32 {
     mask
 }
 
-/// Splits the corpus into about `parts` ranges of whole lines, each starting at a
-/// document whose id is a multiple of SUPER, so no superblock straddles two threads.
+/// Splits the corpus into about `parts` ranges of whole lines. A block or
+/// superblock may straddle two slices: each thread sees the other's documents
+/// as containing no term, so they match nothing there.
 /// Returns (start, end, first id) per slice.
 fn slices(text: &[u8], parts: usize) -> Result<Vec<(usize, usize, u32)>, String> {
     let mut starts: Vec<(usize, u32)> = Vec::new();
     for p in 0..parts {
-        let mut at = if p == 0 { 0 } else { line_end(text, text.len() * p / parts) };
-        while at < text.len() {
+        let at = if p == 0 { 0 } else { line_end(text, text.len() * p / parts) };
+        if at < text.len() && starts.last().is_none_or(|&(s, _)| s < at) {
             let tab = text[at..].iter().position(|&b| b == b'\t').ok_or("docs.txt: a line without a TAB")?;
-            let id = parse_id(&text[at..at + tab])?;
-            if id % SUPER == 0 {
-                if starts.last().is_none_or(|&(s, _)| s < at) {
-                    starts.push((at, id));
-                }
-                break;
-            }
-            at = line_end(text, at);
+            starts.push((at, parse_id(&text[at..at + tab])?));
         }
     }
     Ok((starts.iter().enumerate()).map(|(i, &(s, id))| (s, starts.get(i + 1).map_or(text.len(), |n| n.0), id)).collect())
