@@ -15,6 +15,7 @@ unchanged code took 0.361 s instead of 0.265 (the box was disturbed), so single 
 | 6 | 5c7b09a | No index at all: every query answered during one scan, BOOL queries per block of 64 documents (see README) | run-de33f090eda0 | 0.267 | 38.4 | 910 | 67.6 |
 | 7 | 20856e2 | Exit right after writing; each slice's pages dropped by its thread | run-cc0e62d06c76 | 0.265 | 39.1 | 922 | 67.6 |
 | 8 | 196434d | Queries with common cover terms evaluated once per 256 documents with AVX2; lookups gathered per document with their buckets prefetched; one term table instead of hot table + Bloom filter | run-1a4ed151ee61 | 0.199 | 41.5 | 1,028 | 70.4 |
+| 9 | 15bc6b2 | Leaner tokenizer; branch-free table probe (inline-asm cmov) | run-058dad4dcdce | 0.171 | 41.7 | 1,081 | 71.9 |
 
 ## What each step taught
 

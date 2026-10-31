@@ -25,6 +25,8 @@ each, before pushing.
 | 15 | 1342bda | One endpoint table shared by the parse threads (CAS inserts), so no serial merge; statically linked binary | run-8e8d92a5861d | 0.0219 | 20.6 | 626 | 81.7 |
 | 16 | a1cf30b | The log read through 128 KB buffers per thread instead of mapped; whole names kept in the shared table | run-54e9c5f0e0dd, run-d395d2691d9d | 0.0236, 0.0244 | 21.4 | 610 | 80.8 |
 | 17 | (revert) | Back to the mapped input of step 15: 1 ms faster on the test server, 2 ms slower on the box | | | | | |
+| 18 | 6ca21c8 | Endpoint table with 8x as many slots as endpoints (11% load instead of 45%) | run-f67608cbf0d2 | 0.0227 | 20.9 | 626 | 81.2 |
+| 19 | 58c7dc8 | Pass 2 threads no longer wait for the previous hour's end: each publishes its hour's length, keeps the hour pending and takes the next | run-23cc1c0061e6 | 0.0198 | 20.1 | 659 | 82.8 |
 
 ## What each step taught
 

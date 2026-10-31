@@ -25,7 +25,7 @@ much higher than the box's, so only the board decided what stayed.
 | 15 | eb2cf64 | Per-record fast path (one 64-byte bitmap window, one 32-byte tail compare, one AVX2 number pass); batched dedupe; mallopt top pad; regions passes in the parse threads | run-db85f475f012 | 0.0268 | 16.0 | 914 | 75.0 |
 | 16 | 007cea6 | Fewer lines: a byte-by-byte spec 2.1 parser replaces the SIMD general scanner; regions.csv in one pass, groups numbered as first seen and sorted at output; worker 0 is the main thread and exits right after writing; std locks instead of `UnsafeCell` | run-20006a569215 | 0.0273 | 16.2 | 753 | 75.3 |
 | 17 | 48290f6 | One-pass digit loop for regions.csv; name and note bytes packed in one column; branchy min/max; fast-path bounds check out of the loop | run-bf1770e98008 | 0.0260 | 16.7 | 740 | 75.8 |
-| 18 | 2bf221c | Each thread owns 4 name partitions (threads × 4) in every round: no locks, tables stay in its cache | | | | 733 | |
+| 18 | 2bf221c | Each thread owns 4 name partitions (threads × 4) in every round: no locks, tables stay in its cache | run-b9a64cd5e4d6 | 0.0258 | 15.5 | 733 | 76.2 |
 
 ## What each step taught
 
