@@ -512,18 +512,31 @@ fn masks(block: &[u8; 64]) -> (u64, u64) {
         use std::arch::x86_64::*;
         // SAFETY: AVX2 is enabled for this build (the cfg), and the two unaligned
         // 32-byte loads are inside the 64-byte array.
-        let bits = |byte: u8| unsafe {
-            let wanted = _mm256_set1_epi8(byte as i8);
-            let eq = |at: usize| _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256(block.as_ptr().add(at).cast()), wanted)) as u32 as u64;
-            eq(0) | eq(32) << 32
-        };
-        (bits(b'"'), bits(b',') | bits(b'\n'))
+        unsafe {
+            let (lo, hi) = (_mm256_loadu_si256(block.as_ptr().cast()), _mm256_loadu_si256(block.as_ptr().add(32).cast()));
+            let eq = |v, byte: u8| _mm256_cmpeq_epi8(v, _mm256_set1_epi8(byte as i8));
+            let separators = |v| _mm256_or_si256(eq(v, b','), eq(v, b'\n'));
+            let bits = |lo, hi| movemask(lo) as u64 | (movemask(hi) as u64) << 32;
+            (bits(eq(lo, b'"'), eq(hi, b'"')), bits(separators(lo), separators(hi)))
+        }
     }
     #[cfg(not(target_feature = "avx2"))]
     {
         let bits = |hit: fn(u8) -> bool| block.iter().rev().fold(0u64, |acc, &b| acc << 1 | hit(b) as u64);
         (bits(|b| b == b'"'), bits(|b| b == b',' || b == b'\n'))
     }
+}
+
+/// `vpmovmskb`, kept opaque to the optimizer. LLVM rewrites the intrinsic as a
+/// vector of booleans, and on CPUs without AVX-512 (the scoring box) it then
+/// assembled our 64-bit masks one bit at a time: a quarter of the run time.
+#[cfg(target_feature = "avx2")]
+#[inline(always)]
+fn movemask(v: std::arch::x86_64::__m256i) -> u32 {
+    let mask: u32;
+    // SAFETY: AVX2 is enabled for this build; the instruction reads one register.
+    unsafe { std::arch::asm!("vpmovmskb {0:e}, {1}", out(reg) mask, in(ymm_reg) v, options(pure, nomem, nostack)) };
+    mask
 }
 
 /// Bit k of the result is the XOR of bits 0..=k. Applied to quote bits, it tells
