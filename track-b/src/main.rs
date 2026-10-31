@@ -97,14 +97,12 @@ fn main() {
         let next = slices.get(i + 1).map_or(scan.doc + 1, |s| s.2);
         let ok = slices[0].2 == 0 && next == scan.doc + 1 && scan.doc < 1 << 20;
         assert!(ok, "docs.txt: ids must be 0, 1, 2, ... below 2^20");
-        let state = &scan.answers.state;
-        let state = plan.answer_of.iter().map(|&a| state[a as usize]);
-        (state.collect(), log)
+        (scan.answers.state, log)
     });
 
     // Format in parallel, one range of lines per thread.
     let (lines, parts) = (plan.lines, slices.len().max(1));
-    let chunks = par(parts, |p| format_lines(&results, part(lines, p, parts)));
+    let chunks = par(parts, |p| format_lines(&results, &plan.answer_of, part(lines, p, parts)));
     let mut file = std::fs::File::create(format!("{out_dir}/results.txt")).expect("results.txt");
     for chunk in chunks {
         std::io::Write::write_all(&mut file, &chunk).expect("write results.txt");
@@ -127,9 +125,10 @@ fn part(len: usize, p: usize, parts: usize) -> std::ops::Range<usize> {
     len * p / parts..len * (p + 1) / parts
 }
 
-/// The output for `lines`: per line, the threads' counts and sums added up, and
+/// The output for `lines`: per line, the threads' counts and sums added up (from
+/// the state of its answer: no copy of the states, which would cost 4.5 MB), and
 /// the first ten ids taken from the threads in slice order.
-fn format_lines(results: &[(Vec<u64>, Vec<u64>)], lines: std::ops::Range<usize>) -> Vec<u8> {
+fn format_lines(results: &[(Vec<u64>, Vec<u64>)], answer_of: &[u32], lines: std::ops::Range<usize>) -> Vec<u8> {
     // Per line: the count, the sum, then the first ids.
     let (mut out, mut fields) = (Vec::with_capacity(lines.len() * 32), Vec::new());
     let first = |log: &Vec<u64>| log.partition_point(|&e| e >> 32 < lines.start as u64);
@@ -138,8 +137,8 @@ fn format_lines(results: &[(Vec<u64>, Vec<u64>)], lines: std::ops::Range<usize>)
         fields.clear();
         fields.extend([0, 0]);
         for ((state, log), cursor) in results.iter().zip(&mut cursors) {
-            fields[0] += state[line] >> SUM_BITS;
-            fields[1] += state[line] & ((1 << SUM_BITS) - 1);
+            let s = state[answer_of[line] as usize];
+            (fields[0], fields[1]) = (fields[0] + (s >> SUM_BITS), fields[1] + (s & ((1 << SUM_BITS) - 1)));
             while let Some(&entry) = log.get(*cursor).filter(|&&e| e >> 32 == line as u64) {
                 fields.push(entry & u32::MAX as u64);
                 *cursor += 1;
@@ -605,6 +604,8 @@ struct Scan<'a> {
     /// The slots set in this block (`touched[..n]`), to evaluate and clear.
     touched: Vec<u32>,
     n: usize,
+    /// The entry ranges `(start, end)` of the touched slots that trigger any.
+    work: Vec<(u32, u32)>,
     /// Row r < plan.rows: the words of BOOL term r in the 4 blocks of this
     /// superblock. Row `rows` takes the other terms; row `rows + 1` is all ones.
     wide: Vec<Row>,
@@ -633,6 +634,7 @@ impl<'a> Scan<'a> {
             w,
             touched: vec![0; nb + 2],
             n: 0,
+            work: Vec::with_capacity(nb + 2),
             wide,
             pending: Vec::new(),
             toks: Vec::new(),
@@ -815,21 +817,43 @@ impl<'a> Scan<'a> {
     fn end_block(&mut self, base: u32) {
         let w = &mut self.w;
         if let Some(plan) = self.plan {
+            // Two passes, so that the cold lines of an evaluation are fetched
+            // well before it. The first keeps the entry ranges of the touched
+            // slots that trigger any (about a third) and fetches their first
+            // entries; the second, 4 ranges ahead, fetches the words and the
+            // state the first entry of a range reads, then evaluates it.
             let (touched, group) = (&self.touched[..self.n], plan.group.as_ptr());
-            for (i, t) in touched.iter().map(|&t| t as usize).enumerate() {
-                // Fetched in advance: the group 16 slots ahead, the entries of 8 ahead.
-                // SAFETY: prefetches of the plan's arrays (touched slots are at most
-                // nb, and group has nb + 2 entries); a prefetch never faults anyway.
+            let (entries, work) = (plan.entries.as_ptr(), self.work.as_mut_ptr());
+            let mut m = 0;
+            for (i, &t) in touched.iter().enumerate() {
+                // SAFETY: touched slots are at most nb, group has nb + 2 entries,
+                // and work has room for every touched slot. The prefetches are of
+                // the plan's arrays (an empty range fetches entry 0 instead, which
+                // stays in L1); a prefetch never faults anyway.
+                let (from, to) = unsafe {
+                    _mm_prefetch::<_MM_HINT_T0>(group.add(*touched.get(i + 16).unwrap_or(&0) as usize) as *const i8);
+                    let (from, to) = (*group.add(t as usize), *group.add(t as usize + 1));
+                    _mm_prefetch::<_MM_HINT_T0>(entries.add(if_zero((from ^ to) as u64, 0, from as u64) as usize) as *const i8);
+                    work.add(m).write((from, to));
+                    (from, to)
+                };
+                m += (from != to) as usize;
+            }
+            // SAFETY: the first m ranges were written.
+            unsafe { self.work.set_len(m) };
+            let state = self.answers.state.as_ptr();
+            for (k, &(from, to)) in self.work.iter().enumerate() {
+                // SAFETY: prefetches; the plan's slots are below w.len() and its
+                // answers below state.len(), and the first pass fetched the entry.
                 unsafe {
-                    let ahead = |k: usize| *touched.get(i + k).unwrap_or(&0) as usize;
-                    _mm_prefetch::<_MM_HINT_T0>(group.add(ahead(16)) as *const i8);
-                    let entries = plan.entries.as_ptr().add(*group.add(ahead(8)) as usize);
-                    _mm_prefetch::<_MM_HINT_T0>(entries as *const i8);
+                    let e = &*entries.add(self.work.get(k + 4).map_or(0, |r| r.0) as usize);
+                    for &word in &e.terms {
+                        _mm_prefetch::<_MM_HINT_T0>(w.as_ptr().add((word & TERM) as usize) as *const i8);
+                    }
+                    _mm_prefetch::<_MM_HINT_T0>(state.add(e.answer as usize) as *const i8);
                 }
-                // SAFETY: touched slots are at most nb, and group has nb + 2 entries.
-                let (from, to) = unsafe { (*group.add(t) as usize, *group.add(t + 1) as usize) };
-                // SAFETY: group holds offsets into entries.
-                for e in unsafe { plan.entries.get_unchecked(from..to) } {
+                // SAFETY: group holds ranges of entries.
+                for e in unsafe { plan.entries.get_unchecked(from as usize..to as usize) } {
                     // All ones when bit 0 of b is set: bit(op) for NOT and OR,
                     // bit(op >> 1) only for OR.
                     let bit = |b: u32| 0u64.wrapping_sub((b & 1) as u64);
