@@ -273,25 +273,41 @@ fn relabel(graph: Graph, threads: usize) -> (Graph, Vec<u32>) {
             grow(&mut order, 0);
         }
     }
+    // Renumber in parallel: `order` holds every node exactly once (each was
+    // claimed by one CAS), so the writes to `new_id` are disjoint, and so are the
+    // degree slots of each chunk. Each step is a random access per node; done
+    // serially these loops were most of the relabel time.
     let mut new_id = vec![0u32; n];
-    for (x, &u) in order.iter().enumerate() {
-        new_id[u as usize] = x as u32;
+    let mut offsets = vec![0u32; n + 1];
+    let has_in: Vec<AtomicU8> = (0..n).map(|_| AtomicU8::new(0)).collect();
+    let per = n.div_ceil(threads).max(1);
+    let (ids, degrees) = (Shared(new_id.as_mut_ptr()), Shared(offsets.as_mut_ptr()));
+    thread::scope(|s| {
+        let (ids, degrees, has_in, edges_of) = (&ids, &degrees, &has_in, &edges_of);
+        for (c, chunk) in order.chunks(per).enumerate() {
+            let has_in_old = &graph.has_in;
+            s.spawn(move || {
+                for (k, &u) in chunk.iter().enumerate() {
+                    let x = c * per + k;
+                    // SAFETY: see above; x + 1 <= n, and u < n.
+                    unsafe {
+                        *ids.0.add(u as usize) = x as u32;
+                        *degrees.0.add(x + 1) = edges_of(u).len() as u32;
+                    }
+                    has_in[x].store(has_in_old[u as usize].load(Relaxed), Relaxed);
+                }
+            });
+        }
+    });
+    for x in 0..n {
+        offsets[x + 1] += offsets[x];
     }
 
     // Copy every node's edges to its new position, heads renamed, in parallel.
-    let mut offsets = Vec::with_capacity(n + 1);
-    let mut sum = 0u32;
-    for &u in &order {
-        offsets.push(sum);
-        sum += edges_of(u).len() as u32;
-    }
-    offsets.push(sum);
     let mut edges = vec![(0u32, 0u32); graph.edges.len()];
-    let has_in: Vec<AtomicU8> = order.iter().map(|&u| AtomicU8::new(graph.has_in[u as usize].load(Relaxed))).collect();
     thread::scope(|s| {
         let mut rest: &mut [(u32, u32)] = &mut edges;
-        let per = n.div_ceil(threads);
-        for x0 in (0..n).step_by(per.max(1)) {
+        for x0 in (0..n).step_by(per) {
             let x1 = (x0 + per).min(n);
             let (mine, tail) = rest.split_at_mut((offsets[x1] - offsets[x0]) as usize);
             rest = tail;
@@ -319,7 +335,7 @@ fn prefetch<T>(item: Option<&T>) {
 }
 
 struct Shared<T>(*mut T);
-// SAFETY: only used for the disjoint writes in build_graph.
+// SAFETY: only used for the disjoint writes in build_graph and relabel.
 unsafe impl<T> Sync for Shared<T> {}
 
 /// One thread's reusable Dijkstra state.
