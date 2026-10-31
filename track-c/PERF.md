@@ -33,7 +33,7 @@ much higher than the box's, so only the board decided what stayed.
 | 23 | 68e5b56 | Claims go round the file's stripes, so that runs parsed at the same time do not share page tables | run-2a9b09524d9d | 0.0255 | 13.6 | 616 | 77.5 |
 | 24 | | Fewer lines (mmap.rs folded in, regions as locals, compact slow path, seen rows grown per name); a filer takes over an inbox that grows past 16 x threads buffers | run-a80b6d932516 | 0.0263 | 13.5 | 541 | 77.6 |
 | 25 | e99accf | Trust spec 2.2 (what the generator writes): the 2.1 parser, the one-run second pass and the per-record validation removed; a 2.2 walker for long fields and the file's end; panics as tripwires | run-d1003468b70d | 0.0229 | 13.3 | 445 | 79.8 |
-| 26 | 7a72ab7 | Fewer lines at the same speed: one field walker for all five fields, `masks` returns the inside-quotes mask, the own inbox taken in the filing loop | | | | 407 | |
+| 26 | 7a72ab7 | Fewer lines: one field walker for all five fields, `masks` returns the inside-quotes mask, the own inbox taken in the filing loop. Equal on the server, 10% slower on the box: reverted to step 25 (0cc7815) | run-5b165ed65fa8, run-cb0af101a699 | 0.0253, 0.0252 | | 407 | |
 
 ## What each step taught
 
@@ -201,9 +201,18 @@ guessed cut sent the whole file through a second pass. Neither can happen on gen
   20.27 ms (-7%). Single-thread instructions went from 1042M to 854M (-18%), cycles from 383M to 334M.
   With a busy loop on one CPU: 27.96 against 25.82 ms. Memory is unchanged within noise (13.3–15.5 MB
   over sessions). On the board: 0.0254 → 0.0229 s and 561 → 445 lines, +1.95 points.
-- Step 26: server 20.40 → 20.23 ms (31 runs), loaded 23.29 → 23.26 ms, memory 13.3–13.8 MB for both.
-  Single-thread instructions are 869M against 854M. The regions fill, which now uses `position` and
-  a digit fold instead of a digit loop, accounts for +9M, about 0.1 ms of CPU per thread.
+- Step 26 cut 38 more lines and looked free on the server: 20.40 → 20.23 ms (31 runs), loaded
+  23.29 → 23.26 ms, memory 13.3–13.8 MB for both, single-thread instructions 869M against 854M.
+  On the box it ran 0.0253 and 0.0252 s, against 0.0229 for step 25: 10% slower. It was reverted.
+  Like the populated tables (8a155db), a change that is neutral on the AMD test server can cost on the
+  box: only the board decides. A bisection on the test server with non-PGO builds, each of step 26's
+  changes applied alone to step 25, found single-thread instructions unchanged (948.3M) for the
+  folded quote mask, the field walker, the merged own-table take, the `transmute` of the number
+  lanes, and the `then_some` and tuple forms. Cycles moved within noise. All of the +13M came from
+  the regions fill (`position` and a digit fold instead of the digit loop). At 12 threads every
+  variant measured the same (20.05–20.31 ms), so the server cannot say which change costs on the
+  box. The prime suspects are the regions fill and the merged take, which changes when a thread
+  takes its own inbox.
 - One codegen trap, found while bisecting a slower intermediate version with non-PGO builds:
   `fast_record(..).or_else(|| slow_record(..))` in the per-record closure cost 46M more
   instructions than the same logic as a `match`. The kernel keeps the `match`.
@@ -216,7 +225,7 @@ amount's, and the record ends 4 or 5 bytes after it. Stage A finds every dot of 
 bytes, the name from the 64-byte bitmaps after it, the region and amount commas as the top two
 comma bits of the 32 bytes before the dot, and the note's quotes from 64 bytes. Nothing carries
 from one record to the next but its start. A laptop prototype measured -28% parse time against the
-step-24 kernel. Ported onto step 26, it was exact on seeds 1–4, holdout 99 and the fresh seeds, but:
+step-24 kernel. Ported onto step 26 (measured before step 26 was reverted), it was exact on seeds 1–4, holdout 99 and the fresh seeds, but:
 
 | Version | 12 threads (ms) | Instructions | Cycles (1 thread) |
 |---|---|---|---|
