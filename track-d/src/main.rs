@@ -8,14 +8,13 @@
 //!    the edges into one CSR array (offsets + packed (head, weight) pairs), so the
 //!    graph is built in parallel with no per-node allocation.
 //! 3. Queries run in parallel, one Dijkstra per query, each thread reusing its own
-//!    distance array and resetting only the nodes it touched.
+//!    distance array and resetting only the nodes it touched. Nodes are first
+//!    renumbered in BFS order so that a search's nodes sit close together in memory.
 //! 4. A target with no in-edges is answered -1 at once: the reference settles the
 //!    whole graph to find that out.
 
 mod mmap;
 
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
 use std::fs::File;
 use std::io::Write;
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering::Relaxed};
@@ -50,7 +49,7 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
     let queries_txt = open("queries.txt")?;
     let threads = thread::available_parallelism().map_or(1, |n| n.get());
 
-    let graph = build_graph(graph_txt, threads)?;
+    let (graph, new_id) = relabel(build_graph(graph_txt, threads)?, threads);
     let n = graph.offsets.len() - 1;
 
     let mut queries = Vec::new();
@@ -61,7 +60,7 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
         if s as usize >= n || t as usize >= n {
             return Err(format!("query {s} {t} names a node outside 0..{n}"));
         }
-        queries.push((s, t));
+        queries.push((new_id[s as usize], new_id[t as usize]));
         i = j + 1;
     }
 
@@ -177,20 +176,99 @@ fn build_graph(text: &[u8], threads: usize) -> Result<Graph, String> {
     Ok(Graph { offsets, edges, has_in })
 }
 
+/// Renumbers the nodes in breadth-first order. Node ids in the input are a random
+/// relabelling, so a Dijkstra ball of 10,000 nodes touched 10,000 random cache
+/// lines in each of `offsets`, `edges` and `dist`. In BFS order, nodes a few hops
+/// apart get nearby ids, and the same ball reads a few hundred compact runs.
+/// Returns the renumbered graph and `new_id[old id]`.
+fn relabel(graph: Graph, threads: usize) -> (Graph, Vec<u32>) {
+    let n = graph.offsets.len() - 1;
+    let edges_of = |u: u32| &graph.edges[graph.offsets[u as usize] as usize..graph.offsets[u as usize + 1] as usize];
+    let mut new_id = vec![u32::MAX; n];
+    let mut order: Vec<u32> = Vec::with_capacity(n);
+    for root in 0..n as u32 {
+        if new_id[root as usize] != u32::MAX {
+            continue;
+        }
+        new_id[root as usize] = order.len() as u32;
+        order.push(root);
+        let mut head = order.len() - 1;
+        while head < order.len() {
+            // The queue says which nodes come next: prefetch their offsets and edges
+            // so the misses overlap instead of stalling one after another.
+            if let Some(&ahead) = order.get(head + 16) {
+                prefetch(graph.offsets.get(ahead as usize));
+            }
+            if let Some(&ahead) = order.get(head + 8) {
+                prefetch(graph.edges.get(graph.offsets[ahead as usize] as usize));
+            }
+            let u = order[head];
+            head += 1;
+            for &(v, _) in edges_of(u) {
+                if new_id[v as usize] == u32::MAX {
+                    new_id[v as usize] = order.len() as u32;
+                    order.push(v);
+                }
+            }
+        }
+    }
+
+    // Copy every node's edges to its new position, heads renamed, in parallel.
+    let mut offsets = Vec::with_capacity(n + 1);
+    let mut sum = 0u32;
+    for &u in &order {
+        offsets.push(sum);
+        sum += edges_of(u).len() as u32;
+    }
+    offsets.push(sum);
+    let mut edges = vec![(0u32, 0u32); graph.edges.len()];
+    let has_in: Vec<AtomicU8> = order.iter().map(|&u| AtomicU8::new(graph.has_in[u as usize].load(Relaxed))).collect();
+    thread::scope(|s| {
+        let mut rest: &mut [(u32, u32)] = &mut edges;
+        let per = n.div_ceil(threads);
+        for x0 in (0..n).step_by(per.max(1)) {
+            let x1 = (x0 + per).min(n);
+            let (mine, tail) = rest.split_at_mut((offsets[x1] - offsets[x0]) as usize);
+            rest = tail;
+            let (order, new_id, edges_of) = (&order, &new_id, &edges_of);
+            s.spawn(move || {
+                let mut k = 0;
+                for &u in &order[x0..x1] {
+                    for &(v, w) in edges_of(u) {
+                        mine[k] = (new_id[v as usize], w);
+                        k += 1;
+                    }
+                }
+            });
+        }
+    });
+    (Graph { offsets, edges, has_in }, new_id)
+}
+
+fn prefetch<T>(item: Option<&T>) {
+    #[cfg(target_arch = "x86_64")]
+    if let Some(item) = item {
+        // SAFETY: prefetching is only a hint and never faults.
+        unsafe { std::arch::x86_64::_mm_prefetch(item as *const T as *const i8, std::arch::x86_64::_MM_HINT_T0) };
+    }
+}
+
 struct SharedEdges(*mut (u32, u32));
 // SAFETY: only used for the disjoint scatter writes above.
 unsafe impl Sync for SharedEdges {}
 
 /// One thread's reusable Dijkstra state.
 struct Search {
+    /// Distance + 1, or 0 for "not reached". Zero-filled memory comes from calloc,
+    /// so pages of nodes this thread never reaches are never touched or charged.
     dist: Vec<u64>,
     touched: Vec<u32>,
-    heap: BinaryHeap<Reverse<(u64, u32)>>,
+    heap: RadixHeap,
 }
 
 impl Search {
     fn new(n: usize) -> Self {
-        Search { dist: vec![u64::MAX; n], touched: Vec::new(), heap: BinaryHeap::new() }
+        Search { dist: vec![0; n], touched: Vec::new(), heap: RadixHeap::new() }
     }
 
     fn distance(&mut self, graph: &Graph, source: u32, target: u32) -> i64 {
@@ -201,16 +279,16 @@ impl Search {
             return -1; // nothing points at the target, so no path can end there
         }
         for &u in &self.touched {
-            self.dist[u as usize] = u64::MAX;
+            self.dist[u as usize] = 0;
         }
         self.touched.clear();
         self.heap.clear();
 
-        self.dist[source as usize] = 0;
+        self.dist[source as usize] = 1;
         self.touched.push(source);
-        self.heap.push(Reverse((0, source)));
-        while let Some(Reverse((d, u))) = self.heap.pop() {
-            if d > self.dist[u as usize] {
+        self.heap.push(0, source);
+        while let Some((d, u)) = self.heap.pop() {
+            if d + 1 > self.dist[u as usize] {
                 continue; // stale entry
             }
             if u == target {
@@ -220,16 +298,71 @@ impl Search {
             for &(v, w) in &graph.edges[range] {
                 let candidate = d + w as u64;
                 let slot = &mut self.dist[v as usize];
-                if candidate < *slot {
-                    if *slot == u64::MAX {
+                if *slot == 0 || candidate + 1 < *slot {
+                    if *slot == 0 {
                         self.touched.push(v);
                     }
-                    *slot = candidate;
-                    self.heap.push(Reverse((candidate, v)));
+                    *slot = candidate + 1;
+                    self.heap.push(candidate, v);
                 }
             }
         }
         -1
+    }
+}
+
+/// A radix heap: a monotone priority queue for integer keys. Dijkstra only ever
+/// pushes keys >= the last key popped, so an entry can live in bucket
+/// `bit length of (key XOR last)`: bucket 0 holds keys equal to `last`, and every
+/// key in bucket i shares `last`'s bits above bit i-1. Popping refills bucket 0 by
+/// redistributing the lowest non-empty bucket once its minimum becomes `last`.
+/// Each entry moves down at most 64 times in total, so push and pop are O(1)
+/// amortized, on short contiguous vectors instead of a 15-level binary heap.
+struct RadixHeap {
+    last: u64,
+    len: usize,
+    buckets: [Vec<(u64, u32)>; 65],
+}
+
+impl RadixHeap {
+    fn new() -> Self {
+        RadixHeap { last: 0, len: 0, buckets: std::array::from_fn(|_| Vec::new()) }
+    }
+
+    fn clear(&mut self) {
+        self.buckets.iter_mut().for_each(Vec::clear);
+        self.last = 0;
+        self.len = 0;
+    }
+
+    fn bucket(&self, key: u64) -> usize {
+        (64 - (key ^ self.last).leading_zeros()) as usize
+    }
+
+    fn push(&mut self, key: u64, node: u32) {
+        debug_assert!(key >= self.last);
+        let b = self.bucket(key);
+        self.buckets[b].push((key, node));
+        self.len += 1;
+    }
+
+    fn pop(&mut self) -> Option<(u64, u32)> {
+        if self.len == 0 {
+            return None;
+        }
+        if self.buckets[0].is_empty() {
+            let b = (1..65).find(|&b| !self.buckets[b].is_empty()).unwrap();
+            let moving = std::mem::take(&mut self.buckets[b]);
+            self.last = moving.iter().map(|&(key, _)| key).min().unwrap();
+            for &(key, node) in &moving {
+                let to = self.bucket(key);
+                self.buckets[to].push((key, node));
+            }
+            self.buckets[b] = moving; // keep its capacity for later pushes
+            self.buckets[b].clear();
+        }
+        self.len -= 1;
+        self.buckets[0].pop()
     }
 }
 
