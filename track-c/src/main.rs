@@ -116,16 +116,16 @@ fn map(path: &str) -> Result<&'static [u8], String> {
         .ok_or_else(error)
 }
 
-/// Drops this process's page-table entries for the whole pages inside `slice`, a
-/// part of the input that is done with. At exit the kernel would otherwise unmap
-/// the 50,000 pages of the input one by one, on one core (6 ms on the box); this
-/// does it in each parsing thread, in parallel. Reading the bytes again would
-/// still be correct: the pages fault back in from the page cache.
-fn release(slice: &[u8]) {
-    let start = (slice.as_ptr() as usize).next_multiple_of(4096);
-    let end = (slice.as_ptr() as usize + slice.len()) / 4096 * 4096;
-    // SAFETY: MADV_DONTNEED (4) on whole pages inside a private read-only file
-    // mapping that is never written: dropping them loses nothing.
+/// Drops this process's page-table entries for the whole pages inside the `n`
+/// values at `at`, which are done with. At exit the kernel would otherwise unmap
+/// them one by one, on one core (the 50,000 pages of the input: 6 ms on the box);
+/// this does it in each thread, in parallel.
+fn release<T>(at: *const T, n: usize) {
+    let (start, end) = (at as usize, at as usize + n * size_of::<T>());
+    let (start, end) = (start.next_multiple_of(4096), end / 4096 * 4096);
+    // SAFETY: MADV_DONTNEED (4) on whole pages that are never written again: of the
+    // input's read-only file mappings (read again, they would fault back in from
+    // the page cache), or of tables nothing reads again (they would read as zeros).
     unsafe { madvise(start as *mut u8, end.saturating_sub(start), 4) };
 }
 
@@ -218,7 +218,7 @@ fn run(data_dir: &str, out_dir: &str) -> Result<std::convert::Infallible, String
         let inboxes: Vec<Mutex<(Vec<Vec<u64>>, Vec<Vec<u64>>)>> = many(threads);
         // Per block of runs, how many are parsed.
         let parsed: Vec<AtomicUsize> = many(runs / BLOCK);
-        let [next_chunk, chunks_done, next_run, flushed]: [AtomicUsize; 4] = Default::default();
+        let [next_chunk, chunks_done, next_run, flushed, done]: [AtomicUsize; 5] = Default::default();
         // Each thread's totals, or the reason it stopped.
         let finished = Mutex::new(Vec::new());
         let worker = &|w: usize| {
@@ -284,7 +284,8 @@ fn run(data_dir: &str, out_dir: &str) -> Result<std::convert::Infallible, String
                 // (A call per run: +2 ms, from 4 times the TLB shootdowns.)
                 let block = run / BLOCK;
                 if parsed[block].fetch_add(1, AcqRel) == BLOCK - 1 {
-                    release(&text[cut(block * BLOCK)..cut(block * BLOCK + BLOCK)]);
+                    let (start, end) = (cut(block * BLOCK), cut(block * BLOCK + BLOCK));
+                    release(text[start..].as_ptr(), end - start);
                 }
                 // This thread's tables, unless another thread holds them.
                 if let Ok(mut mine) = tables[w].try_lock() {
@@ -300,6 +301,7 @@ fn run(data_dir: &str, out_dir: &str) -> Result<std::convert::Infallible, String
             }
             // The last thread to finish writes the output and exits, without waiting
             // for the others to exit and without dropping anything.
+            done.fetch_add(1, Release);
             let mut finished = finished.lock().unwrap();
             finished.push(error.map(|_| totals));
             if finished.len() == threads {
@@ -308,6 +310,24 @@ fn run(data_dir: &str, out_dir: &str) -> Result<std::convert::Infallible, String
                     let codes = keys.lock().unwrap();
                     exit_with(parts.and_then(|parts| write_output(out_dir, &parts, &codes)));
                 }
+            }
+            drop(finished);
+            // Meanwhile, as soon as no thread uses any table, the others drop the pages
+            // of theirs (and of the join table and regions.csv), in parallel: the last
+            // thread of the process to exit frees whatever is left, alone. On the
+            // server that took 1.4 ms after the output was written, 1.0 ms with this
+            // (-0.1 to -0.3 ms in all). The pages are never read again: a second parse
+            // makes new tables. (Pair buffers are smaller than a page; a malloc_trim
+            // of everything instead: slower.)
+            spin_until(|| done.load(Acquire) == threads);
+            for p in tables[w].lock().unwrap().iter() {
+                release(p.keys.as_ptr(), p.keys.capacity());
+                release(p.ids.as_ptr(), p.ids.capacity());
+                release(p.seen.as_ptr(), p.seen.capacity());
+            }
+            if w == 1 {
+                release(group_of.as_ptr(), group_of.len());
+                release(lines.as_ptr(), lines.len());
             }
         };
         thread::scope(|s| {
