@@ -49,31 +49,52 @@ const PROT_READ: c_int = 1;
 const PROT_WRITE: c_int = 2;
 const MAP_SHARED: c_int = 1;
 const MAP_PRIVATE: c_int = 2;
+const MAP_FIXED: c_int = 0x10;
+const MAP_ANONYMOUS: c_int = 0x20;
 
-/// Maps the whole file read-only for the rest of the process. It is never
-/// unmapped: the process exits right after using it, and exit unmaps everything.
+/// Zero bytes mapped after the end of the file, so that fixed-size SIMD loads at
+/// any line of it stay inside the mapping.
+pub const PAD: usize = 256;
+
+/// Maps the whole file read-only, followed by PAD zero bytes, for the rest of the
+/// process. It is never unmapped: the process exits right after using it.
 pub fn map(file: &File) -> io::Result<&'static [u8]> {
     let len = file.metadata()?.len() as usize;
-    if len == 0 {
-        return Ok(&[]);
-    }
-    // SAFETY: a fresh read-only private mapping of `len` bytes; the dataset is
-    // mounted read-only, so the bytes cannot change under us.
-    let ptr = unsafe {
+    // Reserve the whole range as zero pages, then map the file over its start.
+    // SAFETY: a fresh anonymous read-only mapping; nothing else refers to it.
+    let base = unsafe {
         mmap(
             std::ptr::null_mut(),
-            len,
+            len + PAD,
             PROT_READ,
-            MAP_PRIVATE,
-            file.as_raw_fd(),
+            MAP_PRIVATE | MAP_ANONYMOUS,
+            -1,
             0,
         )
     };
-    if ptr as isize == -1 {
+    if base as isize == -1 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: the mapping is valid for `len` bytes and lives until exit.
-    Ok(unsafe { std::slice::from_raw_parts(ptr as *const u8, len) })
+    if len > 0 {
+        // SAFETY: MAP_FIXED only replaces pages of the reservation made above; the
+        // dataset is mounted read-only, so the bytes cannot change under us.
+        let ptr = unsafe {
+            mmap(
+                base,
+                len,
+                PROT_READ,
+                MAP_PRIVATE | MAP_FIXED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr as isize == -1 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    // SAFETY: `len + PAD` bytes are mapped (the file, then zeros: the rest of the
+    // file's last page reads as zero) and stay mapped until exit.
+    Ok(unsafe { std::slice::from_raw_parts(base as *const u8, len + PAD) })
 }
 
 /// Maps the first `len` bytes of a file opened for reading and writing, shared:

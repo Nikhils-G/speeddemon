@@ -25,6 +25,9 @@
 
 mod mmap;
 
+#[cfg(not(target_feature = "avx2"))]
+compile_error!("track-a needs AVX2: build with RUSTFLAGS=\"-C target-cpu=native\"");
+
 use std::fs::{File, OpenOptions};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
@@ -52,7 +55,8 @@ fn main() {
 fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
     let input_path = format!("{data_dir}/requests.log");
     let input = File::open(&input_path).map_err(|e| format!("open {input_path}: {e}"))?;
-    let log = mmap::map(&input).map_err(|e| format!("mmap {input_path}: {e}"))?;
+    let padded = mmap::map(&input).map_err(|e| format!("mmap {input_path}: {e}"))?;
+    let log = &padded[..padded.len() - mmap::PAD];
     let output_path = format!("{out_dir}/summary.txt");
     // Read and write: the output is mapped shared and written through memory.
     let output = OpenOptions::new()
@@ -78,7 +82,7 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
                 s.spawn(move || {
                     // Copy the endpoint names out before the chunk's pages are dropped:
                     // the merge reads them all, and each would fault its page back in.
-                    let part = parse_chunk(log, start, start + chunk.len()).map(|mut part| {
+                    let part = parse_chunk(padded, start, start + chunk.len()).map(|mut part| {
                         for name in &mut part.names {
                             *name = Box::leak(name.to_vec().into_boxed_slice());
                         }
@@ -320,13 +324,7 @@ struct Part<'a> {
     keys: Vec<Key>,
 }
 
-/// The longest possible line: 27 + 1 + 7 + 1 + 125 + 1 + 3 + 1 + 10 + 1 bytes.
-const MAX_LINE: usize = 177;
-/// SIMD loads read up to 64 bytes past a field start, so the fast path needs this
-/// much of the file left after the line start; the last lines take the scalar path.
-const FAST_MARGIN: usize = MAX_LINE + 128;
-
-/// Parses the lines in `log[start..end]`.
+/// Parses the lines in `log[start..end]`; `log` goes on with mmap::PAD zero bytes.
 fn parse_chunk(log: &[u8], start: usize, end: usize) -> Result<Part<'_>, String> {
     let mut part = Part {
         records: Vec::with_capacity((end - start) / 70),
@@ -352,11 +350,7 @@ fn parse_chunk(log: &[u8], start: usize, end: usize) -> Result<Part<'_>, String>
                 escapes: part.escapes.len() as u32,
             });
         }
-        let fields = if log.len() - i >= FAST_MARGIN {
-            Fields::fast(line)
-        } else {
-            Fields::scalar(line)
-        };
+        let fields = Fields::parse(line);
         let endpoint = interner.intern(&line[fields.endpoint.clone()], fields.key, &mut part.names);
         if endpoint >= MAX_ENDPOINTS {
             return Err(format!("more than {MAX_ENDPOINTS} distinct endpoints"));
@@ -385,13 +379,6 @@ fn parse_chunk(log: &[u8], start: usize, end: usize) -> Result<Part<'_>, String>
 type Key = [u64; 8];
 const KEY_BYTES: usize = 64;
 
-fn key_of(bytes: &[u8]) -> Key {
-    let mut padded = [0u8; KEY_BYTES];
-    let n = bytes.len().min(KEY_BYTES);
-    padded[..n].copy_from_slice(&bytes[..n]);
-    std::array::from_fn(|i| u64::from_le_bytes(padded[i * 8..i * 8 + 8].try_into().unwrap()))
-}
-
 /// The fields of one line "ts SP method SP endpoint SP status SP latency LF".
 struct Fields {
     endpoint: std::ops::Range<usize>,
@@ -403,48 +390,17 @@ struct Fields {
 }
 
 impl Fields {
-    /// The plain byte-by-byte parse, used near the end of the file.
-    fn scalar(line: &[u8]) -> Self {
-        // ts is 27 bytes and the shortest method is 3, so its space is at 31 or later.
-        let mut e = 31;
-        while line[e] != b' ' {
-            e += 1;
-        }
-        let start = e + 1;
-        e = start;
-        while line[e] != b' ' {
-            e += 1;
-        }
-        let mut j = e + 5;
-        let mut latency = 0u64;
-        while line[j] != b'\n' {
-            latency = latency * 10 + (line[j] - b'0') as u64;
-            j += 1;
-        }
-        // Status is always three digits, 100 to 599, so a 5xx starts with '5'.
-        Fields {
-            endpoint: start..e,
-            key: key_of(&line[start..e]),
-            error: line[e + 1] == b'5',
-            latency,
-            len: j + 1,
-        }
-    }
-
-    /// The same parse with AVX2 and no data-dependent branches for the common
-    /// line: one 64-byte window after the timestamp gives a mask of its spaces,
+    /// The parse, with AVX2 and no data-dependent branches for the common line: one 64-byte window after the timestamp gives a mask of its spaces,
     /// whose first two set bits end the method and the endpoint (the method's
     /// length varies, so this replaces a match on its letters). The endpoint's key
     /// comes from two loads masked to its length, the latency digits are converted
-    /// eight at a time. The caller guarantees FAST_MARGIN readable bytes.
-    #[cfg(target_feature = "avx2")]
-    fn fast(line: &[u8]) -> Self {
+    /// eight at a time. `line` goes on at least mmap::PAD bytes past the line.
+    fn parse(line: &[u8]) -> Self {
         use std::arch::x86_64::*;
-        debug_assert!(line.len() >= FAST_MARGIN);
-        // SAFETY: FAST_MARGIN covers every load below: the window ends 92 bytes in,
-        // the endpoint starts at most 37 bytes in, its key loads read 64 bytes from
-        // there, and the endpoint (at most 125 bytes) plus the latency field (at most
-        // 16 bytes read) ends within MAX_LINE + 16.
+        // SAFETY: every load below stays within the line (at most 177 bytes) and the
+        // mmap::PAD bytes after it: the window ends 92 bytes in, the endpoint starts
+        // at most 37 bytes in and its key loads read 64 bytes from there, and the
+        // latency load reads 16 bytes from the status's end.
         unsafe {
             let window = line.as_ptr().add(28);
             let space = _mm256_set1_epi8(b' ' as i8);
@@ -499,17 +455,11 @@ impl Fields {
             }
         }
     }
-
-    #[cfg(not(target_feature = "avx2"))]
-    fn fast(line: &[u8]) -> Self {
-        Self::scalar(line)
-    }
 }
 
 /// `vpmovmskb`, kept opaque to the optimizer: LLVM rewrites the intrinsic as a
 /// vector of booleans, and on CPUs without AVX-512 (the scoring box) it then
 /// builds a 64-bit mask from two of them one bit at a time.
-#[cfg(target_feature = "avx2")]
 #[inline(always)]
 fn movemask(v: std::arch::x86_64::__m256i) -> u32 {
     let mask: u32;
