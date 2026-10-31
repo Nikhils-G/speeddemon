@@ -1,5 +1,6 @@
 //! Read-only mmap through libc, declared by hand so the crate has no dependencies.
 
+use std::io::Error;
 use std::os::fd::AsRawFd;
 
 unsafe extern "C" {
@@ -32,13 +33,7 @@ pub const PAD: usize = 256;
 pub fn map(path: &str) -> &'static [u8] {
     let file = std::fs::File::open(path).expect(path);
     let len = file.metadata().expect(path).len() as usize;
-    let check = |p: *mut u8| {
-        assert!(
-            p as isize != -1,
-            "mmap {path}: {}",
-            std::io::Error::last_os_error()
-        )
-    };
+    let check = |p: *mut u8| assert!(p as isize != -1, "mmap {path}: {}", Error::last_os_error());
     // Reserve the whole range as zero pages first, then map the file over its start.
     // SAFETY: a fresh anonymous read-only mapping; nothing else refers to it.
     let base = unsafe { mmap(std::ptr::null_mut(), len + PAD, PROT_READ, RESERVE, -1, 0) };
@@ -53,19 +48,18 @@ pub fn map(path: &str) -> &'static [u8] {
     unsafe { std::slice::from_raw_parts(base, len + PAD) }
 }
 
-/// Drops this process's page-table entries for the whole pages inside `slice`, a
+/// Drops this process's page-table entries for the pages that `slice` touches, a
 /// part of a read-only file mapping that is done with. At exit the kernel would
 /// otherwise unmap the 62,000 pages of the input one by one, on one core; this
 /// does the same work in each parsing thread, in parallel. Reading the bytes
 /// again is still correct: the page faults back in from the page cache.
 pub fn release(slice: &[u8]) {
-    const PAGE: usize = 4096;
     const MADV_DONTNEED: i32 = 4;
-    let start = (slice.as_ptr() as usize).next_multiple_of(PAGE);
-    let end = (slice.as_ptr() as usize + slice.len()) / PAGE * PAGE;
-    if end > start {
-        // SAFETY: whole pages inside a private, read-only file mapping that is
-        // never written; dropping them loses nothing.
-        unsafe { madvise(start as *mut u8, end - start, MADV_DONTNEED) };
-    }
+    // madvise takes a page-aligned start; the end is rounded up to whole pages.
+    // The pages at the ends may also hold the neighbouring slices' bytes.
+    let start = slice.as_ptr() as usize / 4096 * 4096;
+    let len = slice.as_ptr() as usize + slice.len() - start;
+    // SAFETY: whole pages of a private, read-only mapping that is never written
+    // (the file, then zero pages); dropping them loses nothing.
+    unsafe { madvise(start as *mut u8, len, MADV_DONTNEED) };
 }

@@ -21,12 +21,10 @@
 
 mod mmap;
 
+use std::arch::asm;
 use std::arch::x86_64::*;
 use std::cmp::Reverse;
-use std::collections::HashMap;
-use std::io::Write;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
-use std::thread;
 
 #[cfg(not(target_feature = "avx2"))]
 compile_error!("track-b needs AVX2: build with RUSTFLAGS=\"-C target-cpu=native\"");
@@ -60,11 +58,11 @@ fn main() {
     let data_dir = args.next().unwrap_or_else(|| "/data".into());
     let out_dir = args.next().unwrap_or_else(|| "/out".into());
     mmap::no_huge_pages();
-    let docs = mmap::map(&format!("{data_dir}/docs.txt"));
+    let open = |name: &str| mmap::map(&format!("{data_dir}/{name}"));
+    let docs = open("docs.txt");
     let text = &docs[..docs.len() - mmap::PAD];
-    let threads = thread::available_parallelism().map_or(1, |n| n.get());
-    let (queries, mut vocab) =
-        parse_queries(mmap::map(&format!("{data_dir}/queries.txt")), threads);
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let (queries, mut vocab) = parse_queries(open("queries.txt"), threads);
     let slices = slices(text, threads);
 
     // Sample the start of every slice for each term's document frequency.
@@ -72,11 +70,8 @@ fn main() {
     let sampled = par(slices.len(), |i| {
         let (start, end, first) = slices[i];
         let stop = line_after(text, start + SAMPLE_BYTES / slices.len()).min(end);
-        Scan::new(&vocab, None, &df)
-            .run(docs, start, stop, first)
-            .doc
-            + 1
-            - first
+        let scan = Scan::new(&vocab, None, &df).run(docs, start, stop, first);
+        scan.doc + 1 - first
     });
     let df: Vec<u32> = df.into_iter().map(AtomicU32::into_inner).collect();
     let plan = Plan::new(queries, &df, sampled.iter().sum(), threads);
@@ -92,29 +87,22 @@ fn main() {
         // Sorted, the log holds each line's first ids in order.
         log.truncate(scan.answers.logged);
         log.sort_unstable();
-        (scan.answers.state, log, scan.doc)
+        // The ids go on in the next slice. Every per-thread sum of ids is below
+        // N^2 / 2, which must fit in SUM_BITS.
+        let next = slices.get(i + 1).map_or(scan.doc + 1, |s| s.2);
+        let ok = slices[0].2 == 0 && next == scan.doc + 1 && scan.doc < 1 << 20;
+        assert!(ok, "docs.txt: ids must be 0, 1, 2, ... below 2^20");
+        (scan.answers.state, log)
     });
-    let next_firsts = slices.iter().skip(1).map(|s| s.2);
-    let dense = results
-        .iter()
-        .zip(next_firsts)
-        .all(|(r, next)| r.2 + 1 == next);
-    let ok = dense && slices.first().is_none_or(|s| s.2 == 0);
-    assert!(ok, "docs.txt: ids must be 0, 1, 2, ... in order");
-    // Every per-thread sum of ids is below N^2 / 2, which must fit in SUM_BITS.
-    assert!(
-        results.last().is_none_or(|r| r.2 < 1 << 20),
-        "docs.txt: over 2^20 documents"
-    );
 
     // Format in parallel, one range of lines per thread.
     let (lines, parts) = (plan.lines, slices.len().max(1));
     let chunks = par(parts, |p| format_lines(&results, part(lines, p, parts)));
     let path = format!("{out_dir}/results.txt");
     let mut file = std::fs::File::create(&path).expect(&path);
-    chunks
-        .iter()
-        .for_each(|chunk| file.write_all(chunk).expect(&path));
+    for chunk in chunks {
+        std::io::Write::write_all(&mut file, &chunk).expect(&path);
+    }
     // Done: exit without freeing the tables and logs, one free at a time.
     std::process::exit(0)
 }
@@ -122,7 +110,7 @@ fn main() {
 /// f(0), f(1), ... f(n - 1), each on its own thread.
 fn par<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
     let f = &f;
-    thread::scope(|s| {
+    std::thread::scope(|s| {
         let threads: Vec<_> = (0..n).map(|i| s.spawn(move || f(i))).collect();
         threads.into_iter().map(|t| t.join().unwrap()).collect()
     })
@@ -135,25 +123,23 @@ fn part(len: usize, p: usize, parts: usize) -> std::ops::Range<usize> {
 
 /// The output for `lines`: per line, the threads' counts and sums added up, and
 /// the first ten ids taken from the threads in slice order.
-fn format_lines(results: &[(Vec<u64>, Vec<u64>, u32)], lines: std::ops::Range<usize>) -> Vec<u8> {
-    let (mut out, mut tops) = (Vec::with_capacity(lines.len() * 32), Vec::new());
+fn format_lines(results: &[(Vec<u64>, Vec<u64>)], lines: std::ops::Range<usize>) -> Vec<u8> {
+    // Per line: the count, the sum, then the first ids.
+    let (mut out, mut fields) = (Vec::with_capacity(lines.len() * 32), Vec::new());
     let first = |log: &Vec<u64>| log.partition_point(|&e| e >> 32 < lines.start as u64);
     let mut cursors: Vec<usize> = results.iter().map(|r| first(&r.1)).collect();
     for line in lines {
-        let (mut count, mut sum) = (0, 0);
-        tops.clear();
-        for ((state, log, _), cursor) in results.iter().zip(&mut cursors) {
-            count += state[line] >> SUM_BITS;
-            sum += state[line] & ((1 << SUM_BITS) - 1);
+        fields.clear();
+        fields.extend([0, 0]);
+        for ((state, log), cursor) in results.iter().zip(&mut cursors) {
+            fields[0] += state[line] >> SUM_BITS;
+            fields[1] += state[line] & ((1 << SUM_BITS) - 1);
             while let Some(&entry) = log.get(*cursor).filter(|&&e| e >> 32 == line as u64) {
-                tops.push(entry & u32::MAX as u64);
+                fields.push(entry & u32::MAX as u64);
                 *cursor += 1;
             }
         }
-        for value in [count, sum]
-            .into_iter()
-            .chain(tops.iter().take(10).copied())
-        {
+        for &value in fields.iter().take(12) {
             push_decimal(&mut out, value);
             out.push(b' ');
         }
@@ -180,10 +166,8 @@ fn split_lines(chunk: &'static [u8], padded: &'static [u8]) -> Split {
         let bad = || -> ! { panic!("queries.txt: bad query {:?}", String::from_utf8_lossy(line)) };
         let start = terms.len();
         let mut term = |term: &'static [u8], op: u32| {
-            let ok = term
-                .iter()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
-            if term.is_empty() || term.len() > MAX_TERM || !ok {
+            let ok = term.iter().all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9'));
+            if !ok || !(1..=MAX_TERM).contains(&term.len()) {
                 bad();
             }
             let at = term.as_ptr() as usize - padded.as_ptr() as usize;
@@ -205,13 +189,11 @@ fn split_lines(chunk: &'static [u8], padded: &'static [u8]) -> Split {
                 };
             }
         } else {
-            let inner = line
-                .strip_prefix(b"PHRASE \"")
-                .and_then(|r| r.strip_suffix(b"\""));
-            inner
-                .unwrap_or_else(|| bad())
-                .split(|&b| b == b' ')
-                .for_each(|word| term(word, 0));
+            let inner = line.strip_prefix(b"PHRASE \"").unwrap_or_else(|| bad());
+            let inner = inner.strip_suffix(b"\"").unwrap_or_else(|| bad());
+            for word in inner.split(|&b| b == b' ') {
+                term(word, 0);
+            }
         }
         let (len, phrase) = (terms.len() - start, !line.starts_with(b"BOOL "));
         if !phrase && len > MAX_BOOL_TERMS {
@@ -228,33 +210,33 @@ type Split = (Vec<(u32, u32, bool)>, Vec<(&'static [u8], __m128i, u32)>);
 /// the file and mmap::PAD zero bytes.
 fn parse_queries(padded: &'static [u8], threads: usize) -> (Queries, Vocab) {
     let text = &padded[..padded.len() - mmap::PAD];
-    let cut = |p: usize| line_after(text, text.len() * p / threads);
+    let cut = |p: usize| cut(text, p, threads);
     let splits = par(threads, |p| split_lines(&text[cut(p)..cut(p + 1)], padded));
-    let mut vocab = Vocab::new(splits.iter().map(|s| s.0.len()).sum());
-    let mut q = Queries {
-        lines: Vec::new(),
-        terms: Vec::new(),
-    };
+    // The term table is sized for about 1.5 distinct terms per query, about 2.3
+    // per bucket (2 MB for 50,000 queries): twice that is 1% faster but 2 MB more
+    // memory. It still grows if there are more terms.
+    let lines: usize = splits.iter().map(|s| s.0.len()).sum();
+    let mut vocab = Vocab::default();
+    vocab.rebuild((lines * 3 / 5).max(1024).next_power_of_two());
+    let (mut lines, mut terms) = (Vec::new(), Vec::new());
     // Each term's bucket is fetched 16 terms in advance: the table is in L3.
     let mut ahead = splits.iter().flat_map(|s| &s.1).skip(16);
-    for (lines, terms) in &splits {
-        let base = q.terms.len() as u32;
-        q.lines.extend(
-            lines
-                .iter()
-                .map(|&(start, len, phrase)| (base + start, len, phrase)),
-        );
-        for &(term, key, op) in terms {
+    for (chunk_lines, chunk_terms) in &splits {
+        let base = terms.len() as u32;
+        for &(start, len, phrase) in chunk_lines {
+            lines.push((base + start, len, phrase));
+        }
+        for &(term, key, op) in chunk_terms {
             if let Some(&(_, key, _)) = ahead.next() {
                 // SAFETY: a prefetch of a bucket of the table (a 32-bit CRC, so
                 // hash >> shift < buckets.len()); a prefetch never faults anyway.
                 let bucket = vocab.buckets.as_ptr().wrapping_add(vocab.home(parts(key)));
                 unsafe { _mm_prefetch::<_MM_HINT_T0>(bucket as *const i8) };
             }
-            q.terms.push(vocab.intern(term, key) | op);
+            terms.push(vocab.intern(term, key) | op);
         }
     }
-    (q, vocab)
+    (Queries { lines, terms }, vocab)
 }
 
 #[derive(Clone, Copy, Default)]
@@ -280,12 +262,8 @@ fn find(buckets: *const Bucket, mask: usize, mut b: usize, key: __m128i) -> u32 
         // SAFETY: b <= mask, and the table has mask + 1 buckets.
         let slots = unsafe { &(*buckets.add(b)).0 };
         // SAFETY: two 32-byte loads that cover the 64-byte bucket.
-        let half = |i| unsafe {
-            _mm256_cmpeq_epi32(
-                _mm256_loadu_si256((slots.as_ptr() as *const __m256i).add(i)),
-                wide,
-            )
-        };
+        let ptr = slots.as_ptr() as *const __m256i;
+        let half = |i| unsafe { _mm256_cmpeq_epi32(_mm256_loadu_si256(ptr.add(i)), wide) };
         let m = movemask_ps(half(0)) | movemask_ps(half(1)) << 8;
         // Slot j matches when its 3 key dwords do: bits 4j..4j + 3 of m.
         // Adding 1 to such a run of ones carries into bit 4j + 3.
@@ -312,14 +290,9 @@ fn key_at(bytes: &[u8], at: usize, len: usize) -> __m128i {
     // its file, which mmap::PAD zero bytes follow) and KEEP (len <= 16); AVX2
     // is enabled for the whole build.
     unsafe {
-        let lower = _mm_or_si128(
-            _mm_loadu_si128(bytes.as_ptr().add(at) as *const __m128i),
-            _mm_set1_epi8(0x20),
-        );
-        _mm_and_si128(
-            lower,
-            _mm_loadu_si128((KEEP.as_ptr() as *const u8).add(16 - len) as *const __m128i),
-        )
+        let raw = _mm_loadu_si128(bytes.as_ptr().add(at).cast());
+        let keep = _mm_loadu_si128(KEEP.as_flattened().as_ptr().add(16 - len).cast());
+        _mm_and_si128(_mm_or_si128(raw, _mm_set1_epi8(0x20)), keep)
     }
 }
 
@@ -350,47 +323,32 @@ struct Vocab {
     /// The home bucket of a key is its hash >> shift.
     shift: u32,
     /// Terms of 13 to 32 bytes: about 0.2% of the corpus tokens are that long.
-    long: HashMap<&'static [u8], u32>,
+    long: std::collections::HashMap<&'static [u8], u32>,
     count: u32,
 }
 
 impl Vocab {
-    fn new(lines: usize) -> Self {
-        // Sized for about 1.5 distinct terms per query, about 2.3 per bucket (2 MB
-        // for 50,000 queries): twice that is 1% faster but 2 MB more memory. The
-        // table still grows if there are more terms.
-        let mut vocab = Vocab::default();
-        vocab.rebuild(
-            (lines * 3 / 5)
-                .next_power_of_two()
-                .max(1024)
-                .trailing_zeros(),
-        );
-        vocab
-    }
-
     fn home(&self, (lo, hi): (u64, u32)) -> usize {
         (hash(lo, hi) >> self.shift) as usize
     }
 
-    /// Moves the terms to a table of 2^bits buckets.
-    fn rebuild(&mut self, bits: u32) {
-        let old = std::mem::replace(&mut self.buckets, vec![Bucket::default(); 1 << bits]);
-        self.shift = 32 - bits;
-        old.iter()
-            .flat_map(|b| b.0)
-            .filter(|s| s.lo != 0)
-            .for_each(|s| self.insert(s));
+    /// Moves the terms to a table of `buckets` buckets, a power of two.
+    fn rebuild(&mut self, buckets: usize) {
+        let old = std::mem::replace(&mut self.buckets, vec![Bucket::default(); buckets]);
+        self.shift = 32 - buckets.trailing_zeros();
+        for slot in old.iter().flat_map(|b| b.0).filter(|s| s.lo != 0) {
+            self.insert((slot.lo, slot.hi), slot.info);
+        }
     }
 
     /// Adds a key that is not in the table yet, in the first free slot from its
     /// home bucket on (slots fill in order, so a bucket is full when its last is).
-    fn insert(&mut self, slot: Slot) {
-        let mut b = self.home((slot.lo, slot.hi));
+    fn insert(&mut self, (lo, hi): (u64, u32), info: u32) {
+        let mut b = self.home((lo, hi));
         while self.buckets[b].0[3].lo != 0 {
             b = (b + 1) & (self.buckets.len() - 1);
         }
-        *self.buckets[b].0.iter_mut().find(|s| s.lo == 0).unwrap() = slot;
+        *self.buckets[b].0.iter_mut().find(|s| s.lo == 0).unwrap() = Slot { lo, hi, info };
     }
 
     /// The id of `term`, whose table key is `key`.
@@ -402,14 +360,9 @@ impl Vocab {
             let id = find(self.buckets.as_ptr(), mask, self.home(parts(key)), key);
             if id == MISS {
                 if (self.count as usize + 1) * 2 > self.buckets.len() * 5 {
-                    self.rebuild(33 - self.shift);
+                    self.rebuild(2 * self.buckets.len());
                 }
-                let (lo, hi) = parts(key);
-                self.insert(Slot {
-                    lo,
-                    hi,
-                    info: self.count,
-                });
+                self.insert(parts(key), self.count);
             }
             id.min(self.count)
         };
@@ -419,15 +372,14 @@ impl Vocab {
 
     /// Renumbers the terms as the plan does and flags the anchors.
     fn finish(&mut self, plan: &Plan) {
-        let slots = self
-            .buckets
-            .iter_mut()
-            .flat_map(|b| &mut b.0)
-            .filter(|s| s.lo != 0);
-        slots.for_each(|s| s.info = plan.info[s.info as usize]);
-        self.long
-            .values_mut()
-            .for_each(|info| *info = plan.info[*info as usize]);
+        for slot in self.buckets.iter_mut().flat_map(|b| &mut b.0) {
+            if slot.lo != 0 {
+                slot.info = plan.info[slot.info as usize];
+            }
+        }
+        for info in self.long.values_mut() {
+            *info = plan.info[*info as usize];
+        }
     }
 
     #[cold]
@@ -497,19 +449,17 @@ impl Plan {
         let cost =
             |t: u32| 1.0 - (1.0 - sample_df[t as usize] as f64 / sampled.max(1) as f64).powi(64);
         // Whether each line is a BOOL query evaluated in every superblock.
-        let always_line = |&(start, len, phrase): &(u32, u32, bool)| {
+        let always_line = |line: usize| {
+            let (start, len, phrase) = q.lines[line];
             !phrase && {
                 let (cover, n) = cover(line_terms(start, len), cost);
                 cover[..n].iter().map(|&t| cost(t)).sum::<f64>() > ALWAYS
             }
         };
         let always_lines = par(parts, |p| {
-            q.lines[part(lines, p, parts)]
-                .iter()
-                .map(always_line)
-                .collect::<Vec<_>>()
-        })
-        .concat();
+            part(lines, p, parts).map(always_line).collect::<Vec<_>>()
+        });
+        let always_lines = always_lines.concat();
         // Per old id: 2 for a term of an `always` query, 1 for another BOOL term.
         let mut kind = vec![0u8; sample_df.len()];
         for (&(start, len, _), &always) in q.lines.iter().zip(&always_lines).filter(|l| !l.0.2) {
@@ -522,20 +472,18 @@ impl Plan {
         // first among them, each part by sampled frequency, most frequent first,
         // so the presence words and entries the scan uses most share cache lines.
         let all = 0..sample_df.len() as u32;
-        let (mut order, phrase_only): (Vec<u32>, Vec<u32>) =
-            all.partition(|&t| kind[t as usize] > 0);
+        let (mut order, phrase_only): (Vec<_>, Vec<_>) = all.partition(|&t| kind[t as usize] > 0);
         order.sort_unstable_by_key(|&t| Reverse((kind[t as usize], sample_df[t as usize])));
         let (nb, rows) = (order.len(), kind.iter().filter(|&&k| k == 2).count());
         order.extend(phrase_only);
-        let (mut rank, mut df) = (vec![0; order.len()], vec![0; order.len()]);
+        let mut rank = vec![0; order.len()];
         for (id, &old) in order.iter().enumerate() {
             rank[old as usize] = id as u32;
-            df[id] = sample_df[old as usize];
         }
         let mut terms = q.terms;
-        terms
-            .iter_mut()
-            .for_each(|word| *word = rank[(*word & TERM) as usize] | *word & !TERM);
+        for word in &mut terms {
+            *word = rank[(*word & TERM) as usize] | *word & !TERM;
+        }
         // The costs by new id, so `cover` finds the sets `always_line` found.
         let cost = |t: u32| cost(order[t as usize]);
         let lines_part = |p: usize| {
@@ -545,20 +493,16 @@ impl Plan {
                 let words = &terms[start as usize..(start + len) as usize];
                 let answer = line as u32; // the index of the line's answer in each thread's state
                 if phrase {
-                    let (offset, &anchor) = words
-                        .iter()
-                        .enumerate()
-                        .min_by_key(|&(_, &t)| df[t as usize])
-                        .unwrap();
-                    by_anchor.push((
-                        anchor,
-                        Anchored {
-                            answer,
-                            offset: offset as u32,
-                            start,
-                            len,
-                        },
-                    ));
+                    // The first of the rarest terms.
+                    let rarest = |&k: &usize| sample_df[order[words[k] as usize] as usize];
+                    let offset = (0..words.len()).min_by_key(rarest).unwrap();
+                    let anchored = Anchored {
+                        answer,
+                        offset: offset as u32,
+                        start,
+                        len,
+                    };
+                    by_anchor.push((words[offset], anchored));
                     continue;
                 }
                 // Padded with AND of the all-ones slot (or row).
@@ -591,7 +535,7 @@ impl Plan {
         // By length and operators, so that `end_super` predicts its branches.
         always.sort_unstable_by_key(|e| (e.earlier, e.terms.map(|word| word >> 30)));
         let (group, entries) = csr(by_trigger, nb + 1);
-        let (anchor, anchored) = csr(by_anchor, df.len());
+        let (anchor, anchored) = csr(by_anchor, order.len());
         let flag = |id: usize| (anchor[id] != anchor[id + 1]) as u32 * ANCHOR;
         let info = rank.iter().map(|&id| id | flag(id as usize)).collect();
         Plan {
@@ -646,8 +590,6 @@ struct Scan<'a> {
     vocab: &'a Vocab,
     plan: Option<&'a Plan>,
     df: &'a [AtomicU32],
-    /// Number of BOOL terms.
-    nb: usize,
     /// Per BOOL term, bit i: document `block + i` contains it. Slot nb collects
     /// the tokens of no BOOL query; slot nb + 1 is all ones.
     w: Vec<u64>,
@@ -679,7 +621,6 @@ impl<'a> Scan<'a> {
             vocab,
             plan,
             df,
-            nb,
             w,
             touched: vec![0; nb + 2],
             n: 0,
@@ -736,11 +677,9 @@ impl<'a> Scan<'a> {
                         unsafe { _mm_prefetch::<_MM_HINT_T0>(buckets.add(b) as *const i8) };
                         (key, b as u64)
                     } else {
+                        let info = self.vocab.get_long(&docs[p..p + len]) as u64;
                         // SAFETY: AVX2 is enabled for the whole build.
-                        (
-                            unsafe { _mm_setzero_si128() },
-                            self.vocab.get_long(&docs[p..p + len]) as u64,
-                        )
+                        (unsafe { _mm_setzero_si128() }, info)
                     };
                     // SAFETY: `reserve(32)` above made room for this chunk's tokens.
                     unsafe { buf.add(n).write(token) };
@@ -756,10 +695,7 @@ impl<'a> Scan<'a> {
                 starts &= starts - 1;
                 let len = (!shifted(b)).trailing_zeros() as usize;
                 let p = at + b as usize;
-                assert!(
-                    docs[p + len] == b'\t',
-                    "docs.txt: a line without an id and a TAB"
-                );
+                assert!(docs[p + len] == b'\t', "docs.txt: no TAB after an id");
                 self.look_up(bit);
                 bit = self.next_doc(&docs[p..p + len]);
             }
@@ -777,7 +713,8 @@ impl<'a> Scan<'a> {
     /// of one step overlap: the buckets were fetched when the tokens were found.
     /// (Fetching the words too cost more instructions than it saved.)
     fn look_up(&mut self, bit: u64) {
-        let (nb, table) = (self.nb, self.vocab);
+        // The number of BOOL terms.
+        let (nb, table) = (self.w.len() - 2, self.vocab);
         let (buckets, mask) = (table.buckets.as_ptr(), table.buckets.len() - 1);
         self.toks.reserve(self.pending.len());
         let (toks, mut len) = (self.toks.as_mut_ptr(), self.toks.len());
@@ -819,10 +756,8 @@ impl<'a> Scan<'a> {
     /// Ends the current document at the id token of the next one; returns its bit.
     fn next_doc(&mut self, digits: &[u8]) -> u64 {
         let id = parse_id(digits);
-        assert!(
-            id == self.doc.wrapping_add(1),
-            "docs.txt: ids must be 0, 1, 2, ... in order"
-        );
+        let ok = id == self.doc.wrapping_add(1);
+        assert!(ok, "docs.txt: ids must be 0, 1, 2, ... in order");
         self.end_doc();
         if id % 64 == 0 && self.n > 0 {
             self.end_block(id - 64);
@@ -855,9 +790,8 @@ impl<'a> Scan<'a> {
                             continue;
                         };
                         let phrase = &plan.terms[a.start as usize..(a.start + a.len) as usize];
-                        if self.toks.get(from..from + phrase.len()) == Some(phrase)
-                            && self.last[i] != doc
-                        {
+                        let hit = self.toks.get(from..from + phrase.len()) == Some(phrase);
+                        if hit && self.last[i] != doc {
                             self.last[i] = doc;
                             self.answers.add(a.answer, 1 << (doc % 64), doc & !63);
                         }
@@ -875,52 +809,45 @@ impl<'a> Scan<'a> {
     fn end_block(&mut self, base: u32) {
         let w = &mut self.w;
         if let Some(plan) = self.plan {
-            let touched = &self.touched[..self.n];
+            let (touched, group) = (&self.touched[..self.n], plan.group.as_ptr());
             for (i, t) in touched.iter().map(|&t| t as usize).enumerate() {
                 // Fetched in advance: the group 16 slots ahead, the entries of 8 ahead.
-                // SAFETY: prefetches of the plan's arrays; touched slots are at most nb.
+                // SAFETY: prefetches of the plan's arrays (touched slots are at most
+                // nb, and group has nb + 2 entries); a prefetch never faults anyway.
                 unsafe {
                     let ahead = |k: usize| *touched.get(i + k).unwrap_or(&0) as usize;
-                    _mm_prefetch::<_MM_HINT_T0>(plan.group.as_ptr().add(ahead(16)) as *const i8);
-                    _mm_prefetch::<_MM_HINT_T0>(
-                        plan.entries
-                            .as_ptr()
-                            .add(*plan.group.get_unchecked(ahead(8)) as usize)
-                            as *const i8,
-                    );
+                    _mm_prefetch::<_MM_HINT_T0>(group.add(ahead(16)) as *const i8);
+                    let entries = plan.entries.as_ptr().add(*group.add(ahead(8)) as usize);
+                    _mm_prefetch::<_MM_HINT_T0>(entries as *const i8);
                 }
                 // SAFETY: touched slots are at most nb, and group has nb + 2 entries.
-                let entries = unsafe {
-                    plan.entries.get_unchecked(
-                        *plan.group.get_unchecked(t) as usize
-                            ..*plan.group.get_unchecked(t + 1) as usize,
-                    )
-                };
-                for e in entries {
+                let (from, to) = unsafe { (*group.add(t) as usize, *group.add(t + 1) as usize) };
+                // SAFETY: group holds offsets into entries.
+                for e in unsafe { plan.entries.get_unchecked(from..to) } {
+                    // All ones when bit 0 of b is set: bit(op) for NOT and OR,
+                    // bit(op >> 1) only for OR.
                     let bit = |b: u32| 0u64.wrapping_sub((b & 1) as u64);
                     let r = e.terms.iter().fold(0u64, |r, &word| {
-                        // SAFETY: the plan's slots are below w.len().
+                        // SAFETY: every term word's slot is below nb or the pad
+                        // slot nb + 1, and w has nb + 2 words.
                         let x = unsafe { *w.get_unchecked((word & TERM) as usize) };
                         // AND: r & x. NOT: r & !x. OR: (r & !x) | x = r | x.
                         (r & (x ^ bit(word >> 30))) | (x & bit(word >> 31))
                     });
                     // A branch on the few entries with earlier cover terms.
-                    let seen = e.earlier != 0
-                        && (0..MAX_BOOL_TERMS)
-                            .any(|k| w[(e.terms[k] & TERM) as usize] & bit(e.earlier >> k) != 0);
+                    let present = |k| w[(e.terms[k] & TERM) as usize] & bit(e.earlier >> k) != 0;
+                    let seen = e.earlier != 0 && (0..MAX_BOOL_TERMS).any(present);
                     self.answers.add(e.answer, if seen { 0 } else { r }, base);
                 }
             }
         }
         let (rows, block) = (self.wide.len() - 2, (base / 64 % (SUPER / 64)) as usize);
+        let wide = self.wide.as_mut_ptr();
         for &t in &self.touched[..self.n] {
             // SAFETY: min(t, rows) < wide.len(), t <= nb < w.len(), block < 4.
             unsafe {
-                *self
-                    .wide
-                    .get_unchecked_mut((t as usize).min(rows))
-                    .0
-                    .get_unchecked_mut(block) = *w.get_unchecked(t as usize);
+                let row = &mut (*wide.add((t as usize).min(rows))).0;
+                *row.get_unchecked_mut(block) = *w.get_unchecked(t as usize);
                 *w.get_unchecked_mut(t as usize) = 0;
             }
         }
@@ -931,23 +858,22 @@ impl<'a> Scan<'a> {
     /// `base`, like `end_block` but on four words at once, then clears it.
     fn end_super(&mut self, base: u32) {
         let Some(plan) = self.plan else { return };
-        let wide = &self.wide;
+        let wide = self.wide.as_ptr() as *const __m256i;
         for e in &plan.always {
-            // SAFETY: aligned 32-byte loads of rows (the plan's rows are below
-            // wide.len()); AVX2 is enabled for the whole build.
+            // For `always` entries, `earlier` holds the number of terms.
+            let terms = &e.terms[..e.earlier as usize];
+            // SAFETY: 32-byte loads of rows, which are 32-byte aligned (Row is
+            // repr(align(32))); the plan's rows are below wide.len(). AVX2 is
+            // enabled for the whole build.
             let hits = unsafe {
-                e.terms[..e.earlier as usize]
-                    .iter()
-                    .fold(_mm256_setzero_si256(), |r, &word| {
-                        let x = _mm256_load_si256(
-                            wide.get_unchecked((word & TERM) as usize).0.as_ptr() as *const __m256i,
-                        );
-                        match word >> 30 {
-                            AND => _mm256_and_si256(r, x),
-                            NOT => _mm256_andnot_si256(x, r),
-                            _ => _mm256_or_si256(r, x),
-                        }
-                    })
+                terms.iter().fold(_mm256_setzero_si256(), |r, &word| {
+                    let x = _mm256_load_si256(wide.add((word & TERM) as usize));
+                    match word >> 30 {
+                        AND => _mm256_and_si256(r, x),
+                        NOT => _mm256_andnot_si256(x, r),
+                        _ => _mm256_or_si256(r, x),
+                    }
+                })
             };
             self.answers.add_wide(e.answer, hits, base);
         }
@@ -982,6 +908,7 @@ impl Answers {
     fn new(answers: usize) -> Self {
         Answers {
             state: written_zeros(answers),
+            // One more: `add` always writes the slot after the logged ids.
             log: vec![0; answers * 10 + 1],
             logged: 0,
         }
@@ -991,12 +918,8 @@ impl Answers {
     fn add(&mut self, answer: u32, hits: u64, base: u32) {
         // SAFETY: answers index the state; an answer logs at most 10 ids, so
         // logged <= 10 * answers < log.len().
-        let (s, log) = unsafe {
-            (
-                &mut *self.state.as_mut_ptr().add(answer as usize),
-                self.log.as_mut_ptr(),
-            )
-        };
+        let s = unsafe { &mut *self.state.as_mut_ptr().add(answer as usize) };
+        let log = self.log.as_mut_ptr();
         let count = *s >> SUM_BITS;
         let entry = |bits: u64| (answer as u64) << 32 | (base + bits.trailing_zeros()) as u64;
         // The first id without a branch: always written, kept only if wanted.
@@ -1014,20 +937,12 @@ impl Answers {
             rest &= rest - 1;
         }
         // The bit positions' sum, one binary digit at a time: digit j is set in
-        // the positions that the mask POSITION_BITS[j] covers.
-        const POSITION_BITS: [u64; 6] = [
-            0xAAAA_AAAA_AAAA_AAAA,
-            0xCCCC_CCCC_CCCC_CCCC,
-            0xF0F0_F0F0_F0F0_F0F0,
-            0xFF00_FF00_FF00_FF00,
-            0xFFFF_0000_FFFF_0000,
-            0xFFFF_FFFF_0000_0000,
-        ];
-        let positions: u64 = (POSITION_BITS.iter().enumerate())
-            .map(|(j, &m)| ((hits & m).count_ones() as u64) << j)
-            .sum();
+        // the positions that `digit(j)` covers (0xAAAA..., 0xCCCC..., 0xF0F0...,
+        // ..., 0xFFFF_FFFF_0000_0000), constants once the loop is unrolled.
+        let digit = |j: u32| !0u64 / ((1 << (1 << j)) + 1) << (1 << j);
+        let positions = (0..6).map(|j| ((hits & digit(j)).count_ones() as u64) << j);
         let n = hits.count_ones() as u64;
-        *s += n << SUM_BITS | (n * base as u64 + positions);
+        *s += n << SUM_BITS | (n * base as u64 + positions.sum::<u64>());
     }
 
     /// `add` for the 256 documents from `base`, one word of `hits` per 64.
@@ -1054,45 +969,29 @@ impl Answers {
 fn count_positions(v: __m256i) -> (u64, u64) {
     // SAFETY: AVX2 is enabled for the whole build.
     unsafe {
-        let table = |t: [i8; 16]| {
-            _mm256_broadcastsi128_si256(_mm_loadu_si128(t.as_ptr() as *const __m128i))
-        };
-        let popcount = table([0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4]);
+        let table = |t: &[u8; 16]| _mm256_broadcastsi128_si256(_mm_loadu_si128(t.as_ptr().cast()));
+        // `pop`: the set bits of a nibble.
+        let pop = table(&[0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4]);
         // The bit positions of a low nibble, and of a high one (4 more per bit).
-        let low = table([0, 0, 1, 1, 2, 2, 3, 3, 3, 3, 4, 4, 5, 5, 6, 6]);
-        let high = table([0, 4, 5, 9, 6, 10, 11, 15, 7, 11, 12, 16, 13, 17, 18, 22]);
+        let low = table(&[0, 0, 1, 1, 2, 2, 3, 3, 3, 3, 4, 4, 5, 5, 6, 6]);
+        let high = table(&[0, 4, 5, 9, 6, 10, 11, 15, 7, 11, 12, 16, 13, 17, 18, 22]);
         let nibble = _mm256_set1_epi8(0x0F);
-        let (lo, hi) = (
-            _mm256_and_si256(v, nibble),
-            _mm256_and_si256(_mm256_srli_epi16::<4>(v), nibble),
-        );
-        let count = _mm256_add_epi8(
-            _mm256_shuffle_epi8(popcount, lo),
-            _mm256_shuffle_epi8(popcount, hi),
-        );
+        let (lo, hi) = (_mm256_and_si256(v, nibble), _mm256_srli_epi16::<4>(v));
+        let hi = _mm256_and_si256(hi, nibble);
+        let count = _mm256_add_epi8(_mm256_shuffle_epi8(pop, lo), _mm256_shuffle_epi8(pop, hi));
         let own = _mm256_add_epi8(_mm256_shuffle_epi8(low, lo), _mm256_shuffle_epi8(high, hi));
         // Byte b adds 8b per set bit: 16-bit sums of byte pairs, then 32-bit sums,
         // with the count added at bit 16 (the position sum is below 2^15).
-        let eight_b = _mm256_setr_epi8(
-            0, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, -128, -120, -112,
-            -104, -96, -88, -80, -72, -64, -56, -48, -40, -32, -24, -16, -8,
-        );
+        // maddubs reads its first operand as unsigned bytes, 0 to 248 here.
+        let eight_b = _mm256_loadu_si256(EIGHT_B.as_ptr().cast());
         let (ones8, ones16) = (_mm256_set1_epi8(1), _mm256_set1_epi16(1));
-        let pos = _mm256_add_epi16(
-            _mm256_maddubs_epi16(eight_b, count),
-            _mm256_maddubs_epi16(own, ones8),
-        );
-        let sums = _mm256_add_epi32(
-            _mm256_madd_epi16(pos, ones16),
-            _mm256_slli_epi32::<16>(_mm256_madd_epi16(
-                _mm256_maddubs_epi16(count, ones8),
-                ones16,
-            )),
-        );
-        let s = _mm_add_epi32(
-            _mm256_castsi256_si128(sums),
-            _mm256_extracti128_si256::<1>(sums),
-        );
+        let pos = _mm256_maddubs_epi16(eight_b, count);
+        let pos = _mm256_add_epi16(pos, _mm256_maddubs_epi16(own, ones8));
+        let counts = _mm256_madd_epi16(_mm256_maddubs_epi16(count, ones8), ones16);
+        let pos = _mm256_madd_epi16(pos, ones16);
+        let sums = _mm256_add_epi32(pos, _mm256_slli_epi32::<16>(counts));
+        let s = _mm256_castsi256_si128(sums);
+        let s = _mm_add_epi32(s, _mm256_extracti128_si256::<1>(sums));
         let s = _mm_add_epi32(s, _mm_shuffle_epi32::<0b01_00_11_10>(s));
         let s = _mm_add_epi32(s, _mm_shuffle_epi32::<0b10_11_00_01>(s));
         let total = _mm_cvtsi128_si32(s) as u64;
@@ -1100,16 +999,18 @@ fn count_positions(v: __m256i) -> (u64, u64) {
     }
 }
 
+/// 8b at byte b.
+static EIGHT_B: [u8; 32] = [
+    0, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168,
+    176, 184, 192, 200, 208, 216, 224, 232, 240, 248,
+];
+
 /// Bit i is set when byte `at + i` is `byte`.
 fn byte_mask(docs: &[u8], at: usize, byte: u8) -> u64 {
     // SAFETY: unaligned 32-byte loads from 32-byte slices; AVX2 is enabled for the whole build.
-    let half = |at: usize| {
-        movemask(unsafe {
-            _mm256_cmpeq_epi8(
-                _mm256_loadu_si256(docs[at..at + 32].as_ptr() as *const __m256i),
-                _mm256_set1_epi8(byte as i8),
-            )
-        })
+    let half = |at: usize| unsafe {
+        let v = _mm256_loadu_si256(docs[at..at + 32].as_ptr() as *const __m256i);
+        movemask(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(byte as i8)))
     };
     half(at) as u64 | (half(at + 32) as u64) << 32
 }
@@ -1122,12 +1023,9 @@ fn token_mask(docs: &[u8], at: usize, end: usize) -> u64 {
         // for the whole build.
         movemask(unsafe {
             let v = _mm256_loadu_si256(bytes.as_ptr() as *const __m256i);
-            let between = |x, lo: u8, hi: u8| {
-                _mm256_and_si256(
-                    _mm256_cmpgt_epi8(x, _mm256_set1_epi8(lo as i8 - 1)),
-                    _mm256_cmpgt_epi8(_mm256_set1_epi8(hi as i8 + 1), x),
-                )
-            };
+            let at_least = |x, lo: u8| _mm256_cmpgt_epi8(x, _mm256_set1_epi8(lo as i8 - 1));
+            let at_most = |x, hi: u8| _mm256_cmpgt_epi8(_mm256_set1_epi8(hi as i8 + 1), x);
+            let between = |x, lo, hi| _mm256_and_si256(at_least(x, lo), at_most(x, hi));
             // Signed compares: bytes 0x80 and up are negative, never letters or
             // digits. Letters are tested on v | 0x20, digits on the raw byte.
             let letter = between(_mm256_or_si256(v, _mm256_set1_epi8(0x20)), b'a', b'z');
@@ -1143,12 +1041,10 @@ fn token_mask(docs: &[u8], at: usize, end: usize) -> u64 {
 
 /// `vmovmskps`, hidden from LLVM like `movemask`.
 fn movemask_ps(v: __m256i) -> u32 {
-    let mask: u32;
+    let m: u32;
     // SAFETY: AVX2 is enabled for this build; the instruction reads one register.
-    unsafe {
-        std::arch::asm!("vmovmskps {0:e}, {1}", out(reg) mask, in(ymm_reg) v, options(pure, nomem, nostack))
-    };
-    mask
+    unsafe { asm!("vmovmskps {:e}, {}", out(reg) m, in(ymm_reg) v, options(pure, nomem, nostack)) };
+    m
 }
 
 /// `if c == 0 { a } else { b }` as a cmov: LLVM turns such selects of loaded
@@ -1157,7 +1053,7 @@ fn if_zero(c: u64, a: u64, b: u64) -> u64 {
     let mut r = b;
     // SAFETY: register-only instructions.
     unsafe {
-        std::arch::asm!("test {c}, {c}", "cmovz {r}, {a}", c = in(reg) c, a = in(reg) a, r = inout(reg) r, options(pure, nomem, nostack))
+        asm!("test {c}, {c}", "cmovz {r}, {a}", c = in(reg) c, a = in(reg) a, r = inout(reg) r, options(pure, nomem, nostack))
     };
     r
 }
@@ -1166,12 +1062,10 @@ fn if_zero(c: u64, a: u64, b: u64) -> u64 {
 /// combination of two movemasks into a bit-by-bit extraction that costs a quarter
 /// of the runtime.
 fn movemask(v: __m256i) -> u32 {
-    let mask: u32;
+    let m: u32;
     // SAFETY: AVX2 is enabled for this build; the instruction reads one register.
-    unsafe {
-        std::arch::asm!("vpmovmskb {0:e}, {1}", out(reg) mask, in(ymm_reg) v, options(pure, nomem, nostack))
-    };
-    mask
+    unsafe { asm!("vpmovmskb {:e}, {}", out(reg) m, in(ymm_reg) v, options(pure, nomem, nostack)) };
+    m
 }
 
 /// Splits the corpus into about `parts` ranges of whole lines. A block or
@@ -1179,24 +1073,21 @@ fn movemask(v: __m256i) -> u32 {
 /// as containing no term, so they match nothing there.
 /// Returns (start, end, first id) per slice.
 fn slices(text: &[u8], parts: usize) -> Vec<(usize, usize, u32)> {
-    let mut starts: Vec<usize> = (0..parts)
-        .map(|p| line_after(text, text.len() * p / parts))
-        .collect();
+    let mut starts: Vec<usize> = (0..parts).map(|p| cut(text, p, parts)).collect();
     starts.dedup();
     starts.retain(|&start| start < text.len());
     let ends = starts.iter().skip(1).copied().chain([text.len()]);
     let id = |at: usize| {
-        let tab = text[at..]
-            .iter()
-            .position(|&b| b == b'\t')
-            .expect("docs.txt: a line without a TAB");
-        parse_id(&text[at..at + tab])
+        let tab = text[at..].iter().position(|&b| b == b'\t');
+        parse_id(&text[at..at + tab.expect("docs.txt: a line without a TAB")])
     };
-    starts
-        .iter()
-        .zip(ends)
-        .map(|(&start, end)| (start, end, id(start)))
-        .collect()
+    let slice = |(&start, end): (&usize, usize)| (start, end, id(start));
+    starts.iter().zip(ends).map(slice).collect()
+}
+
+/// The start of the p-th of `parts` ranges of whole lines of `text`.
+fn cut(text: &[u8], p: usize, parts: usize) -> usize {
+    line_after(text, text.len() * p / parts)
 }
 
 /// The start of the line after the one that holds byte `at`, or the end of
@@ -1204,31 +1095,21 @@ fn slices(text: &[u8], parts: usize) -> Vec<(usize, usize, u32)> {
 fn line_after(text: &[u8], at: usize) -> usize {
     let at = at.min(text.len());
     let next = text[at..].iter().position(|&b| b == b'\n');
-    if at == 0 {
-        0
-    } else {
-        next.map_or(text.len(), |i| at + i + 1)
-    }
+    let next = next.map_or(text.len(), |i| at + i + 1);
+    if at == 0 { 0 } else { next }
 }
 
 fn parse_id(digits: &[u8]) -> u32 {
     let ok = !digits.is_empty() && digits.len() <= 9 && digits.iter().all(u8::is_ascii_digit);
     assert!(ok, "docs.txt: bad id {:?}", String::from_utf8_lossy(digits));
-    digits
-        .iter()
-        .fold(0, |acc, &b| acc * 10 + (b - b'0') as u32)
+    digits.iter().fold(0, |n, &b| n * 10 + (b - b'0') as u32)
 }
 
 fn push_decimal(out: &mut Vec<u8>, mut value: u64) {
-    let mut digits = [0u8; 20];
-    let mut i = digits.len();
-    loop {
-        i -= 1;
-        digits[i] = b'0' + (value % 10) as u8;
+    let digits = value.checked_ilog10().unwrap_or(0) as usize + 1;
+    out.resize(out.len() + digits, 0);
+    for digit in out.iter_mut().rev().take(digits) {
+        *digit = b'0' + (value % 10) as u8;
         value /= 10;
-        if value == 0 {
-            break;
-        }
     }
-    out.extend_from_slice(&digits[i..]);
 }
