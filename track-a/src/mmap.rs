@@ -46,6 +46,8 @@ pub fn no_huge_pages() {
 }
 
 const PROT_READ: c_int = 1;
+const PROT_WRITE: c_int = 2;
+const MAP_SHARED: c_int = 1;
 const MAP_PRIVATE: c_int = 2;
 
 /// Maps the whole file read-only for the rest of the process. It is never
@@ -72,4 +74,30 @@ pub fn map(file: &File) -> io::Result<&'static [u8]> {
     }
     // SAFETY: the mapping is valid for `len` bytes and lives until exit.
     Ok(unsafe { std::slice::from_raw_parts(ptr as *const u8, len) })
+}
+
+/// Maps the first `len` bytes of a file opened for reading and writing, shared:
+/// writing the slice writes the file. Never unmapped, like `map`.
+pub fn map_mut(file: &File, len: usize) -> io::Result<&'static mut [u8]> {
+    if len == 0 {
+        return Ok(&mut []);
+    }
+    // SAFETY: a fresh shared mapping of `len` bytes of a file this process just
+    // created and sized; nothing else maps or writes it.
+    let ptr = unsafe {
+        mmap(
+            std::ptr::null_mut(),
+            len,
+            PROT_READ | PROT_WRITE,
+            MAP_SHARED,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    if ptr as isize == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the mapping is valid for `len` bytes, lives until exit, and this is
+    // the only reference to it.
+    Ok(unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, len) })
 }

@@ -25,8 +25,8 @@
 
 mod mmap;
 
-use std::fs::File;
-use std::os::unix::fs::FileExt;
+use std::fs::{File, OpenOptions};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::thread;
 
@@ -54,7 +54,14 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
     let input = File::open(&input_path).map_err(|e| format!("open {input_path}: {e}"))?;
     let log = mmap::map(&input).map_err(|e| format!("mmap {input_path}: {e}"))?;
     let output_path = format!("{out_dir}/summary.txt");
-    let output = File::create(&output_path).map_err(|e| format!("create {output_path}: {e}"))?;
+    // Read and write: the output is mapped shared and written through memory.
+    let output = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&output_path);
+    let output = output.map_err(|e| format!("create {output_path}: {e}"))?;
     if log.is_empty() {
         return Ok(()); // the spec's empty input gives an empty summary
     }
@@ -200,43 +207,44 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
     drop(parts);
     stats.sort_unstable_by_key(|&(hour, _, _)| hour);
 
-    // Pass 3, parallel: format every hour straight to its offset in the file.
-    let mut offsets = vec![0];
-    for (_, _, len) in &stats {
-        offsets.push(offsets.last().unwrap() + len);
-    }
+    // Pass 3, parallel: format every hour straight into its part of the file,
+    // mapped shared. On tmpfs, where /out is, one write call per hour would
+    // serialise on the file's lock; page faults on the mapping do not.
+    let total = stats.iter().map(|&(_, _, len)| len).sum::<usize>();
     output
-        .set_len(*offsets.last().unwrap() as u64)
+        .set_len(total as u64)
         .map_err(|e| format!("size {output_path}: {e}"))?;
+    let mut file = mmap::map_mut(&output, total).map_err(|e| format!("mmap {output_path}: {e}"))?;
+    let pieces: Vec<Mutex<&mut [u8]>> = stats
+        .iter()
+        .map(|&(_, _, len)| {
+            let (piece, rest) = std::mem::take(&mut file).split_at_mut(len);
+            file = rest;
+            Mutex::new(piece)
+        })
+        .collect();
     let next = AtomicUsize::new(0);
     thread::scope(|s| {
-        let handles: Vec<_> = (0..threads)
-            .map(|_| {
-                let (stats, offsets, hours, names, output, next) =
-                    (&stats, &offsets, &hours, &names, &output, &next);
-                s.spawn(move || -> std::io::Result<()> {
-                    let mut out = Vec::new();
-                    loop {
-                        let k = next.fetch_add(1, Relaxed);
-                        let Some((hour, groups, len)) = stats.get(k) else {
-                            return Ok(());
-                        };
-                        out.clear();
-                        for stat in groups {
-                            stat.write(&hours[*hour], names, &mut out);
-                        }
-                        assert_eq!(out.len(), *len, "hour length computed wrongly");
-                        output.write_all_at(&out, offsets[k] as u64)?;
+        for _ in 0..threads {
+            let (stats, pieces, hours, names, next) = (&stats, &pieces, &hours, &names, &next);
+            s.spawn(move || {
+                let mut out = Vec::new();
+                loop {
+                    let k = next.fetch_add(1, Relaxed);
+                    let Some((hour, groups, _)) = stats.get(k) else {
+                        break;
+                    };
+                    out.clear();
+                    for stat in groups {
+                        stat.write(&hours[*hour], names, &mut out);
                     }
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| h.join().unwrap())
-            .collect::<std::io::Result<()>>()
-    })
-    .map_err(|e| format!("write {output_path}: {e}"))
+                    // Panics if the length computed in pass 2 was wrong.
+                    pieces[k].lock().unwrap().copy_from_slice(&out);
+                }
+            });
+        }
+    });
+    Ok(())
 }
 
 /// The first 13 bytes of a timestamp, "YYYY-MM-DDTHH": one UTC hour.
