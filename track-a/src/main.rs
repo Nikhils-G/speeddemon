@@ -139,12 +139,12 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
                             if group.is_empty() {
                                 continue;
                             }
-                            group.sort_unstable();
+                            let [p50, p95, p99] = percentiles(group);
                             let (n, errs) = (group.len() as u64, errors[rank] as u64);
                             out.extend_from_slice(&label);
                             out.push(b' ');
                             out.extend_from_slice(names[rank]);
-                            for value in [n, rank_value(group, 50), rank_value(group, 95), rank_value(group, 99), errs, errs * 1_000_000 / n] {
+                            for value in [n, p50, p95, p99, errs, errs * 1_000_000 / n] {
                                 out.push(b' ');
                                 push_decimal(&mut out, value);
                             }
@@ -489,9 +489,16 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (yoe + era * 400 + (m <= 2) as i64, m, d)
 }
 
-/// Nearest rank: the value at 1-indexed rank ceil(p * n / 100) of sorted values.
-fn rank_value(sorted: &[u32], p: usize) -> u64 {
-    sorted[(p * sorted.len() + 99) / 100 - 1] as u64
+/// Nearest-rank p50, p95 and p99 (the value at 1-indexed rank ceil(p * n / 100)
+/// in sorted order) of a non-empty group, by selection instead of a full sort: p50
+/// first, then each next rank within the part above the last one. Each value is
+/// read at once: the next selection reorders that part, its own slot included.
+fn percentiles(values: &mut [u32]) -> [u64; 3] {
+    let [r50, r95, r99] = [50, 95, 99].map(|p| (p * values.len()).div_ceil(100) - 1);
+    let p50 = *values.select_nth_unstable(r50).1;
+    let p95 = *values[r50..].select_nth_unstable(r95 - r50).1;
+    let p99 = *values[r95..].select_nth_unstable(r99 - r95).1;
+    [p50, p95, p99].map(u64::from)
 }
 
 fn push_decimal(out: &mut Vec<u8>, mut value: u64) {
