@@ -827,7 +827,11 @@ struct Answers {
 
 impl Answers {
     fn new(answers: usize) -> Self {
-        Answers { state: vec![0; answers], log: vec![0; answers * 10 + 1], logged: 0 }
+        // Written now: a lazily zeroed page that is read first faults again
+        // when written, and that fault flushes the TLB of every thread.
+        let mut state = Vec::with_capacity(answers);
+        state.resize(answers, std::hint::black_box(0));
+        Answers { state, log: vec![0; answers * 10 + 1], logged: 0 }
     }
 
     /// Adds the documents `base + i` for each bit i of `hits`, which may be 0.
