@@ -2,9 +2,9 @@
 //!
 //! There is no index: the corpus is scanned once, in parallel slices, and every
 //! query is answered during that scan, so nothing grows with the corpus.
-//! 1. The queries come first. Only their terms are looked up, in one shared
-//!    table, its bucket fetched in advance: each document's tokens are found
-//!    first, then looked up.
+//! 1. The queries come first. Only their terms are looked up, in a perfect hash
+//!    of them: one 16-byte slot per term, fetched in advance. Each document's
+//!    tokens are found first, then looked up.
 //! 2. BOOL queries are evaluated per block of 64 documents. While a block is
 //!    scanned, each query term present gets a 64-bit word with one bit per
 //!    document, so at the block end AND, OR and NOT are word operations, applied
@@ -24,16 +24,17 @@ mod mmap;
 use std::arch::asm;
 use std::arch::x86_64::*;
 use std::cmp::Reverse;
-use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use std::mem::{replace, transmute};
+use std::sync::atomic::{AtomicU16, AtomicU32, Ordering::Relaxed};
 
-#[cfg(not(all(target_feature = "avx2", target_feature = "bmi2")))]
-compile_error!("track-b needs AVX2 and BMI2: build with RUSTFLAGS=\"-C target-cpu=native\"");
+#[cfg(not(all(target_feature = "avx2", target_feature = "bmi2", target_feature = "aes")))]
+compile_error!("track-b needs AVX2, BMI2 and AES-NI: build with RUSTFLAGS=\"-C target-cpu=native\"");
 
 /// A token's info word: its term id, plus ANCHOR if a phrase is anchored on it.
 /// A token that no query uses gets MISS.
 const ANCHOR: u32 = 1 << 31;
 const MISS: u32 = ANCHOR - 1;
-/// Terms of up to KEY bytes live in the bucket table, keyed by their bytes.
+/// Terms of up to KEY bytes live in the perfect hash, keyed by their bytes.
 const KEY: usize = 12;
 /// The spec's grammar: a BOOL query has 1 to 6 terms.
 const MAX_BOOL_TERMS: usize = 6;
@@ -159,9 +160,12 @@ type Queries = (Vec<(u32, u32, bool)>, Vec<u32>);
 
 /// Splits `chunk`, whole lines of `padded` (the file and mmap::PAD zero bytes),
 /// into its lines, as in `Queries` but from 0, and their terms: each with its
-/// table key (zero for a long term) and, in a BOOL query, its op << 30.
-fn split_lines(chunk: &'static [u8], padded: &'static [u8]) -> Split {
-    let (mut lines, mut terms) = (Vec::new(), Vec::new());
+/// table key (zero for a long term) and, in a BOOL query, its op << 30. Also
+/// the hashes (with `seed`) and keys of the terms, by hash & 63 (their group),
+/// and the long terms. (The long terms' zero key then gets an id that no term
+/// uses: harmless.)
+fn split_lines(chunk: &'static [u8], padded: &'static [u8], seed: u64) -> Split {
+    let (mut lines, mut terms, mut short, mut long) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     // Every line is a query of the spec's grammar (2.3) and ends with LF.
     for line in chunk.split_inclusive(|&b| b == b'\n') {
         let (start, phrase) = (terms.len(), line[0] == b'P');
@@ -174,6 +178,10 @@ fn split_lines(chunk: &'static [u8], padded: &'static [u8]) -> Split {
                 // Length 0 gives the zero key, which marks a long term.
                 let key = key_at(padded, at, if word.len() > KEY { 0 } else { word.len() });
                 terms.push((word, key, op << 30));
+                long.extend((word.len() > KEY).then_some(word));
+                // SAFETY: __m128i and u128 have the same size, and any bits are valid.
+                let bits = unsafe { transmute::<__m128i, u128>(key) };
+                short.push((hash(key, seed), bits));
             } else {
                 op = match word[0] {
                     b'A' => AND,
@@ -184,77 +192,49 @@ fn split_lines(chunk: &'static [u8], padded: &'static [u8]) -> Split {
         }
         lines.push((start as u32, (terms.len() - start) as u32, phrase));
     }
-    (lines, terms)
+    short.sort_unstable_by_key(|e| e.0 & 63);
+    (lines, terms, short, long)
 }
 
-type Split = (Vec<(u32, u32, bool)>, Vec<(&'static [u8], __m128i, u32)>);
+type Split = (Vec<(u32, u32, bool)>, Vec<Term>, Vec<Key>, Vec<Long>);
+type Long = &'static [u8];
+type Term = (&'static [u8], __m128i, u32);
+/// A key's hash and its bytes.
+type Key = (u64, u128);
 
-/// Splits the lines in parallel, then gives the terms ids in order. `padded` is
-/// the file and mmap::PAD zero bytes.
+
+
+/// Splits the lines in parallel, then gives the terms ids: their slots in the
+/// perfect hash. `padded` is the file and mmap::PAD zero bytes.
 fn parse_queries(padded: &'static [u8], threads: usize) -> (Queries, Vocab) {
     let text = &padded[..padded.len() - mmap::PAD];
     let cut = |p: usize| cut(text, p, threads);
-    let splits = par(threads, &|p| split_lines(&text[cut(p)..cut(p + 1)], padded));
-    // The term table is sized for about 1.5 distinct terms per query, about 2.3
-    // per bucket (2 MB for 50,000 queries): twice that is 1% faster but 2 MB more
-    // memory. It still grows if there are more terms.
-    let lines: usize = splits.iter().map(|s| s.0.len()).sum();
-    let mut vocab = Vocab::default();
-    vocab.rebuild((lines * 3 / 5).max(1024).next_power_of_two());
+    let chunk = |p| &text[cut(p)..cut(p + 1)];
+    let split = |seed| par(threads, &|p| split_lines(chunk(p), padded, seed));
+    let (vocab, ids, splits) = (0..).find_map(|s| Vocab::new(split(s), s)).unwrap();
     let (mut lines, mut terms) = (Vec::new(), Vec::new());
-    // Each term's bucket is fetched 16 terms in advance: the table is in L3.
-    let mut ahead = splits.iter().flat_map(|s| &s.1).skip(16);
-    for (chunk_lines, chunk_terms) in &splits {
+    for (split, ids) in splits.iter().zip(ids) {
         let base = terms.len() as u32;
-        lines.extend(chunk_lines.iter().map(|&(s, n, p)| (base + s, n, p)));
-        for &(term, key, op) in chunk_terms {
-            // A bucket of the table: a 32-bit CRC, so hash >> shift < buckets.len().
-            // (The last 16 terms fetch their own.)
-            let ahead = ahead.next().map_or(key, |a| a.1);
-            prefetch(vocab.buckets.as_ptr(), vocab.home(parts(ahead)));
-            terms.push(vocab.intern(term, key) | op);
-        }
+        lines.extend(split.0.iter().map(|&(s, n, p)| (base + s, n, p)));
+        terms.extend(ids);
     }
     ((lines, terms), vocab)
 }
 
-#[derive(Clone, Copy, Default)]
-struct Slot {
-    lo: u64,
-    hi: u32,
-    info: u32,
-}
-
-/// Four slots in one cache line, so a probe costs one memory access.
-#[derive(Clone, Copy, Default)]
-#[repr(align(64))]
-struct Bucket([Slot; 4]);
-
-/// The info of `key` in the buckets from b on, or MISS: a full bucket continues
-/// into the next one, as `Vocab::insert` does. A raw pointer and mask, so that
-/// a loop that calls it keeps them in registers.
+/// The info of `slot` if its key is `key`, else MISS. A slot is a term's key
+/// (12 bytes, zero-padded) under its info word (the top 4 bytes): the key bytes
+/// are compared in one vptest, and the cmov keeps it branch-free (LLVM would
+/// branch).
 #[inline(always)]
-fn find(buckets: *const Bucket, mask: usize, mut b: usize, key: __m128i) -> u32 {
-    // SAFETY: AVX2 is enabled for the whole build.
-    let wide = unsafe { _mm256_broadcastsi128_si256(key) };
-    loop {
-        // SAFETY: b <= mask, and the table has mask + 1 buckets.
-        let slots = unsafe { &(*buckets.add(b)).0 };
-        // SAFETY: two 32-byte loads that cover the 64-byte bucket.
-        let ptr = slots.as_ptr() as *const __m256i;
-        let half = |i| unsafe { _mm256_cmpeq_epi32(_mm256_loadu_si256(ptr.add(i)), wide) };
-        let m = movemask(half(0)) as u64 | (movemask(half(1)) as u64) << 32;
-        // Slot j matches when its 3 key dwords do: bits 16j..16j + 12 of m.
-        // Adding 1 to such a run of ones carries into bit 16j + 12.
-        let hit = ((m & 0x0FFF_0FFF_0FFF_0FFF) + 0x0001_0001_0001_0001) & 0x1000_1000_1000_1000;
-        let info = slots[hit.trailing_zeros() as usize / 16 & 3].info;
-        // Without a branch (whether and where a key hits is random), except on
-        // a miss in a full bucket: slots fill in order and are never removed,
-        // so a free last slot ends the probe.
-        if if_zero(hit, slots[3].lo, 0) == 0 {
-            return if_zero(hit, MISS as u64, info as u64) as u32;
-        }
-        b = (b + 1) & mask;
+fn probe(slot: *const u128, key: __m128i) -> u32 {
+    // SAFETY: `slot` points into the table (u128 is 16-byte aligned); the asm
+    // reads registers only. AVX2 is enabled for the whole build.
+    unsafe {
+        let x = _mm_xor_si128(_mm_load_si128(slot.cast()), key);
+        let mut info = (*slot >> 96) as u32;
+        asm!("vptest {x}, {m}", "cmovnz {i:e}, {miss:e}", x = in(xmm_reg) x, m = in(xmm_reg) _mm_set_epi32(0, -1, -1, -1),
+             i = inout(reg) info, miss = in(reg) MISS, options(pure, nomem, nostack));
+        info
     }
 }
 
@@ -274,98 +254,187 @@ fn key_at(bytes: &[u8], at: usize, len: usize) -> __m128i {
     }
 }
 
-/// CRC32 of the key: the table indexes by its top bits.
-fn hash((lo, hi): (u64, u32)) -> u64 {
-    // SAFETY: SSE4.2 is enabled for the whole build (it comes with AVX2).
-    unsafe { _mm_crc32_u64(hi as u64, lo) }
-}
-
-/// The first 8 and the next 4 bytes of a key.
-fn parts(key: __m128i) -> (u64, u32) {
-    // SAFETY: SSE4.1 is enabled for the whole build (it comes with AVX2).
-    let (lo, hi) = unsafe { (_mm_cvtsi128_si64(key), _mm_extract_epi32::<2>(key)) };
-    (lo as u64, hi as u32)
+/// Two AES rounds of the key, its low 64 bits as the hash. AESENC does
+/// ShiftRows, SubBytes and MixColumns, then XORs the round key: after two rounds
+/// every output byte depends on every key byte, non-linearly, and a different
+/// first round key (the seed) gives an unrelated hash. Three instructions, one
+/// cycle of throughput each. The round keys are digits of pi; a loop that
+/// hashes keeps them in registers.
+#[inline(always)]
+fn hash(key: __m128i, seed: u64) -> u64 {
+    let first = 0x243f6a8885a308d3_13198a2e03707344 ^ seed as u128;
+    // SAFETY: u128 and __m128i have the same size, and any bits are valid.
+    let [a, b]: [__m128i; 2] = unsafe { transmute([first, 0x24093822299f31d0_082efa98ec4e6c89u128]) };
+    // SAFETY: AES-NI and SSE2 are enabled for the whole build (checked above).
+    unsafe { _mm_cvtsi128_si64(_mm_aesenc_si128(_mm_aesenc_si128(key, a), b)) as u64 }
 }
 
 /// A window into it at 16 - len keeps the first len bytes of 16.
 static KEEP: [[u8; 16]; 2] = [[0xFF; 16], [0; 16]];
 
-/// Every query term, with its id and (after `finish`) its ANCHOR flag.
-#[derive(Default)]
+/// Every query term, with its id and, after `finish`, its info.
+///
+/// The terms of up to 12 bytes are in a perfect hash (PTHash style): a term
+/// with hash h is in bucket h & bmask, and the bucket's pilot m puts it in slot
+/// `(h * m).rotate_right(6) >> shift`. Every term has its own slot, so a token
+/// is compared with one slot only. Two terms of a bucket share the low bits of h
+/// but differ above, so different multipliers move them apart. A pilot is 1 mod
+/// 64, so the low 6 bits of h * m are those of h (its group): rotated to the
+/// top, they make each group's slots a region of its own, and the groups are
+/// placed in parallel.
 struct Vocab {
-    /// The terms of up to 12 bytes, keyed by their bytes (zero-padded: token
-    /// bytes are never zero, so the key is exact and lo = 0 marks an empty slot),
-    /// kept under 2.5 per bucket so that most buckets have a free slot: a word no
-    /// query uses is then turned away by one probe.
-    buckets: Vec<Bucket>,
-    /// The home bucket of a key is its hash >> shift.
-    shift: u32,
-    /// Terms of 13 to 32 bytes: about 0.2% of the corpus tokens are that long.
+    phf: Phf,
+    /// 2^(64 - shift) slots of the hash, one per long term, then one with the
+    /// info MISS. Empty slots have the zero key, which no token has (token bytes
+    /// are never zero).
+    table: Vec<u128>,
+    /// The ids of the terms of 13 to 32 bytes, the last ones: about 0.2% of the
+    /// corpus tokens are that long.
     long: std::collections::HashMap<&'static [u8], u32>,
+    /// The number of terms: their ids are 0..count.
     count: u32,
 }
 
+/// The hash function of the table: the seed, the pilots (per bucket, a
+/// power of two of them) and the shift. Copy, so that the scan keeps it in
+/// registers. The pilots are leaked (they live until the process exits), and
+/// atomic so that the threads of the build can write them; a relaxed load is a
+/// plain load.
+#[derive(Clone, Copy)]
+struct Phf(u64, &'static [AtomicU16], u32);
+
+impl Phf {
+    /// The slot of a short key (a term's if the key is one).
+    #[inline(always)]
+    fn slot(self, key: __m128i) -> usize {
+        let h = hash(key, self.0);
+        // SAFETY: h & (len - 1) < len.
+        let m = unsafe { self.1.get_unchecked(h as usize & (self.1.len() - 1)) };
+        place(h, m.load(Relaxed) as u64, self.2)
+    }
+}
+
+/// The slot of the hash h with the pilot m.
+#[inline(always)]
+fn place(h: u64, m: u64, shift: u32) -> usize {
+    (h.wrapping_mul(m).rotate_right(6) >> shift) as usize
+}
+
 impl Vocab {
-    fn home(&self, key_parts: (u64, u32)) -> usize {
-        (hash(key_parts) >> self.shift) as usize
-    }
-
-    /// Moves the terms to a table of `buckets` buckets, a power of two.
-    fn rebuild(&mut self, buckets: usize) {
-        let old = std::mem::replace(&mut self.buckets, vec![Bucket::default(); buckets]);
-        self.shift = 32 - buckets.trailing_zeros();
-        for slot in old.iter().flat_map(|b| b.0).filter(|s| s.lo != 0) {
-            self.insert((slot.lo, slot.hi), slot.info);
-        }
-    }
-
-    /// Adds a key that is not in the table yet, in the first free slot from its
-    /// home bucket on (slots fill in order, so a bucket is full when its last is).
-    fn insert(&mut self, (lo, hi): (u64, u32), info: u32) {
-        let mut b = self.home((lo, hi));
-        while self.buckets[b].0[3].lo != 0 {
-            b = (b + 1) & (self.buckets.len() - 1);
-        }
-        *self.buckets[b].0.iter_mut().find(|s| s.lo == 0).unwrap() = Slot { lo, hi, info };
-    }
-
-    /// The id of `term`, whose table key is `key`.
-    fn intern(&mut self, term: &'static [u8], key: __m128i) -> u32 {
-        let id = if term.len() > KEY {
-            *self.long.entry(term).or_insert(self.count)
-        } else {
-            let mask = self.buckets.len() - 1;
-            let id = find(self.buckets.as_ptr(), mask, self.home(parts(key)), key);
-            if id == MISS {
-                if (self.count as usize + 1) * 2 > self.buckets.len() * 5 {
-                    self.rebuild(2 * self.buckets.len());
-                }
-                self.insert(parts(key), self.count);
+    /// The vocabulary of the query terms in `splits`, with the hash of `seed`,
+    /// the term words of each split with their ids, and `splits`; or None when the build
+    /// needs another seed: two different keys with one hash, or a bucket that
+    /// finds no pilot. Every third seed also doubles the table, so some seed
+    /// succeeds.
+    ///
+    /// A bucket's hashes share their low bits, so it lies in one group (hash &
+    /// 63). Each thread takes a range of groups: it sorts their keys by bucket
+    /// and hash and keeps one of each hash, checking that equal hashes have
+    /// equal keys. Then, in its own region of the table, it places their buckets
+    /// and writes their keys and ids, and once every thread has, it gives its
+    /// split's terms their ids. About 4.6 distinct terms per bucket and at least
+    /// 1.5 slots per term (a load of 0.58 on seed 1).
+    fn new(splits: Vec<Split>, seed: u64) -> Option<(Self, Vec<Vec<u32>>, Vec<Split>)> {
+        let n = splits.len();
+        let total: usize = splits.iter().map(|s| s.2.len()).sum();
+        let bmask = (total / 16).max(64).next_power_of_two() as u64 - 1;
+        let groups = par(n, &|q| {
+            let g = part(64, q, n);
+            let at = |s: &Split, g| s.2.partition_point(|e| ((e.0 & 63) as usize) < g);
+            let mut keys = Vec::with_capacity(2 * total / n + 64);
+            for s in &splits {
+                keys.extend_from_slice(&s.2[at(s, g.start)..at(s, g.end)]);
             }
-            id.min(self.count)
-        };
-        self.count += (id == self.count) as u32;
-        id
+            // By bucket, then hash: the rotation puts the bucket bits on top.
+            keys.sort_unstable_by_key(|e| e.0.rotate_right(bmask.count_ones()));
+            let same = |w: &[Key]| w[0].0 != w[1].0 || w[0].1 == w[1].1;
+            let ok = keys.windows(2).all(same);
+            keys.dedup_by_key(|e| e.0);
+            ok.then_some(keys)
+        });
+        let groups: Vec<_> = groups.into_iter().collect::<Option<_>>()?;
+        let distinct: usize = groups.iter().map(Vec::len).sum();
+        let bits = (distinct * 3 / 2).max(1024).next_power_of_two().ilog2() + seed as u32 / 3;
+        let (slots, shift, region) = (1 << bits, 64 - bits, bits - 6);
+        let mut long = std::collections::HashMap::new();
+        for &term in splits.iter().flat_map(|s| &s.3) {
+            let id = (distinct + long.len()) as u32;
+            long.entry(term).or_insert(id);
+        }
+        // The table is allocated zeroed, so empty slots cost nothing until they
+        // are read. Long term `id` has the slot `slots + id - distinct`.
+        let count = distinct + long.len();
+        let mut table = vec![0u128; slots + long.len() + 1];
+        (distinct..count).for_each(|id| table[slots + id - distinct] = (id as u128) << 96);
+        table[slots + long.len()] = (MISS as u128) << 96;
+        let pilots: &[_] = Vec::leak((0..=bmask).map(|_| AtomicU16::new(0)).collect());
+        let phf = Phf(seed, pilots, shift);
+        let (at, barrier) = (table.as_mut_ptr() as usize, std::sync::Barrier::new(n));
+        let ids = par(n, &|q| {
+            // Largest buckets first: for each the first pilot whose slots are
+            // all free, claimed one at a time and given back at the first taken
+            // one. `taken` covers this thread's regions, from `base`. Thread q
+            // numbers its keys from the number of keys before its groups.
+            let base = part(64, q, n).start << region;
+            let mut taken = vec![false; part(64, q, n).len() << region];
+            let mut next = groups[..q].iter().map(Vec::len).sum::<usize>() as u128;
+            let bucket = |a: &Key, b: &Key| (a.0 ^ b.0) & bmask == 0;
+            let mut order: Vec<_> = groups[q].chunk_by(bucket).collect();
+            order.sort_unstable_by_key(|b| Reverse(b.len()));
+            let slot = |e: &Key, m| place(e.0, m, shift) - base;
+            let mut set = |e, m, v| replace(&mut taken[slot(e, m)], v);
+            let placed = order.iter().all(|it| {
+                let fits = (1..1 << 16).step_by(64).find(|&m| {
+                    let free = it.iter().take_while(|e| !set(e, m, true)).count();
+                    // Gives the claimed slots back unless all were free.
+                    let all = free == it.len();
+                    it[..free].iter().for_each(|e| _ = set(e, m, all));
+                    all
+                });
+                let Some(m) = fits else { return false };
+                pilots[(it[0].0 & bmask) as usize].store(m as u16, Relaxed);
+                for e in *it {
+                    // SAFETY: the slot is in this thread's regions of the table,
+                    // which no other thread writes.
+                    unsafe { *(at as *mut u128).add(base + slot(e, m)) = e.1 | next << 96 };
+                    next += 1;
+                }
+                true
+            });
+            // The ids need every thread's pilots and slots.
+            barrier.wait();
+            // SAFETY: a slot of the table, which no thread writes any more.
+            let info = |key| (unsafe { *(at as *const u128).add(phf.slot(key)) } >> 96) as u32;
+            let id = |&(t, key, op): &Term| op | long.get(t).copied().unwrap_or_else(|| info(key));
+            placed.then(|| splits[q].1.iter().map(id).collect())
+        });
+        let vocab = Vocab { phf, table, long, count: count as u32 };
+        Some((vocab, ids.into_iter().collect::<Option<_>>()?, splits))
     }
 
-    /// Renumbers the terms as the plan does and flags the anchors.
+    /// Gives each slot the info the plan gives its id (renumbered, ANCHOR).
     fn finish(&mut self, plan: &Plan) {
-        let slots = self.buckets.iter_mut().flat_map(|b| &mut b.0);
-        let infos = slots.filter(|s| s.lo != 0).map(|s| &mut s.info);
-        for info in infos.chain(self.long.values_mut()) {
-            *info = plan.info[*info as usize];
+        // Empty slots have info 0 too: harmless, their key matches no token.
+        // The last slot keeps MISS.
+        let n = self.table.len() - 1;
+        for s in &mut self.table[..n] {
+            *s = *s & ((1 << 96) - 1) | (plan.info[(*s >> 96) as usize] as u128) << 96;
         }
     }
 
+    /// A long token's key and slot: the zero key, and the slot of its term or
+    /// the last one, which the zero key matches.
     #[cold]
     #[inline(never)]
-    fn get_long(&self, token: &[u8]) -> u32 {
-        // A token is at most 64 bytes (its length comes from a 64-bit mask); one
-        // longer than 32 bytes is in no table.
+    fn get_long(&self, token: &[u8]) -> (__m128i, u64) {
+        // A token is at most 64 bytes (its length comes from a 64-bit mask).
         let lower = &mut [0u8; 64][..token.len()];
         lower.copy_from_slice(token);
         lower.make_ascii_lowercase();
-        self.long.get(&*lower).copied().unwrap_or(MISS)
+        let id = self.long.get(&*lower).map_or(self.count, |&id| id);
+        let slot = self.table.len() + id as usize - 1 - self.count as usize;
+        // SAFETY: SSE2 is enabled for the whole build.
+        (unsafe { _mm_setzero_si128() }, slot as u64)
     }
 }
 
@@ -566,8 +635,7 @@ struct Scan<'a> {
     /// Row r < plan.rows: the words of BOOL term r in the 4 blocks of this
     /// superblock. Row `rows` takes the other terms; row `rows + 1` is all ones.
     wide: Vec<Row>,
-    /// This document's tokens to look up: their keys and home buckets (or a zero key
-    /// and the info of a long token).
+    /// This document's tokens to look up: their keys and slots.
     pending: Vec<(__m128i, u64)>,
     /// This document's term ids, and the positions of anchors among them.
     toks: Vec<u32>,
@@ -634,7 +702,7 @@ impl<'a> Scan<'a> {
                 let mut text = starts & (ids & ids.wrapping_neg()).wrapping_sub(1);
                 starts ^= text;
                 let (buf, mut n) = (self.pending.as_mut_ptr(), self.pending.len());
-                let (buckets, shift) = (self.vocab.buckets.as_ptr(), self.vocab.shift);
+                let (vocab, phf, table) = (self.vocab, self.vocab.phf, self.vocab.table.as_ptr());
                 while text != 0 {
                     let b = text.trailing_zeros();
                     text &= text - 1;
@@ -642,19 +710,15 @@ impl<'a> Scan<'a> {
                     // a term anyway.
                     let len = (!shifted(b)).trailing_zeros() as usize;
                     let p = at + b as usize;
-                    let token = if len <= KEY {
-                        let key = key_at(docs, p, len);
-                        let b = (hash(parts(key)) >> shift) as usize;
-                        // A bucket of the table: a 32-bit CRC, so b < buckets.len().
-                        prefetch(buckets, b);
-                        (key, b as u64)
-                    } else {
-                        let info = self.vocab.get_long(&docs[p..p + len]) as u64;
-                        // SAFETY: AVX2 is enabled for the whole build.
-                        (unsafe { _mm_setzero_si128() }, info)
-                    };
                     // SAFETY: `reserve(32)` above made room for this chunk's tokens.
-                    unsafe { buf.add(n).write(token) };
+                    if len <= KEY {
+                        let key = key_at(docs, p, len);
+                        let s = phf.slot(key);
+                        prefetch(table, s);
+                        unsafe { buf.add(n).write((key, s as u64)) };
+                    } else {
+                        unsafe { buf.add(n).write(vocab.get_long(&docs[p..p + len])) };
+                    }
                     n += 1;
                 }
                 // SAFETY: the first n entries were written.
@@ -698,21 +762,16 @@ impl<'a> Scan<'a> {
 
     /// Looks up the tokens of this document, whose bit is `bit`, and sets their
     /// words. Each step runs over the whole document, so that the memory accesses
-    /// of one step overlap: the buckets were fetched when the tokens were found.
+    /// of one step overlap: the slots were fetched when the tokens were found.
     /// (Fetching the words too cost more instructions than it saved.)
     fn look_up(&mut self, bit: u64) {
         // The number of BOOL terms.
-        let (nb, table) = (self.w.len() - 2, self.vocab);
-        let (buckets, mask) = (table.buckets.as_ptr(), table.buckets.len() - 1);
+        let (nb, table) = (self.w.len() - 2, self.vocab.table.as_ptr());
         self.toks.reserve(self.pending.len());
         let (toks, mut len) = (self.toks.as_mut_ptr(), self.toks.len());
-        for &(key, b) in &self.pending {
-            // SAFETY: SSE4.1 is enabled for the whole build (it comes with AVX2).
-            let info = if unsafe { _mm_testz_si128(key, key) } == 1 {
-                b as u32
-            } else {
-                find(buckets, mask, b as usize, key)
-            };
+        for &(key, s) in &self.pending {
+            // SAFETY: pending slots are below table.len().
+            let info = probe(unsafe { table.add(s as usize) }, key);
             let id = info & MISS;
             if info & ANCHOR != 0 {
                 self.anchors.push(len as u32);
