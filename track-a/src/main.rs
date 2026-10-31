@@ -574,7 +574,7 @@ impl Interner {
         loop {
             match self.slots[i] {
                 0 => break,
-                id if self.keys[id as usize - 1] == key
+                id if same(&self.keys[id as usize - 1], &key)
                     && (name.len() < KEY_BYTES || names[id as usize - 1] == name) =>
                 {
                     return id - 1;
@@ -598,6 +598,12 @@ impl Interner {
         }
         names.len() as u32 - 1
     }
+}
+
+/// Key equality, written so that it compiles to inline XORs: `==` on the 64-byte
+/// array became a library `memcmp` call per line, 12% of the run time.
+fn same(a: &Key, b: &Key) -> bool {
+    a.iter().zip(b).fold(0, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// Folds the four key words into one multiply. Collisions only cost a probe.
