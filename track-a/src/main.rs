@@ -514,7 +514,7 @@ struct Interner {
 // (Release), and read only after a slot holding it is seen (Acquire).
 unsafe impl Sync for Interner {}
 
-const SLOTS: usize = 2 * MAX_ENDPOINTS as usize;
+const SLOTS: usize = 8 * MAX_ENDPOINTS as usize;
 
 impl Interner {
     fn new() -> Self {
