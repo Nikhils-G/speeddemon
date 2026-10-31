@@ -81,7 +81,8 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
     if doc_count > 1 << 20 {
         return Err(format!("docs.txt: {doc_count} documents is more than this program supports (2^20)"));
     }
-    let slices = slices(text, thread::available_parallelism().map_or(1, |n| n.get()))?;
+    // One thread per core: two hyperthreads would share a core's L2.
+    let slices = slices(text, thread::available_parallelism().map_or(1, |n| n.get()).min(6))?;
     let nb = vocab.bool_terms as usize;
 
     // Sample the start of every slice for each term's document frequency.
