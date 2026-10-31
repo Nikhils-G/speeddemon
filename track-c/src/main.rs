@@ -47,10 +47,7 @@ const PARTITIONS: usize = 1 << PARTITION_BITS;
 /// 1,560 per partition.
 const FIRST_SLOTS: usize = 1 << 11;
 
-static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-
 fn main() {
-    START.get_or_init(std::time::Instant::now);
     mmap::no_huge_pages();
     let mut args = std::env::args().skip(1);
     let data_dir = args.next().unwrap_or_else(|| "/data".into());
@@ -94,10 +91,6 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
         }
     };
 
-    // TEMPORARY box probe (full-size input only, dedupe skipped): exit code = elapsed 0.25 ms units.
-    if records.len() > 100_000_000 {
-        std::process::exit((START.get().unwrap().elapsed().as_micros() / 250).min(255) as i32);
-    }
     let mut out = Vec::new();
     // Group numbers are in output order: codes sorted, then `_UNMATCHED` ("_" > "Z").
     for g in 0..regions.keys.len() {
@@ -125,7 +118,9 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
     let output_path = format!("{out_dir}/aggregates.txt");
     File::create(&output_path)
         .and_then(|mut f| f.write_all(&out))
-        .map_err(|e| format!("write {output_path}: {e}"))
+        .map_err(|e| format!("write {output_path}: {e}"))?;
+    // Done: exit without dropping the tables, one free at a time.
+    std::process::exit(0)
 }
 
 /// Parses and aggregates every run, one round of `threads` runs at a time, and
@@ -176,7 +171,11 @@ fn aggregate(
                                 &mut totals,
                                 mine,
                             ) {
-                                Ok(end) if end == starts[run + 1] => {}
+                                // Drop the run's pages now, in parallel, instead of
+                                // the kernel unmapping all 50,000 at exit on one core.
+                                Ok(end) if end == starts[run + 1] => {
+                                    mmap::release(&text[starts[run]..end])
+                                }
                                 Ok(_) => error = Some(ParseError::Misaligned),
                                 Err(e) => error = Some(e),
                             }
@@ -184,7 +183,7 @@ fn aggregate(
                         barrier.wait();
                         loop {
                             let p = next_partition[round].fetch_add(1, Relaxed);
-                            if p >= PARTITIONS || error.is_some() || text.len() > 100_000_000 {
+                            if p >= PARTITIONS || error.is_some() {
                                 break;
                             }
                             // SAFETY: the counter gives partition p to this thread alone
