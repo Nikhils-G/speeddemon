@@ -24,8 +24,9 @@
 //!    file, goes to a byte-by-byte walker.
 //! 4. Distinct names per country: a name's identity is its raw inner bytes (inside
 //!    quotes, `""` maps one to one to the unescaped value; an empty name is empty
-//!    whether quoted or not), reduced to a 56-bit hash; with the spec's 100,000
-//!    names the chance that two share one is about 7e-8. Parsing only files a (hash,
+//!    whether quoted or not), reduced to a 56-bit hash, of which the name tables
+//!    tell apart 50 bits or more (see `add`); with the spec's 100,000 names the chance
+//!    that two share them is below 1e-7. Parsing only files a (hash,
 //!    group) pair under one of 4 partitions per thread picked by the hash. After
 //!    each run it parses, a thread hands its buffers of pairs to their owners'
 //!    inboxes, and its own tables take what waits in its inbox: small tables of
@@ -69,12 +70,13 @@ const REGION_CHUNKS: usize = 64;
 type Totals = [i64; 7];
 const EMPTY: Totals = [0, 0, 0, i64::MAX, i64::MIN, 0, 0];
 
-/// One partition's names: an open-addressing table of name hashes (0 = empty,
-/// else the hash with its low byte set to 0xFF) in buckets of 4 slots, at most 5/8
-/// full so that a lookup is nearly always one bucket; a dense id per slot; and a
-/// row of WORDS words of group bits per id, added per new name. (Rows by slot
-/// instead, in a 7/8 full table: 23% less memory, but +0.8M branch misses.)
-type Table = (Vec<u64>, Vec<u16>, Vec<u64>);
+/// One partition's names: an open-addressing table of keys (0 = empty) in buckets
+/// of 4 slots, at most 5/8 full so that a lookup is nearly always one bucket; and a
+/// row of WORDS words of group bits per name, added per new name. A key is the
+/// name's hash with its low bits replaced by the name's row (and a low byte of 0xFF,
+/// never 0), so that a hit needs no second load for the row. (Rows by slot instead,
+/// in a 7/8 full table: 23% less memory, but +0.8M branch misses.)
+type Table = (Vec<u64>, Vec<u64>);
 
 /// One parsed record: id, region_id, amount in cents, name_bytes << 32 |
 /// note_bytes, the name's hash, and where the next record starts.
@@ -206,7 +208,7 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
     let worker = &|w: usize| {
         let mut totals = [EMPTY; GROUPS];
         // This thread's tables and pair buffers: made here, so they are in its cache.
-        let table = || (vec![0; slots], vec![0; slots], Vec::with_capacity(rows));
+        let table = || (vec![0; slots], Vec::with_capacity(rows));
         *tables[w].lock().unwrap() = (0..PARTITIONS_PER_THREAD).map(|_| table()).collect();
         let mut pairs: Vec<_> = (0..parts).map(|_| Vec::with_capacity(capacity)).collect();
         // Thread t's tables take the pairs in its inbox, and give the buffers back
@@ -334,36 +336,41 @@ fn money(cents: i64) -> String {
 #[inline(never)]
 fn add(table: &mut Table, pairs: &[u64], totals: &mut [Totals; GROUPS]) {
     // Fields as locals: no store through them can change the others.
-    let (keys, ids, seen) = table;
+    let (keys, seen) = table;
     let (buckets, full) = (keys.len() / 4, keys.len() / 8 * 5 * WORDS);
+    // A key's bits 8..24 hold its row (a table holds at most 40,960, as the u16 ids
+    // before). Its 40 hash bits above them and the bucket's 10 or more tell names
+    // apart: with the generator's 100,000 names, two share both with odds below 1e-7.
     for &pair in pairs {
-        let (key, group) = (pair | 0xFF, (pair & 0xFF) as usize);
+        let (hash, group) = (pair & !0xFF_FFFF, (pair & 0xFF) as usize);
         // The top hash bits picked the partition; the bits above the group pick a
         // bucket of 4 slots, compared at once. Slots fill in order and are never
         // emptied, so the first slot that holds the key or is empty is the name's.
         let mut bucket = (pair >> 8) as usize & (buckets - 1);
-        // SAFETY: buckets are masked to the table (a multiple of 4 slots), a slot's
-        // id has its row of WORDS in `seen`, which covers every group. AVX2 is
+        // SAFETY: buckets are masked to the table (a multiple of 4 slots), a key's
+        // row has its WORDS words in `seen`, which covers every group. AVX2 is
         // enabled.
         unsafe {
-            let wanted = _mm256_set1_epi64x(key as i64);
+            let wanted = _mm256_set1_epi64x(hash as i64);
+            let mask = _mm256_set1_epi64x(!0xFF_FFFF);
             let slot = loop {
                 let v = _mm256_loadu_si256(keys.as_ptr().add(bucket * 4).cast());
                 let free = _mm256_cmpeq_epi64(v, _mm256_setzero_si256());
-                let hit = _mm256_or_si256(_mm256_cmpeq_epi64(v, wanted), free);
+                let hit = _mm256_cmpeq_epi64(_mm256_and_si256(v, mask), wanted);
+                let hit = _mm256_or_si256(hit, free);
                 let hit = _mm256_movemask_pd(_mm256_castsi256_pd(hit));
                 if hit != 0 {
                     break bucket * 4 + hit.trailing_zeros() as usize;
                 }
                 bucket = (bucket + 1) & (buckets - 1);
             };
-            if *keys.get_unchecked(slot) == 0 {
+            let key = keys.get_unchecked_mut(slot);
+            if *key == 0 {
                 assert!(seen.len() < full, "more names than the tables hold");
-                *keys.get_unchecked_mut(slot) = key;
-                *ids.get_unchecked_mut(slot) = (seen.len() / WORDS) as u16;
+                *key = hash | (seen.len() / WORDS << 8) as u64 | 0xFF;
                 seen.extend_from_slice(&[0; WORDS]);
             }
-            let id = *ids.get_unchecked(slot) as usize;
+            let id = (*key >> 8) as u16 as usize;
             let word = seen.get_unchecked_mut(id * WORDS + group / 64);
             let bit = 1 << (group % 64);
             totals[group][5] += (*word & bit == 0) as i64; // names_distinct
