@@ -631,6 +631,7 @@ fn prefix_xor(bits: u64) -> u64 {
 /// its raw value bytes, and its unescaped length. Inner quotes are not checked to
 /// pair up: the separator scan only proves that their count is even. An unpaired
 /// one (invalid, never generated) would be counted as half of a `""`.
+#[inline(always)]
 fn text_value(text: &[u8], s: usize, e: usize, quotes: u64) -> Option<((usize, usize), u64)> {
     if quotes == 0 {
         return Some(((s, e), (e - s) as u64));
@@ -640,6 +641,7 @@ fn text_value(text: &[u8], s: usize, e: usize, quotes: u64) -> Option<((usize, u
 }
 
 /// `1*DIGIT` in `text[s..e]`. Up to 8 digits: one load and SWAR arithmetic.
+#[inline(always)]
 fn digits(text: &[u8], s: usize, e: usize) -> Option<u64> {
     let len = e.checked_sub(s)?;
     if (1..=8).contains(&len) && e >= 8 {
@@ -653,6 +655,7 @@ fn digits(text: &[u8], s: usize, e: usize) -> Option<u64> {
 }
 
 /// Eight digit values, most significant in the lowest byte, as a number.
+#[inline(always)]
 fn eight_digits(x: u64) -> u64 {
     let x = (x * 10 + (x >> 8)) & 0x00FF_00FF_00FF_00FF;
     let x = (x * 100 + (x >> 16)) & 0x0000_FFFF_0000_FFFF;
@@ -667,6 +670,7 @@ fn parse_digits(digits: &[u8]) -> Option<u64> {
 }
 
 /// `[ "-" ] 1*DIGIT "." 2DIGIT` in `text[s..e]`, before the CR of a CRLF: cents.
+#[inline(always)]
 fn amount(text: &[u8], s: usize, mut e: usize) -> Option<i64> {
     if e > s && text[e - 1] == b'\r' {
         e -= 1;
@@ -704,6 +708,7 @@ impl Field {
 /// A wyhash-style 64-bit hash of `text[s..e]`: each 8-byte word goes through a
 /// full 64x64->128 multiply, folded, so every input bit reaches every output bit.
 /// Words are loaded straight from the text, the last one masked to the field.
+#[inline(always)]
 fn hash(text: &[u8], s: usize, e: usize) -> u64 {
     if e + 8 > text.len() {
         // At the very end of the file: hash a padded copy, so loads stay in bounds.
