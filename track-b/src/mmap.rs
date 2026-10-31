@@ -1,28 +1,18 @@
 //! Read-only mmap through libc, declared by hand so the crate has no dependencies.
 
-use std::fs::File;
-use std::io;
 use std::os::fd::AsRawFd;
-use std::os::raw::{c_int, c_long, c_void};
 
 unsafe extern "C" {
-    fn mmap(
-        addr: *mut c_void,
-        len: usize,
-        prot: c_int,
-        flags: c_int,
-        fd: c_int,
-        offset: c_long,
-    ) -> *mut c_void;
-    fn prctl(option: c_int, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> c_int;
-    fn madvise(addr: *mut c_void, len: usize, advice: c_int) -> c_int;
+    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
+    fn prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i32;
+    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
 }
 
-const PR_SET_THP_DISABLE: c_int = 41;
-const PROT_READ: c_int = 1;
-const MAP_PRIVATE: c_int = 2;
-const MAP_FIXED: c_int = 0x10;
-const MAP_ANONYMOUS: c_int = 0x20;
+const PR_SET_THP_DISABLE: i32 = 41;
+const PROT_READ: i32 = 1;
+/// MAP_PRIVATE | MAP_ANONYMOUS, and MAP_PRIVATE | MAP_FIXED.
+const RESERVE: i32 = 0x02 | 0x20;
+const FIXED: i32 = 0x02 | 0x10;
 
 /// Turns off transparent huge pages for this process. With THP set to "always",
 /// touching one byte of a sparse, lazily zeroed table can fault in a whole 2 MB
@@ -37,45 +27,30 @@ pub fn no_huge_pages() {
 /// zero is a separator.
 pub const PAD: usize = 256;
 
-/// Maps the whole file read-only, followed by PAD zero bytes, for the rest of the
-/// process. It is never unmapped: the process exits right after using it.
-pub fn map(file: &File) -> io::Result<&'static [u8]> {
-    let len = file.metadata()?.len() as usize;
-    // Reserve the whole range as zero pages first, then map the file over its start.
-    // SAFETY: a fresh anonymous read-only mapping; nothing else refers to it.
-    let base = unsafe {
-        mmap(
-            std::ptr::null_mut(),
-            len + PAD,
-            PROT_READ,
-            MAP_PRIVATE | MAP_ANONYMOUS,
-            -1,
-            0,
+/// Maps the file at `path` read-only, followed by PAD zero bytes, for the rest of
+/// the process. It is never unmapped: the process exits right after using it.
+pub fn map(path: &str) -> &'static [u8] {
+    let file = std::fs::File::open(path).expect(path);
+    let len = file.metadata().expect(path).len() as usize;
+    let check = |p: *mut u8| {
+        assert!(
+            p as isize != -1,
+            "mmap {path}: {}",
+            std::io::Error::last_os_error()
         )
     };
-    if base as isize == -1 {
-        return Err(io::Error::last_os_error());
-    }
+    // Reserve the whole range as zero pages first, then map the file over its start.
+    // SAFETY: a fresh anonymous read-only mapping; nothing else refers to it.
+    let base = unsafe { mmap(std::ptr::null_mut(), len + PAD, PROT_READ, RESERVE, -1, 0) };
+    check(base);
     if len > 0 {
         // SAFETY: MAP_FIXED only replaces pages of the reservation made above. The
         // dataset is mounted read-only, so the bytes cannot change under us.
-        let ptr = unsafe {
-            mmap(
-                base,
-                len,
-                PROT_READ,
-                MAP_PRIVATE | MAP_FIXED,
-                file.as_raw_fd(),
-                0,
-            )
-        };
-        if ptr as isize == -1 {
-            return Err(io::Error::last_os_error());
-        }
+        check(unsafe { mmap(base, len, PROT_READ, FIXED, file.as_raw_fd(), 0) });
     }
     // SAFETY: `len + PAD` bytes are mapped (the file, then zeros: the tail of the
     // file's last page reads as zero) and stay mapped until exit.
-    Ok(unsafe { std::slice::from_raw_parts(base as *const u8, len + PAD) })
+    unsafe { std::slice::from_raw_parts(base, len + PAD) }
 }
 
 /// Drops this process's page-table entries for the whole pages inside `slice`, a
@@ -85,12 +60,12 @@ pub fn map(file: &File) -> io::Result<&'static [u8]> {
 /// again is still correct: the page faults back in from the page cache.
 pub fn release(slice: &[u8]) {
     const PAGE: usize = 4096;
-    const MADV_DONTNEED: c_int = 4;
+    const MADV_DONTNEED: i32 = 4;
     let start = (slice.as_ptr() as usize).next_multiple_of(PAGE);
     let end = (slice.as_ptr() as usize + slice.len()) / PAGE * PAGE;
     if end > start {
         // SAFETY: whole pages inside a private, read-only file mapping that is
         // never written; dropping them loses nothing.
-        unsafe { madvise(start as *mut c_void, end - start, MADV_DONTNEED) };
+        unsafe { madvise(start as *mut u8, end - start, MADV_DONTNEED) };
     }
 }
