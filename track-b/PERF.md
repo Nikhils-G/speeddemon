@@ -28,12 +28,23 @@ box, so no decision rests on one run.
 | 17 | 26b5cb5 | Leaner token lookup: long tokens on a cold path, the bucket probe compares dwords, the scan's probe and the table's `get` share one function that keeps the table in registers, the CRC stays in 32 bits | run-b16e2000c75d | 0.1484 | 38.6 | 1,140 | 73.24 |
 | 18 | e24c58d | Superblock queries evaluated over their real terms only, sorted by term count and operators so the operator branch predicts. A second run, on 33cac7e, took 0.1643 s | run-6820636c30fc | 0.1529 | | 1,142 | 72.91* |
 | 19 | 34dd399 | No bounds checks in the block-end loops (9b7b6f9, which had no board run of its own); then no per-token prefetch of the presence word. First run run-13cc611d4761: 0.1518 s, 72.96* | run-2bc33f24a19f | 0.1478 | 38.54 | 1,151 | 73.26 |
+| 20 | 8fdef14 | The block end prefetches the entry range of the slot 16 ahead and the entries of the slot 8 ahead (one thread: cycles −5.2%). Rerun run-f0af75ddb8ab: 0.1416 s | run-4b9ff571a190 | 0.1404 | 38.46 | 1,162 | 73.78 |
+| 21 | 831097c | Same engine in fewer lines; hot loops unchanged. First run run-bb8fc84e151e: 0.1466 s, M 39.68, 73.81, in a dispatch where A was slow too | run-72157fe9a7e1 | 0.1435 | 39.51 | 998 | 74.04 |
+| 22 | a3a700b | Fewer lines again, hot code reformatted with the same operations; SAFETY arguments for every prefetch and unchecked load | run-1ed2ef15f7af | 0.1459 | 38.54 | 854 | 74.37 |
+| 23 | 8274ba4 | Answers numbered in evaluation order (README, design 5): test server −3.4%, L2 misses −10%. Its only run was a disturbed dispatch (A 0.0263 s against about 0.0195) | run-36419fde7616 | 0.1550 | | 880 | 73.61* |
+| 24 | d8e7a08 | **Reverted** (cb193e5). Step 23 plus a 64 KB one-word filter in front of the term table, so most tokens no query uses skip the 2 MB table: L2 misses −19% on the test server, box equal to step 22 (0.1443 against 0.1459) for 19 more lines | run-cda99758e008 | 0.1443 | | 899 | 74.32 |
+| 25 | cb193e5 | Step 23's numbering kept in a shorter form, filter dropped. No board run of its own: step 26 followed six minutes later | | | | 859 | |
+| 26 | 9a61acf | Fewer lines in setup and the result gather. M 44.09 is just over the 44 MB credit; a later run of the same code (387ebb3, ID not logged) gave 0.1420 s and 43.8 MB. The cause, found in step 28: step 23's formatter copied every thread's state into line order, about 4.5 MB | run-d00be2692c6c | 0.1389 | 44.09 | 844 | 74.93 |
+| 27 | 368aa64 | **Reverted** (387ebb3). PGO training on one thread (`taskset -c 0`), so that builds are repeatable: two local builds then differed by 5 KB instead of 1.1 MB. The board's builder may not use CPU 0, so the Docker build failed on every track and there is no scored run | | | | 844 | |
+| 28 | 841e809 | The block end in two passes (README, design 3): ranges gathered and prefetched first, then words and state fetched 4 ranges ahead of the evaluation (test server −4.5 to −5.7%); the formatter reads each thread's state through `answer_of` instead of a copy (M back to 39 MB). Rerun on 2515d02, run-65497002e714: 0.1381 s, 38.68 MB, 74.88 | run-3814466b62c2 | 0.1374 | 39.22 | 875 | 74.94 |
 
-Step 19 is the current code. S is the harness's `static_axes.py` count, which matches the board for
+Step 28 is the current code. S is the harness's `static_axes.py` count, which matches the board for
 every run where the board's S was logged. M is blank where it was not logged. Points marked * are
 computed from T and S with the board's formula: every M logged since step 6 is under the 44 MB cap
-(26.8 to 41.7 MB), where M no longer changes K, and the formula reproduces every logged point value to
-within 0.01.
+(26.8 to 41.7 MB) except step 26's 44.09 MB, which costs 0.01 points, and the formula reproduces every
+logged point value to within 0.01. Steps 24 and 27 are the round's reverted experiments; step 23 was
+kept because its server gain was clear and the box did not show it slower than step 22 once
+step 24 ran without the disturbance.
 
 ## What each step taught
 
@@ -78,14 +89,38 @@ within 0.01.
   against step 16 from 6.8% to 11%, and step 19 cut 4.1% and then 4.8% more, but the box gave 0.1529,
   0.1518 and 0.1478 s against step 17's 0.1484. They were kept because they are not slower and step 19 ran the best time so far. The design
   is now at about 141 instructions per corpus token in all; a further gain needs a smaller working set, not fewer
-  instructions.
+  instructions (steps 23–24 later showed that a smaller working set did not pay either; fewer stalls did).
+- **Step 20: hiding random loads transferred.** The touched slots come in first-seen order, so the
+  block end's loads of their entry ranges and entries were random L3 hits. Prefetching them ahead
+  took the box from 0.1478 s to 0.1404 and 0.1416 (−4 to −5%), more than the 3.3% the test server
+  showed at twelve threads.
+- **Steps 21–22, 25–26: lines are cheap points.** S went from 1,162 to 844 with the hot loops
+  unchanged; at the board's S exponent that is worth about 1 point, the same as a 9% time cut.
+- **Steps 23–24: L2-miss cuts did not transfer.** Numbering the answers in evaluation order cut L2
+  misses 10%, and the one-word filter 19% more, on the test server; the box did not move (0.1443
+  against 0.1459). The test server has 512 KB of L2 per core, less than the box's 1.25 MB, and is
+  still faster, so the L2 explanation of the box's slower scan in steps 11–12 does not hold; clock
+  and L3 latency are the likelier causes.
+- **Step 26: a memory regression hidden in a line cut.** M rose from about 38.5 to 44.09 MB, just past
+  the 44 MB credit. Step 23's formatter gathered every thread's state into line order: twelve
+  threads times 50,000 answers of 8 bytes. Step 28 reads the states in place through `answer_of`.
+- **Step 27: PGO builds are not deterministic.** With a twelve-thread training run and non-atomic
+  profile counters, every build is a different binary; builds of the same code ran 2.5 to 6% apart
+  in speed. A single board run therefore mixes the code's effect with the build's, which explains part
+  of the spread above, and the final scoring rebuilds. Training on one thread made builds repeatable
+  locally but failed on the board's builder, so it was reverted at once (README, next 24 hours).
+- **Step 28: stall cuts transferred again.** The two-pass block end hides the remaining random loads
+  of an evaluation (words and answer state) behind the evaluations before it. The box gave 0.1374 and
+  0.1381 s against step 26's 0.1389 and 0.1420, and M fell back to 39 MB, for 31 more lines. What the
+  box rewarded in this whole round was more parallel setup (steps 15–16) and fewer stalls on random
+  loads (steps 20, 28), not cuts of instructions (steps 18–19) or of L2 misses (steps 23–24).
 - **A measurement bug**: some test-server A/B comparisons after step 11 compared a stale binary,
   because copied source files kept older modification times and cargo did not rebuild. It was found
   and fixed; every keep-or-revert decision above rests on board runs, not on those comparisons.
 
 ## Experiments that did not make it (measured, reverted)
 
-Board-measured reverts are in the table above (steps 11, 12 and 14). These were measured elsewhere.
+Board-measured reverts are in the table above (steps 11, 12, 14, 24 and 27). These were measured elsewhere.
 
 | Experiment | Result |
 |---|---|
@@ -101,6 +136,7 @@ Board-measured reverts are in the table above (steps 11, 12 and 14). These were 
 | Prefetching the entries' `w` words at the block end | cycles 2.45G → 2.55G |
 | Branching around a zero evaluation result | cycles 2.76G → 2.82G |
 | Profile-guided build trained on the full scale instead of the sample | neutral on the test server, not pushed |
+| Single-thread PGO training (step 27) pinned to the first allowed CPU instead of CPU 0, or LLVM's atomic profile counters | not yet tried: either should make builds repeatable without breaking the board's builder |
 | Document frequencies sampled into 2^16 hashed u16 counters, to overlap the sample with query parsing | simulated on seed 1: hash collisions move queries to the superblock path (5,882 → about 8,530), +138M instructions in total; not built |
 
 ## Correctness checks run before every push
