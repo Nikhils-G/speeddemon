@@ -118,7 +118,9 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
     let output_path = format!("{out_dir}/distances.txt");
     File::create(&output_path)
         .and_then(|mut f| f.write_all(&out))
-        .map_err(|e| format!("write {output_path}: {e}"))
+        .map_err(|e| format!("write {output_path}: {e}"))?;
+    // Done: exit without freeing the graphs (about 120 MB), one free at a time.
+    std::process::exit(0)
 }
 
 /// A per-query result slot written by exactly one thread.
