@@ -257,7 +257,8 @@ fn run(data_dir: &str, out_dir: &str) -> Result<std::convert::Infallible, String
                 let cut = |run| run_start(text, body_start, run, runs, guessed);
                 if error.is_ok() {
                     let (start, end) = (cut(run), cut(run + 1));
-                    error = parse_run(text, start, end, &group_of, &mut totals, &mut pairs);
+                    let span = (start, end, guessed);
+                    error = parse_run(text, span, &group_of, &mut totals, &mut pairs);
                 }
                 for (t, pairs) in pairs.chunks_mut(PARTITIONS_PER_THREAD).enumerate() {
                     let mut inbox = inboxes[t].lock().unwrap();
@@ -453,29 +454,41 @@ fn run_start(text: &[u8], from: usize, k: usize, parts: usize, guessed: bool) ->
 /// at `end`. (It takes the table, not a struct holding a Mutex too, which would
 /// make every record reload the table's address.) Out of line: inlined into the
 /// worker, its registers were allocated with the worker's, and it ran 2-4% slower.
+///
+/// With `split` (guessed cuts), the run is parsed as two halves at once: each pass
+/// of the loop parses one record from each half and then counts both, so their two
+/// chains of dependent work, above all their two random region-table loads, are in
+/// the core at the same time (as 1BRC solutions run several cursors per thread).
+/// Server, 12 threads: -0.5 ms; single-threaded the region-load stall went from
+/// about 35% of this function's cycles to 13%. (Three cursors: no faster, more
+/// instructions; cursors in arrays: +3 ms, the arrays stay in memory.)
+/// It is exact for the same reason the runs are: the second half starts at a cut
+/// guessed like theirs, and the first half must end exactly there, or the run fails
+/// and the whole file is parsed again as one run, where `split` is false. Every
+/// total, the min and max, and the set of pairs do not depend on the order in which
+/// records are counted.
 #[inline(never)]
 fn parse_run(
     text: &[u8],
-    start: usize,
-    end: usize,
+    (start, end, split): (usize, usize, bool),
     group_of: &[AtomicU8],
     totals: &mut [Totals; GROUPS],
     pairs: &mut [Vec<u64>],
 ) -> Result<(), String> {
-    let mut i = start;
     // The header comes first, so a record start is at least 8 bytes in.
     let fast_end = end.min(text.len().saturating_sub(256));
-    while i < end {
+    let record = |i: usize| {
         // A non-temporal prefetch ~16 records ahead: the stream then takes less of
         // L2, so more of the 1 MB region table stays there.
         // SAFETY: a prefetch never faults, and wrapping_add keeps the address defined.
         unsafe { _mm_prefetch::<_MM_HINT_NTA>(text.as_ptr().wrapping_add(i + 1024).cast()) };
-        let r = match fast_record(text, i, fast_end) {
-            Some(r) => r,
-            None => slow_record(text, i)
-                .ok_or_else(|| format!("records.csv: bad record at byte {i}"))?,
-        };
-        let Record(id, region_id, cents, bytes, hash, next) = r;
+        match fast_record(text, i, fast_end) {
+            Some(r) => Ok(r),
+            None => slow_record(text, i).ok_or_else(|| format!("records.csv: bad record at byte {i}")),
+        }
+    };
+    let mut count = |r: &Record| {
+        let &Record(id, region_id, cents, bytes, hash, _) = r;
         // The stored group + 1, so 0 (not in the table) wraps to `_UNMATCHED`.
         let k = (region_id as usize).min(group_of.len() - 1);
         // SAFETY: k is below the length (which is at least 2).
@@ -496,12 +509,30 @@ fn parse_run(
         // The partition from the top hash bits, by multiply-shift: any count.
         let p = ((hash >> 32) * pairs.len() as u64 >> 32) as usize;
         pairs[p].push(hash & !0xFF | group as u64);
-        i = next;
+    };
+    // Where the second half starts: a guessed record start in the middle (none
+    // without `split`: the first half is the whole run).
+    let mid = if split { run_start(&text[..end], start, 1, 2, true) } else { end };
+    let (mut i, mut j) = (start, mid);
+    while i < mid && j < end {
+        let (a, b) = (record(i)?, record(j)?);
+        count(&a);
+        count(&b);
+        (i, j) = (a.5, b.5);
     }
-    match i.min(text.len()) == end {
-        true => Ok(()),
-        false => Err("records.csv: a record crosses a run boundary".into()),
+    // The rest of the longer half, one record at a time; each half must end exactly
+    // at its end (for the first, the guessed cut).
+    for (mut i, end) in [(i, mid), (j, end)] {
+        while i < end {
+            let r = record(i)?;
+            count(&r);
+            i = r.5;
+        }
+        if i.min(text.len()) != end {
+            return Err("records.csv: a record crosses a run boundary".into());
+        }
     }
+    Ok(())
 }
 
 /// One parsed record: id, region_id, amount in cents, name_bytes << 32 |
