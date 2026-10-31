@@ -159,6 +159,7 @@ fn build_graph(text: &[u8], threads: usize) -> Result<Graph, String> {
                         out[(u >> shift) as usize].push((u, v, w));
                         i = j + 1;
                     }
+                    mmap::release(chunk);
                     Ok(out)
                 })
             })
