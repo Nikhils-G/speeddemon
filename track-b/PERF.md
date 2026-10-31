@@ -14,6 +14,7 @@ unchanged code took 0.361 s instead of 0.265 (the box was disturbed), so single 
 | 5 | 42acaa7 | Profile-guided build | run-acc60580e004 | 0.355 | 203 | 937 | 57.8 |
 | 6 | 5c7b09a | No index at all: every query answered during one scan, BOOL queries per block of 64 documents (see README) | run-de33f090eda0 | 0.267 | 38.4 | 910 | 67.6 |
 | 7 | 20856e2 | Exit right after writing; each slice's pages dropped by its thread | run-cc0e62d06c76 | 0.265 | 39.1 | 922 | 67.6 |
+| 8 | 196434d | Queries with common cover terms evaluated once per 256 documents with AVX2; lookups gathered per document with their buckets prefetched; one term table instead of hot table + Bloom filter | run-1a4ed151ee61 | 0.199 | 41.5 | 1,028 | 70.4 |
 
 ## What each step taught
 
@@ -29,6 +30,11 @@ unchanged code took 0.361 s instead of 0.265 (the box was disturbed), so single 
 - **Step 7** did not move T on the box (6% on the test server): unlike tracks A and C, B's exit
   had little to free.
 
+- **Step 8** (test server, one thread): cycles 4.1G → 2.5G, about 112 → 69 cycles per corpus
+  token. The 256-document superblocks alone took 175 → 151 ms at 12 threads, prefetched lookups
+  151 → 139, and dropping the hot table and Bloom filter 139 → 128: with every bucket prefetched,
+  one table is cheaper than three structures.
+
 ## Experiments that did not make it (measured, reverted)
 
 | Experiment | Result |
@@ -40,6 +46,10 @@ unchanged code took 0.361 s instead of 0.265 (the box was disturbed), so single 
 | Block engine: early return when an evaluation's result is zero | no change |
 | Block engine: hot table of 2^10 to 2^14 buckets | 2^13 best on the server |
 | Prefetching the term table while parsing queries | no gain |
+| Superblock threshold ALWAYS at 0.125 / 0.5 instead of 0.25 | 129–131 / 133 ms vs 127 ms |
+| One term table of 2^17 buckets | 135 ms vs 129 at 2^16 (kept 2^15 for memory) |
+| Prefetching the entries' `w` words at the block end | cycles 2.45G → 2.55G |
+| Branching around a zero evaluation result | cycles 2.76G → 2.82G |
 
 ## Correctness checks run before every push
 
