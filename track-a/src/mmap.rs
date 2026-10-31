@@ -1,5 +1,4 @@
-//! mmap, madvise and prctl through libc, declared by hand so the crate has no
-//! dependencies.
+//! Read-only mmap through libc, declared by hand so the crate has no dependencies.
 
 use std::fs::File;
 use std::io;
@@ -19,8 +18,12 @@ unsafe extern "C" {
     fn madvise(addr: *mut c_void, len: usize, advice: c_int) -> c_int;
 }
 
-/// Gives back the whole pages inside `slice`, which is done with: anonymous memory
-/// (the records) is freed and would read as zeros, but it is never read again.
+/// Drops this process's pages for the whole pages inside `slice`, which is done
+/// with. At exit the kernel would otherwise unmap the 58,000 pages of the input one
+/// by one, on one core (about 9 ms); this does the same work in each parsing thread,
+/// in parallel. Reading the input again is still correct: the page faults back in
+/// from the page cache. Anonymous memory (the records) is freed and would read as
+/// zeros, but it is never read again.
 pub fn release(slice: &[u8]) {
     const PAGE: usize = 4096;
     const MADV_DONTNEED: c_int = 4;
@@ -46,6 +49,54 @@ pub fn no_huge_pages() {
 const PROT_READ: c_int = 1;
 const PROT_WRITE: c_int = 2;
 const MAP_SHARED: c_int = 1;
+const MAP_PRIVATE: c_int = 2;
+const MAP_FIXED: c_int = 0x10;
+const MAP_ANONYMOUS: c_int = 0x20;
+
+/// Zero bytes mapped after the end of the file, so that fixed-size SIMD loads at
+/// any line of it stay inside the mapping.
+pub const PAD: usize = 256;
+
+/// Maps the whole file read-only, followed by PAD zero bytes, for the rest of the
+/// process. It is never unmapped: the process exits right after using it.
+pub fn map(file: &File) -> io::Result<&'static [u8]> {
+    let len = file.metadata()?.len() as usize;
+    // Reserve the whole range as zero pages, then map the file over its start.
+    // SAFETY: a fresh anonymous read-only mapping; nothing else refers to it.
+    let base = unsafe {
+        mmap(
+            std::ptr::null_mut(),
+            len + PAD,
+            PROT_READ,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if base as isize == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    if len > 0 {
+        // SAFETY: MAP_FIXED only replaces pages of the reservation made above; the
+        // dataset is mounted read-only, so the bytes cannot change under us.
+        let ptr = unsafe {
+            mmap(
+                base,
+                len,
+                PROT_READ,
+                MAP_PRIVATE | MAP_FIXED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr as isize == -1 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    // SAFETY: `len + PAD` bytes are mapped (the file, then zeros: the rest of the
+    // file's last page reads as zero) and stay mapped until exit.
+    Ok(unsafe { std::slice::from_raw_parts(base as *const u8, len + PAD) })
+}
 
 /// Maps the first `len` bytes of a file opened for reading and writing, shared:
 /// writing the slice writes the file. Never unmapped, like `map`.

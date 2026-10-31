@@ -23,7 +23,8 @@ each, before pushing.
 | 13 | 1d7dbb3, f15bc76 | Each output line built in a stack buffer; groups of up to 32 sorted, not selected; endpoint keys compared inline instead of through `memcmp` | run-9ca9494b04b1 | 0.0299 | 26.1 | 599 | 77.4 |
 | 14 | 689fffc | Parse loop on raw pointers into preallocated records (CRC hash, interner probe inlined); pass 2 without bounds checks; write fused into pass 2 (hours in order); record pages released early | run-d79597111386 | 0.0226 | 21.8 | 629 | 81.1 |
 | 15 | 1342bda | One endpoint table shared by the parse threads (CAS inserts), so no serial merge; statically linked binary | run-8e8d92a5861d | 0.0219 | 20.6 | 626 | 81.7 |
-| 16 | a1cf30b | The log read through 128 KB buffers per thread instead of mapped; whole names kept in the shared table | (board pending) | | | | |
+| 16 | a1cf30b | The log read through 128 KB buffers per thread instead of mapped; whole names kept in the shared table | run-54e9c5f0e0dd, run-d395d2691d9d | 0.0236, 0.0244 | 21.4 | 610 | 80.8 |
+| 17 | (revert) | Back to the mapped input of step 15: 1 ms faster on the test server, 2 ms slower on the box | | | | | |
 
 ## What each step taught
 
