@@ -98,16 +98,7 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
         .map(|id| table.name(id))
         .collect();
     let mut order: Vec<u32> = (0..found.len() as u32).collect();
-    // Compared eight bytes at a time first, then whole (only long names can tie).
-    let prefix = |name: &[u8]| {
-        let mut words = [0u64; 16];
-        for (word, bytes) in words.iter_mut().zip(name.chunks(8)) {
-            *word = bytes.iter().fold(0, |w, &b| w << 8 | b as u64) << (64 - 8 * bytes.len());
-        }
-        words
-    };
-    let prefixes: Vec<[u64; 16]> = found.iter().map(|name| prefix(name)).collect();
-    order.sort_unstable_by_key(|&id| &prefixes[id as usize]);
+    order.sort_unstable_by_key(|&id| found[id as usize]);
     let mut rank = vec![0u32; found.len()];
     for (r, &id) in order.iter().enumerate() {
         rank[id as usize] = r as u32;
