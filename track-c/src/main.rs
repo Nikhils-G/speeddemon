@@ -73,6 +73,12 @@ unsafe extern "C" {
     fn prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i32;
 }
 
+/// 2 MB of zeroed memory, on one huge page if the kernel gave one, for the join
+/// table: its lookups are random over 1 MB, which on 4 KB pages missed the first
+/// level TLB about once a record (server: L1 DTLB misses -27%, -0.5 ms at 12
+/// threads; memory +1 MB). Null if the mapping failed.
+static HUGE: std::sync::atomic::AtomicPtr<u8> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
 fn main() {
     // SAFETY: plain libc calls; failure only keeps the defaults.
     // - M_TOP_PAD (-2), 32 MB: a worker thread's first allocations get their own
@@ -82,8 +88,17 @@ fn main() {
     // - PR_SET_THP_DISABLE (41): with transparent huge pages, touching one byte of
     //   a sparse table can fault in a whole 2 MB page, so the memory peak would
     //   depend on how fragmented the host is (13 to 24 MB between runs).
+    // - Before that, one 2 MB page for the join table (see `HUGE`): an anonymous
+    //   mapping, PROT_READ | PROT_WRITE (3), MAP_PRIVATE | MAP_ANONYMOUS (0x22),
+    //   with a 2 MB-aligned 2 MB inside it, faulted in while huge pages are on.
     unsafe {
         mallopt(-2, 32 << 20);
+        let p = mmap(std::ptr::null_mut(), 4 << 20, 3, 0x22, -1, 0);
+        if p as isize != -1 {
+            let p = (p as usize).next_multiple_of(2 << 20) as *mut u8;
+            std::ptr::write_volatile(p, 0); // inside the mapping, which is writable
+            HUGE.store(p, Relaxed);
+        }
         prctl(41, 1, 0, 0, 0);
     }
     let mut args = std::env::args().skip(1);
@@ -173,9 +188,15 @@ fn run(data_dir: &str, out_dir: &str) -> Result<std::convert::Infallible, String
     // or a bad record. Then the file is parsed again as one run: exact under 2.1.
     for guessed in [true, false] {
         // The join table, dense by region id: group + 1, or 0 for ids it does not
-        // contain. SAFETY: zero is a valid AtomicU8. Zeroed by calloc, so the pages
-        // fault in on the threads that fill them.
-        let group_of: Box<[AtomicU8]> = unsafe { Box::new_zeroed_slice(ids).assume_init() };
+        // contain: `HUGE` if the ids fit, else (and for a second parse, which needs
+        // a fresh one) zeroed by calloc. SAFETY: zero is a valid AtomicU8, and
+        // `HUGE` is 2 MB of zeroed memory that nothing else uses.
+        let huge = HUGE.load(Relaxed);
+        let group_of: &[AtomicU8] = if guessed && !huge.is_null() && ids <= 2 << 20 {
+            unsafe { std::slice::from_raw_parts(huge.cast(), ids) }
+        } else {
+            Box::leak(unsafe { Box::new_zeroed_slice(ids).assume_init() })
+        };
         // By country code index (26^3 of them): its group + 1, or 0 while not seen;
         // and the codes in group order, held while a code gets the next number.
         let (codes, keys): (Vec<AtomicU8>, _) = (many(26 * 26 * 26), Mutex::new(Vec::new()));
@@ -258,7 +279,7 @@ fn run(data_dir: &str, out_dir: &str) -> Result<std::convert::Infallible, String
                 if error.is_ok() {
                     let (start, end) = (cut(run), cut(run + 1));
                     let span = (start, end, guessed);
-                    error = parse_run(text, span, &group_of, &mut totals, &mut pairs);
+                    error = parse_run(text, span, group_of, &mut totals, &mut pairs);
                 }
                 for (t, pairs) in pairs.chunks_mut(PARTITIONS_PER_THREAD).enumerate() {
                     let mut inbox = inboxes[t].lock().unwrap();
