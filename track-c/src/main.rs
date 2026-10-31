@@ -285,16 +285,8 @@ impl Names {
         prefetch(&self.table[2 * self.home(hash.max(1))]);
     }
 
-    /// Fetches the (name, group) bit's line for writing: most of the 3.3M bits are
-    /// set by a different core than the one that last wrote the line, so asking
-    /// for ownership early overlaps that cross-core transfer with other work.
     fn prefetch_row(&self, id: usize, group: usize) {
-        let line = &self.seen[id * self.words + group / 64];
-        #[cfg(target_arch = "x86_64")]
-        // SAFETY: prefetching is only a hint and never faults.
-        unsafe {
-            std::arch::x86_64::_mm_prefetch(line as *const AtomicU64 as *const i8, std::arch::x86_64::_MM_HINT_ET0)
-        };
+        prefetch(&self.seen[id * self.words + group / 64]);
     }
 
     /// Marks (name, group); true for exactly one caller per pair, the first.
@@ -359,7 +351,7 @@ fn record_starts(text: &[u8], from: usize, parts: usize) -> Vec<usize> {
 }
 
 /// Records are handled in batches of this many, so that their cache misses overlap.
-const BATCH: usize = 32;
+const BATCH: usize = 16;
 
 /// One parsed record, waiting for its table lookups.
 #[derive(Clone, Copy, Default)]
