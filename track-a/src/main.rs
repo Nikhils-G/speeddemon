@@ -80,14 +80,7 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
             .map(|&chunk| {
                 let start = chunk.as_ptr() as usize - log.as_ptr() as usize;
                 s.spawn(move || {
-                    // Copy the endpoint names out before the chunk's pages are dropped:
-                    // the merge reads them all, and each would fault its page back in.
-                    let part = parse_chunk(padded, start, start + chunk.len()).map(|mut part| {
-                        for name in &mut part.names {
-                            *name = Box::leak(name.to_vec().into_boxed_slice());
-                        }
-                        part
-                    });
+                    let part = parse_chunk(padded, start, start + chunk.len());
                     mmap::release(chunk);
                     part
                 })
