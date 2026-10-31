@@ -1,10 +1,8 @@
 //! Read-only mmap and a few memory settings through libc, declared by hand so the
 //! crate has no dependencies.
 
-use std::fs::File;
-use std::io;
 use std::os::fd::AsRawFd;
-use std::os::raw::{c_int, c_long, c_void};
+use std::os::raw::{c_int, c_void};
 
 unsafe extern "C" {
     fn mmap(
@@ -13,21 +11,28 @@ unsafe extern "C" {
         prot: c_int,
         flags: c_int,
         fd: c_int,
-        offset: c_long,
-    ) -> *mut c_void;
+        at: i64,
+    ) -> *mut u8;
     fn prctl(option: c_int, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> c_int;
     fn madvise(addr: *mut c_void, len: usize, advice: c_int) -> c_int;
     fn mallopt(param: c_int, value: c_int) -> c_int;
 }
 
-/// Makes malloc grow each heap 32 MB at a time. A worker thread's first
-/// allocations get their own heap, which otherwise grows a few pages per
-/// mprotect, and each mprotect stalls every other thread's page faults (800 of
-/// them per run). Reserved but untouched pages cost no memory.
-pub fn big_heap_steps() {
+/// Makes malloc grow each heap 32 MB at a time, and turns off transparent huge
+/// pages. A worker thread's first allocations get their own heap, which otherwise
+/// grows a few pages per mprotect, and each mprotect stalls every other thread's
+/// page faults (800 of them per run); reserved but untouched pages cost no memory.
+/// With THP set to "always", touching one byte of a sparse, lazily zeroed table can
+/// fault in a whole 2 MB page, so the memory peak would depend on how fragmented
+/// the host is that run.
+pub fn setup() {
     const M_TOP_PAD: c_int = -2;
-    // SAFETY: a plain libc call; failure only keeps the default.
-    unsafe { mallopt(M_TOP_PAD, 32 << 20) };
+    const PR_SET_THP_DISABLE: c_int = 41;
+    // SAFETY: plain libc calls; failure only keeps the defaults.
+    unsafe {
+        mallopt(M_TOP_PAD, 32 << 20);
+        prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
+    }
 }
 
 /// Drops this process's page-table entries for the whole pages inside `slice`, a
@@ -36,10 +41,9 @@ pub fn big_heap_steps() {
 /// does the same work in each parsing thread, in parallel. Reading the bytes
 /// again is still correct: the page faults back in from the page cache.
 pub fn release(slice: &[u8]) {
-    const PAGE: usize = 4096;
     const MADV_DONTNEED: c_int = 4;
-    let start = (slice.as_ptr() as usize).next_multiple_of(PAGE);
-    let end = (slice.as_ptr() as usize + slice.len()) / PAGE * PAGE;
+    let start = (slice.as_ptr() as usize).next_multiple_of(4096);
+    let end = (slice.as_ptr() as usize + slice.len()) / 4096 * 4096;
     if end > start {
         // SAFETY: whole pages inside a private, read-only file mapping that is
         // never written; dropping them loses nothing.
@@ -47,22 +51,11 @@ pub fn release(slice: &[u8]) {
     }
 }
 
-const PR_SET_THP_DISABLE: c_int = 41;
-
-/// Turns off transparent huge pages for this process. With THP set to "always",
-/// touching one byte of a sparse, lazily zeroed table can fault in a whole 2 MB
-/// page, so the memory peak would depend on how fragmented the host is that run.
-pub fn no_huge_pages() {
-    // SAFETY: a plain syscall wrapper; failure only means THP stays on.
-    unsafe { prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0) };
-}
-
-const PROT_READ: c_int = 1;
-const MAP_PRIVATE: c_int = 2;
-
 /// Maps the whole file read-only for the rest of the process. It is never
 /// unmapped: the process exits right after using it, and exit unmaps everything.
-pub fn map(file: &File) -> io::Result<&'static [u8]> {
+pub fn map(file: &std::fs::File) -> std::io::Result<&'static [u8]> {
+    const PROT_READ: c_int = 1;
+    const MAP_PRIVATE: c_int = 2;
     let len = file.metadata()?.len() as usize;
     if len == 0 {
         return Ok(&[]);
@@ -80,8 +73,8 @@ pub fn map(file: &File) -> io::Result<&'static [u8]> {
         )
     };
     if ptr as isize == -1 {
-        return Err(io::Error::last_os_error());
+        return Err(std::io::Error::last_os_error());
     }
     // SAFETY: the mapping is valid for `len` bytes and lives until exit.
-    Ok(unsafe { std::slice::from_raw_parts(ptr as *const u8, len) })
+    Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
 }
