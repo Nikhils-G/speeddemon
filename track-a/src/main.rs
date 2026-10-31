@@ -61,14 +61,14 @@ fn main() {
         return; // the spec's empty input gives an empty summary
     }
 
-    // Pass 1, parallel: each thread parses blocks of the log, taken in turn, into
-    // packed records, with one endpoint table shared by all threads.
+    // Pass 1, parallel: parse each chunk into packed records, with one endpoint
+    // table shared by all threads.
     let threads = thread::available_parallelism().map_or(1, |n| n.get());
     let table = &Interner::new();
-    let (blocks, next) = (&split_at_lines(log, 4 * threads), &AtomicUsize::new(0));
+    let chunks = split_at_lines(log, threads);
     let parts: Vec<Part> = thread::scope(|s| {
-        let spawn = |_| s.spawn(move || parse_blocks(log.len(), blocks, next, table));
-        let handles: Vec<_> = (0..threads).map(spawn).collect();
+        let spawn = |&chunk| s.spawn(move || parse_chunk(chunk, table));
+        let handles: Vec<_> = chunks.iter().map(spawn).collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
@@ -86,23 +86,19 @@ fn main() {
     let mut hours: Vec<Head> = all_runs.map(|r| r.head).collect();
     hours.sort_unstable_by_key(|head| number(head));
     hours.dedup();
-    // Also each block's records, as (part, start, end), and how many hours still
-    // read them: the hour that brings a block's count to zero gives the rest of its
-    // records back. Runs of one block are adjacent in an hour's list.
+    // Also how many hours still read each part's records: the hour that brings
+    // its part's count to zero gives the rest of the records back. Runs of one
+    // part are adjacent in an hour's list.
     let mut runs_of: Vec<Vec<(usize, Run, usize)>> = vec![Vec::new(); hours.len()];
-    let readers: Vec<AtomicUsize> = blocks.iter().map(|_| AtomicUsize::new(0)).collect();
-    let mut spans = vec![(0, 0, 0); blocks.len()];
+    let readers: Vec<AtomicUsize> = parts.iter().map(|_| AtomicUsize::new(0)).collect();
     for (p, part) in parts.iter().enumerate() {
         for (k, run) in part.runs.iter().enumerate() {
             let next = part.runs.get(k + 1);
             let end = next.map_or(part.records.len(), |r| r.start as usize);
-            let first = k == 0 || part.runs[k - 1].block != run.block;
-            let span = &mut spans[run.block as usize];
-            *span = (p, if first { run.start as usize } else { span.1 }, end);
             let hour = hours.binary_search_by_key(&number(&run.head), |h| number(h));
             let runs = &mut runs_of[hour.unwrap()];
-            if runs.last().is_none_or(|r| r.1.block != run.block) {
-                readers[run.block as usize].fetch_add(1, Relaxed);
+            if runs.last().is_none_or(|r| r.0 != p) {
+                readers[p].fetch_add(1, Relaxed);
             }
             runs.push((p, *run, end));
         }
@@ -214,14 +210,13 @@ fn main() {
                     // The records are no longer needed once placed.
                     for (k, &(p, run, end)) in runs.iter().enumerate() {
                         // Long runs (shard 0's hourly uploads: 142 runs, 93% of the
-                        // records) at once, the rest with their block.
+                        // records) at once, the rest with their part.
                         if end - run.start as usize >= 4096 {
                             mmap::release(&parts[p].records[run.start as usize..end]);
                         }
-                        let last = k == 0 || runs[k - 1].1.block != run.block;
-                        if last && readers[run.block as usize].fetch_sub(1, AcqRel) == 1 {
-                            let (p, start, end) = spans[run.block as usize];
-                            mmap::release(&parts[p].records[start..end]);
+                        let last = k == 0 || runs[k - 1].0 != p;
+                        if last && readers[p].fetch_sub(1, AcqRel) == 1 {
+                            mmap::release(&parts[p].records);
                         }
                     }
                     let (mut groups, mut len) = (Vec::with_capacity(endpoints), 0);
@@ -260,12 +255,11 @@ fn number(bytes: &[u8]) -> u128 {
     u128::from_be_bytes(padded)
 }
 
-/// A run of consecutive lines of one part in one hour, all from log block `block`,
-/// from record `start` (and escape `escapes`) to the next run's start.
+/// A run of consecutive lines of one part in one hour, from record `start` (and
+/// escape `escapes`) to the next run's start.
 #[derive(Clone, Copy)]
 struct Run {
     head: Head,
-    block: u32,
     start: u32,
     escapes: u32,
 }
@@ -346,15 +340,13 @@ struct Part {
 /// The shortest possible line: timestamp, "GET", "/", status, one digit, spaces, LF.
 const MIN_LINE: usize = 27 + 1 + 3 + 1 + 1 + 1 + 3 + 1 + 1 + 1;
 
-/// Parses the lines of the next untaken block, slices of the mapped log of `size`
-/// bytes (which goes on with mmap::PAD zero bytes), giving each block's pages back
-/// when done, until none is left. Taking blocks in turn evens out threads that run
-/// slower, such as two sharing a core. Every line is "ts SP method SP endpoint SP
-/// status SP latency LF" (27-byte ts).
-fn parse_blocks(size: usize, blocks: &[&[u8]], next: &AtomicUsize, table: &Interner) -> Part {
+/// Parses the lines of `chunk`, a slice of the mapped log, which goes on with
+/// mmap::PAD zero bytes, then gives the chunk's pages back. Every line is
+/// "ts SP method SP endpoint SP status SP latency LF" (27-byte ts).
+fn parse_chunk(chunk: &'static [u8], table: &Interner) -> Part {
     // Sized for the worst case, so the loop writes without capacity checks; only
     // the pages actually written are ever backed by memory.
-    let most = size / MIN_LINE + 1;
+    let most = chunk.len() / MIN_LINE + 1;
     let (mut records, mut escapes) = (Vec::with_capacity(most), Vec::with_capacity(most));
     let mut runs = Vec::new();
     // SAFETY: every load stays within the line (at most 177 bytes) and the mmap::PAD
@@ -367,68 +359,61 @@ fn parse_blocks(size: usize, blocks: &[&[u8]], next: &AtomicUsize, table: &Inter
         let (first_record, first_escape): (*mut u32, *mut u32) =
             (records.as_mut_ptr(), escapes.as_mut_ptr());
         let (mut record, mut escape) = (first_record, first_escape);
-        loop {
-            let index = next.fetch_add(1, Relaxed);
-            let Some(&block) = blocks.get(index) else {
-                break;
-            };
-            let (mut line, stop) = (block.as_ptr(), block.as_ptr_range().end);
-            // Lines from one shard arrive in time order, so most lines repeat the
-            // previous line's hour. Its bytes "MM-DDTHH" decide: every timestamp lies in
-            // one 72-hour span (the spec), so lines that share them share the year.
-            let mut last = u64::MAX;
-            while line < stop {
-                let hour = line.add(5).cast::<u64>().read_unaligned();
-                if hour != last {
-                    last = hour;
-                    runs.push(Run {
-                        head: *line.cast::<Head>(),
-                        block: index as u32,
-                        start: record.offset_from(first_record) as u32,
-                        escapes: escape.offset_from(first_escape) as u32,
-                    });
-                }
-                // One 64-byte window after the timestamp: its first two spaces end the
-                // method and the endpoint (no branch on the method or the length).
-                let load = |at: usize| _mm256_loadu_si256(line.add(at).cast());
-                let spaces = |at: usize| movemask(_mm256_cmpeq_epi8(load(28 + at), space)) as u64;
-                let mask = spaces(0) | spaces(32) << 32;
-                let from = 29 + mask.trailing_zeros() as usize;
-                let rest = mask & (mask - 1);
-                let to = if rest != 0 {
-                    28 + rest.trailing_zeros() as usize
-                } else {
-                    let mut at = 64; // an endpoint of about 60 bytes or more: on by 32
-                    while spaces(at) == 0 {
-                        at += 32;
-                    }
-                    28 + at + spaces(at).trailing_zeros() as usize
-                };
-                // The key: the endpoint's first 64 bytes, zero from the space on.
-                let len = to - from;
-                let keep = KEEP.as_ptr().cast::<u8>().add(64 - len.min(64));
-                let half = |at: usize| {
-                    _mm256_and_si256(load(from + at), _mm256_loadu_si256(keep.add(at).cast()))
-                };
-                let key = [half(0), half(32)];
-                let endpoint = table.id(&key, std::slice::from_raw_parts(line.add(from), len));
-                // The latency: up to 10 digits from 5 bytes after the endpoint, to the LF.
-                let digits = _mm_loadu_si128(line.add(to + 5).cast());
-                let count = _mm_movemask_epi8(_mm_cmpeq_epi8(digits, _mm_set1_epi8(b'\n' as i8)))
-                    .trailing_zeros() as usize;
-                let latency = parse_digits(digits, count);
-                *escape = latency as u32;
-                escape = escape.add((latency >= ESCAPE as u64) as usize);
-                let error = ((*line.add(to + 1) == b'5') as u32) << 20;
-                *record = endpoint << ENDPOINT_SHIFT | error | latency.min(ESCAPE as u64) as u32;
-                record = record.add(1);
-                line = line.add(to + 5 + count + 1);
+        let (mut line, stop) = (chunk.as_ptr(), chunk.as_ptr_range().end);
+        // Lines from one shard arrive in time order, so most lines repeat the
+        // previous line's hour. Its bytes "MM-DDTHH" decide: every timestamp lies in
+        // one 72-hour span (the spec), so lines that share them share the year.
+        let mut last = u64::MAX;
+        while line < stop {
+            let hour = line.add(5).cast::<u64>().read_unaligned();
+            if hour != last {
+                last = hour;
+                runs.push(Run {
+                    head: *line.cast::<Head>(),
+                    start: record.offset_from(first_record) as u32,
+                    escapes: escape.offset_from(first_escape) as u32,
+                });
             }
-            mmap::release(block);
+            // One 64-byte window after the timestamp: its first two spaces end the
+            // method and the endpoint (no branch on the method or the length).
+            let load = |at: usize| _mm256_loadu_si256(line.add(at).cast());
+            let spaces = |at: usize| movemask(_mm256_cmpeq_epi8(load(28 + at), space)) as u64;
+            let mask = spaces(0) | spaces(32) << 32;
+            let from = 29 + mask.trailing_zeros() as usize;
+            let rest = mask & (mask - 1);
+            let to = if rest != 0 {
+                28 + rest.trailing_zeros() as usize
+            } else {
+                let mut at = 64; // an endpoint of about 60 bytes or more: on by 32
+                while spaces(at) == 0 {
+                    at += 32;
+                }
+                28 + at + spaces(at).trailing_zeros() as usize
+            };
+            // The key: the endpoint's first 64 bytes, zero from the space on.
+            let len = to - from;
+            let keep = KEEP.as_ptr().cast::<u8>().add(64 - len.min(64));
+            let half = |at: usize| {
+                _mm256_and_si256(load(from + at), _mm256_loadu_si256(keep.add(at).cast()))
+            };
+            let key = [half(0), half(32)];
+            let endpoint = table.id(&key, std::slice::from_raw_parts(line.add(from), len));
+            // The latency: up to 10 digits from 5 bytes after the endpoint, to the LF.
+            let digits = _mm_loadu_si128(line.add(to + 5).cast());
+            let count = _mm_movemask_epi8(_mm_cmpeq_epi8(digits, _mm_set1_epi8(b'\n' as i8)))
+                .trailing_zeros() as usize;
+            let latency = parse_digits(digits, count);
+            *escape = latency as u32;
+            escape = escape.add((latency >= ESCAPE as u64) as usize);
+            let error = ((*line.add(to + 1) == b'5') as u32) << 20;
+            *record = endpoint << ENDPOINT_SHIFT | error | latency.min(ESCAPE as u64) as u32;
+            record = record.add(1);
+            line = line.add(to + 5 + count + 1);
         }
         records.set_len(record.offset_from(first_record) as usize);
         escapes.set_len(escape.offset_from(first_escape) as usize);
     }
+    mmap::release(chunk);
     Part {
         records,
         escapes,
