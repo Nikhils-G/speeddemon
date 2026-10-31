@@ -82,30 +82,14 @@ fn main() {
     // - PR_SET_THP_DISABLE (41): with transparent huge pages, touching one byte of
     //   a sparse table can fault in a whole 2 MB page, so the memory peak would
     //   depend on how fragmented the host is (13 to 24 MB between runs).
-    // - Before that, while they are on, one huge page on purpose: a 2 MB-aligned
-    //   2 MB inside an anonymous mapping of 4 MB, PROT_READ | PROT_WRITE (3),
-    //   MAP_PRIVATE | MAP_ANONYMOUS (0x22), touched once. It holds the join table,
-    //   whose lookups are random over 1 MB: on 4 KB pages they missed the first
-    //   level TLB about once a record. Its other half holds the keys and ids of
-    //   the first partition tables made, so the page costs no more memory (and
-    //   without a huge page, the same 4 KB pages are used as before). Server, 12
-    //   threads: L1 DTLB misses -40%, -0.5 ms, the same memory peak.
-    let huge = unsafe {
+    unsafe {
         mallopt(-2, 32 << 20);
-        let p = mmap(std::ptr::null_mut(), 4 << 20, 3, 0x22, -1, 0);
-        let page = (p as usize).next_multiple_of(2 << 20) as *mut u64;
-        // (Its 2 MB are inside the mapping, which lives until exit.)
-        let mut page = (p as isize != -1).then(|| std::slice::from_raw_parts_mut(page, 1 << 18));
-        if let Some(page) = &mut page {
-            page[0] = 0; // faults the page in
-        }
         prctl(41, 1, 0, 0, 0);
-        page
-    };
+    }
     let mut args = std::env::args().skip(1);
     let data_dir = args.next().unwrap_or_else(|| "/data".into());
     let out_dir = args.next().unwrap_or_else(|| "/out".into());
-    let Err(message) = run(&data_dir, &out_dir, huge);
+    let Err(message) = run(&data_dir, &out_dir);
     exit_with(Err(message))
 }
 
@@ -154,7 +138,7 @@ fn many<T: Default>(n: usize) -> Vec<T> {
 /// and writes the output. One set of threads does all of it, this one included.
 /// Returns only on failure: on success the thread that writes the output exits
 /// the process.
-fn run(data_dir: &str, out_dir: &str, mut huge: Option<&'static mut [u64]>) -> Result<std::convert::Infallible, String> {
+fn run(data_dir: &str, out_dir: &str) -> Result<std::convert::Infallible, String> {
     let lines = map(&format!("{data_dir}/regions.csv"))?;
     let lines = lines
         .strip_prefix(b"region_id,country\n")
@@ -189,18 +173,9 @@ fn run(data_dir: &str, out_dir: &str, mut huge: Option<&'static mut [u64]>) -> R
     // or a bad record. Then the file is parsed again as one run: exact under 2.1.
     for guessed in [true, false] {
         // The join table, dense by region id: group + 1, or 0 for ids it does not
-        // contain (and at least `ids` long). In the huge page if it fits, with the
-        // rest of the page to spare for partitions; else, and for a second parse,
-        // zeroed by calloc, so the pages fault in on the threads that fill them.
-        let (table, spare) = match huge.take() {
-            Some(page) if ids <= 2 << 20 => page.split_at_mut(ids.div_ceil(8)),
-            _ => (vec![0; ids.div_ceil(8)].leak(), &mut [][..]),
-        };
-        // SAFETY: zeroed memory used by nothing else, and an AtomicU8 is laid out
-        // as a u8, for which zero is valid.
-        let group_of: &[AtomicU8] =
-            unsafe { std::slice::from_raw_parts(table.as_ptr().cast(), table.len() * 8) };
-        let spare = Mutex::new(spare);
+        // contain. SAFETY: zero is a valid AtomicU8. Zeroed by calloc, so the pages
+        // fault in on the threads that fill them.
+        let group_of: Box<[AtomicU8]> = unsafe { Box::new_zeroed_slice(ids).assume_init() };
         // By country code index (26^3 of them): its group + 1, or 0 while not seen;
         // and the codes in group order, held while a code gets the next number.
         let (codes, keys): (Vec<AtomicU8>, _) = (many(26 * 26 * 26), Mutex::new(Vec::new()));
@@ -249,7 +224,7 @@ fn run(data_dir: &str, out_dir: &str, mut huge: Option<&'static mut [u64]>) -> R
         let worker = &|w: usize| {
             let mut totals = [EMPTY; GROUPS];
             // This thread's tables and pair buffers: made here, so they are in its cache.
-            let mine = (0..PARTITIONS_PER_THREAD).map(|_| Partition::new(slots, &spare));
+            let mine = (0..PARTITIONS_PER_THREAD).map(|_| Partition::new(slots));
             *tables[w].lock().unwrap() = mine.collect();
             let mut pairs: Vec<_> = (0..parts).map(|_| Vec::with_capacity(capacity)).collect();
             // Thread t's tables take the pairs in its inbox, and give the buffers back
@@ -283,7 +258,7 @@ fn run(data_dir: &str, out_dir: &str, mut huge: Option<&'static mut [u64]>) -> R
                 if error.is_ok() {
                     let (start, end) = (cut(run), cut(run + 1));
                     let span = (start, end, guessed);
-                    error = parse_run(text, span, group_of, &mut totals, &mut pairs);
+                    error = parse_run(text, span, &group_of, &mut totals, &mut pairs);
                 }
                 for (t, pairs) in pairs.chunks_mut(PARTITIONS_PER_THREAD).enumerate() {
                     let mut inbox = inboxes[t].lock().unwrap();
@@ -389,27 +364,20 @@ fn spin_until(done: impl Fn() -> bool) {
 /// in a 7/8 full table: 23% less memory, but 13% of lookups leave their first
 /// bucket, +0.8M branch misses.)
 struct Partition {
-    keys: &'static mut [u64], // 0 = empty, else the name hash with its low byte set to 0xFF
-    ids: &'static mut [u16],  // by slot
-    seen: Vec<u64>,           // WORDS per id, a row added per new name
+    keys: Vec<u64>, // 0 = empty, else the name hash with its low byte set to 0xFF
+    ids: Vec<u16>,  // by slot
+    seen: Vec<u64>, // WORDS per id, a row added per new name
 }
 
 impl Partition {
-    /// A table of `slots` slots (a power of two), for up to 5/8 as many names. Its
-    /// keys and ids (4 to a word) are in `spare` while it has room.
-    fn new(slots: usize, spare: &Mutex<&'static mut [u64]>) -> Self {
-        let mut spare = spare.lock().unwrap();
-        let (keys, ids) = if spare.len() >= slots + slots / 4 {
-            let (mine, rest) = std::mem::take(&mut *spare).split_at_mut(slots + slots / 4);
-            *spare = rest;
-            let (keys, ids) = mine.split_at_mut(slots);
-            // SAFETY: zero bits are a valid u16, and u64s are aligned for u16s.
-            (keys, unsafe { ids.align_to_mut().1 })
-        } else {
-            (vec![0; slots].leak(), vec![0; slots].leak())
-        };
-        let seen = Vec::with_capacity(slots / 8 * 5 * WORDS);
-        Partition { keys, ids, seen }
+    /// A table of `slots` slots (a power of two), for up to 5/8 as many names.
+    fn new(slots: usize) -> Self {
+        let (keys, ids) = (vec![0; slots], vec![0; slots]);
+        Partition {
+            keys,
+            ids,
+            seen: Vec::with_capacity(slots / 8 * 5 * WORDS),
+        }
     }
 
     /// Marks each (name hash, group) pair, and counts in `totals` the pairs seen
@@ -418,7 +386,7 @@ impl Partition {
     #[inline(never)]
     fn add(&mut self, pairs: &[u64], totals: &mut [Totals; GROUPS]) -> Result<(), String> {
         // Fields as locals: no store through them can change the others.
-        let (keys, ids, seen) = (&mut *self.keys, &mut *self.ids, &mut self.seen);
+        let (keys, ids, seen) = (&mut self.keys, &mut self.ids, &mut self.seen);
         let (buckets, full) = (keys.len() / 4, keys.len() / 8 * 5 * WORDS);
         for &pair in pairs {
             let (key, group) = (pair | 0xFF, (pair & 0xFF) as usize);
