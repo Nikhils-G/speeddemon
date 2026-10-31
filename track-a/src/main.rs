@@ -10,19 +10,20 @@
 //!    AVX2 compares, digits are converted eight at a time, and endpoints are
 //!    interned per thread by comparing their zero-padded 32-byte form, with no
 //!    allocation per line.
-//! 3. Endpoints are then ranked in byte order, so `group = hour * E + rank` is
-//!    already the output order. A counting sort by group lays every group's
-//!    latencies out contiguously, and each group is sorted on its own (groups are
-//!    small), which gives exact percentiles without one big sort.
-//! 4. Every pass between parsing and writing is parallel too, including the
-//!    prefix sums over the 130,000 groups and the output, written by all threads
-//!    at once into a pre-sized file: at this speed, serial glue is what shows.
+//! 3. Each thread then groups its records by hour, in place. Endpoints are ranked
+//!    in byte order, and the hours are handed out to the threads: a thread gathers
+//!    one hour's records from every part, groups them by endpoint with a counting
+//!    sort small enough to stay in L1/L2, sorts each group (groups are small) for
+//!    exact percentiles, and formats the hour's lines. One cache-friendly pass per
+//!    hour replaces global histograms, prefix sums and a scatter across a 12 MB
+//!    array, which did not scale with threads.
+//! 4. The hours' pieces are written by all threads at once into a pre-sized file.
 
 mod mmap;
 
 use std::fs::File;
 use std::os::unix::fs::FileExt;
-use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::thread;
 
 /// Hours are stored relative to the first line's hour minus this slack, in 12 bits.
@@ -90,149 +91,71 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
     let hour_lo = parts.iter().map(|p| p.hour_lo).min().unwrap();
     let hour_hi = parts.iter().map(|p| p.hour_hi).max().unwrap();
     let endpoints = names.len();
-    let groups = (hour_hi - hour_lo + 1) as usize * endpoints;
-    let group_of = |part: usize, key: u32| -> usize {
-        let hour = (key >> KEY_BITS) - hour_lo;
-        hour as usize * endpoints + rank_of[part][(key & ENDPOINT_MASK) as usize] as usize
-    };
 
-    // Pass 2, parallel: per-part group histograms.
-    let mut slots: Vec<Vec<u32>> = thread::scope(|s| {
-        let handles: Vec<_> = parts
-            .iter()
-            .enumerate()
-            .map(|(i, part)| {
+    // Pass 2, parallel over hours: each thread takes the next hour, gathers its
+    // records from every part, groups them by endpoint rank, and formats lines.
+    let next = AtomicUsize::new(0);
+    let mut pieces: Vec<(u32, Vec<u8>)> = thread::scope(|s| {
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let (parts, rank_of, names, next) = (&parts, &rank_of, &names, &next);
                 s.spawn(move || {
-                    let mut counts = vec![0u32; groups];
-                    for &record in &part.records {
-                        counts[group_of(i, (record >> 32) as u32)] += 1;
+                    let mut done = Vec::new();
+                    let (mut start, mut errors, mut values) = (vec![0u32; endpoints + 1], vec![0u32; endpoints], Vec::new());
+                    loop {
+                        let hour = hour_lo + next.fetch_add(1, Relaxed) as u32;
+                        if hour > hour_hi {
+                            break done;
+                        }
+                        let records = || parts.iter().zip(rank_of).flat_map(move |(part, ranks)| part.hour(hour).iter().map(move |&r| (ranks, r)));
+                        // Count per endpoint rank (shifted by one), then turn the
+                        // counts into start offsets, then place each latency.
+                        start.fill(0);
+                        errors.fill(0);
+                        for (ranks, record) in records() {
+                            let key = (record >> 32) as u32;
+                            let rank = ranks[(key & ENDPOINT_MASK) as usize] as usize;
+                            start[rank + 1] += 1;
+                            errors[rank] += (key & ERROR_BIT != 0) as u32;
+                        }
+                        for k in 0..endpoints {
+                            start[k + 1] += start[k];
+                        }
+                        values.resize(start[endpoints] as usize, 0);
+                        let mut cursor = start.clone();
+                        for (ranks, record) in records() {
+                            let rank = ranks[((record >> 32) as u32 & ENDPOINT_MASK) as usize] as usize;
+                            values[cursor[rank] as usize] = record as u32;
+                            cursor[rank] += 1;
+                        }
+                        let label = hour_label(base + hour);
+                        let mut out = Vec::with_capacity(values.len() * 4);
+                        for rank in 0..endpoints {
+                            let group = &mut values[start[rank] as usize..start[rank + 1] as usize];
+                            if group.is_empty() {
+                                continue;
+                            }
+                            group.sort_unstable();
+                            let (n, errs) = (group.len() as u64, errors[rank] as u64);
+                            out.extend_from_slice(&label);
+                            out.push(b' ');
+                            out.extend_from_slice(names[rank]);
+                            for value in [n, rank_value(group, 50), rank_value(group, 95), rank_value(group, 99), errs, errs * 1_000_000 / n] {
+                                out.push(b' ');
+                                push_decimal(&mut out, value);
+                            }
+                            out.push(b'\n');
+                        }
+                        done.push((hour, out));
                     }
-                    counts
                 })
             })
             .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
+        handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
     });
-
-    // Turn the histograms into write positions: group by group, part by part.
-    // Only the running total over groups is serial; the rest works on disjoint
-    // group ranges in parallel.
-    let ranges: Vec<std::ops::Range<usize>> = (0..threads).map(|t| groups * t / threads..groups * (t + 1) / threads).collect();
-    let mut group_start = vec![0u32; groups + 1];
-    thread::scope(|s| {
-        let slots = &slots;
-        let mut rest: &mut [u32] = &mut group_start;
-        for range in &ranges {
-            let (mine, tail) = rest.split_at_mut(range.len());
-            rest = tail;
-            s.spawn(move || {
-                for (total, g) in mine.iter_mut().zip(range.clone()) {
-                    *total = slots.iter().map(|part| part[g]).sum();
-                }
-            });
-        }
-    });
-    let mut next = 0u32;
-    for total in group_start.iter_mut() {
-        let count = *total;
-        *total = next;
-        next += count;
-    }
-    let shared_slots: Vec<SharedSlice> = slots.iter_mut().map(|part| SharedSlice(part.as_mut_ptr())).collect();
-    thread::scope(|s| {
-        let (group_start, shared_slots) = (&group_start, &shared_slots);
-        for range in &ranges {
-            s.spawn(move || {
-                for g in range.clone() {
-                    let mut offset = group_start[g];
-                    for part in shared_slots {
-                        // SAFETY: each thread owns a disjoint range of groups, and
-                        // every part's array has `groups` entries.
-                        let slot = unsafe { &mut *part.0.add(g) };
-                        let count = *slot;
-                        *slot = offset;
-                        offset += count;
-                    }
-                }
-            });
-        }
-    });
-
-    // Pass 3, parallel: scatter each latency to its slot, counting 5xx on the way.
-    // Both arrays are written by every thread at random: populated up front, so
-    // the threads do not all fault the same pages in (see `mmap::populate`).
-    let mut latencies = vec![0u32; next as usize];
-    mmap::populate(&mut latencies);
-    let mut errors: Vec<AtomicU32> = (0..groups).map(|_| AtomicU32::new(0)).collect();
-    mmap::populate(&mut errors);
-    let errors = &errors;
-    let target = SharedSlice(latencies.as_mut_ptr());
-    thread::scope(|s| {
-        for (i, (part, part_slots)) in parts.iter().zip(slots.iter_mut()).enumerate() {
-            let target = &target;
-            s.spawn(move || {
-                for &record in &part.records {
-                    let key = (record >> 32) as u32;
-                    let g = group_of(i, key);
-                    let slot = &mut part_slots[g];
-                    // SAFETY: the prefix sums above gave every (group, part) pair its
-                    // own disjoint range of `latencies`, so no two threads write the
-                    // same index.
-                    unsafe { *target.0.add(*slot as usize) = record as u32 };
-                    *slot += 1;
-                    if key & ERROR_BIT != 0 {
-                        errors[g].fetch_add(1, Relaxed);
-                    }
-                }
-            });
-        }
-    });
-    drop(slots);
     drop(parts);
-
-    // Pass 4, parallel: sort each group and format its line. The groups are split
-    // into contiguous ranges of roughly equal latency counts, so each buffer is a
-    // contiguous piece of the output.
-    let hour_labels: Vec<[u8; 20]> = (hour_lo..=hour_hi).map(|h| hour_label(base + h)).collect();
-    let mut bounds = vec![0usize];
-    for t in 1..threads {
-        let want = (next as u64 * t as u64 / threads as u64) as u32;
-        bounds.push(group_start.partition_point(|&s| s < want).min(groups).max(*bounds.last().unwrap()));
-    }
-    bounds.push(groups);
-    let buffers: Vec<Vec<u8>> = thread::scope(|s| {
-        let mut rest: &mut [u32] = &mut latencies;
-        let mut handles = Vec::new();
-        for w in bounds.windows(2) {
-            let (g0, g1) = (w[0], w[1]);
-            let len = (group_start[g1] - group_start[g0]) as usize;
-            let (mine, tail) = rest.split_at_mut(len);
-            rest = tail;
-            let (group_start, names, hour_labels) = (&group_start, &names, &hour_labels);
-            handles.push(s.spawn(move || {
-                let mut out = Vec::with_capacity(len * 4);
-                let offset = group_start[g0] as usize;
-                for g in g0..g1 {
-                    let values = &mut mine[group_start[g] as usize - offset..group_start[g + 1] as usize - offset];
-                    if values.is_empty() {
-                        continue;
-                    }
-                    values.sort_unstable();
-                    let (n, errs) = (values.len() as u64, errors[g].load(Relaxed) as u64);
-                    out.extend_from_slice(&hour_labels[g / endpoints]);
-                    out.push(b' ');
-                    out.extend_from_slice(names[g % endpoints]);
-                    for value in [n, rank(values, 50), rank(values, 95), rank(values, 99), errs, errs * 1_000_000 / n] {
-                        out.push(b' ');
-                        push_decimal(&mut out, value);
-                    }
-                    out.push(b'\n');
-                }
-                out
-            }));
-        }
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
+    pieces.sort_unstable_by_key(|&(hour, _)| hour);
+    let buffers: Vec<Vec<u8>> = pieces.into_iter().map(|(_, out)| out).collect();
 
     // Every thread writes its piece at its offset into the pre-sized file.
     let total: usize = buffers.iter().map(Vec::len).sum();
@@ -257,14 +180,12 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
     .map_err(|e| format!("write {output_path}: {e}"))
 }
 
-struct SharedSlice(*mut u32);
-// SAFETY: only used for the disjoint writes documented at each use.
-unsafe impl Sync for SharedSlice {}
-
 /// One thread's parse of its chunk.
 struct Part<'a> {
-    /// `key << 32 | latency` (see KEY_BITS), hour relative to `base`.
+    /// `key << 32 | latency` (see KEY_BITS), hour relative to `base`, grouped by
+    /// hour: hour h is `records[hour_start[h]..hour_start[h + 1]]`.
     records: Vec<u64>,
+    hour_start: Vec<u32>,
     /// Local endpoint id -> its bytes in the mmap, and its 32-byte key.
     names: Vec<&'a [u8]>,
     keys: Vec<Key>,
@@ -280,7 +201,8 @@ const FAST_MARGIN: usize = MAX_LINE + 64;
 
 /// Parses the lines in `log[start..end]`.
 fn parse_chunk(log: &[u8], start: usize, end: usize, base: u32) -> Result<Part<'_>, String> {
-    let mut part = Part { records: Vec::with_capacity((end - start) / 70), names: Vec::new(), keys: Vec::new(), hour_lo: u32::MAX, hour_hi: 0 };
+    let mut part = Part { records: Vec::with_capacity((end - start) / 70), hour_start: Vec::new(), names: Vec::new(), keys: Vec::new(), hour_lo: u32::MAX, hour_hi: 0 };
+    let mut per_hour = vec![0u32; 1 << HOUR_BITS];
     let mut interner = Interner::new();
     // Lines from one shard arrive in time order, so most lines repeat the previous
     // line's hour: compare the 13 bytes "YYYY-MM-DDTHH" instead of reparsing them.
@@ -310,9 +232,39 @@ fn parse_chunk(log: &[u8], start: usize, end: usize, base: u32) -> Result<Part<'
         }
         let key = hour << KEY_BITS | if fields.error { ERROR_BIT } else { 0 } | endpoint;
         part.records.push((key as u64) << 32 | fields.latency);
+        per_hour[hour as usize] += 1;
         i += fields.len;
     }
+    part.group_by_hour(&per_hour);
     Ok(part)
+}
+
+impl Part<'_> {
+    /// Sorts the records by hour in place, one American flag sort pass: every
+    /// record is swapped straight into its hour's region, with no second array.
+    fn group_by_hour(&mut self, per_hour: &[u32]) {
+        let mut start = vec![0u32; per_hour.len() + 1];
+        for (h, &count) in per_hour.iter().enumerate() {
+            start[h + 1] = start[h] + count;
+        }
+        let mut next = start.clone();
+        for h in 0..per_hour.len() {
+            while next[h] < start[h + 1] {
+                let to = (self.records[next[h] as usize] >> (32 + KEY_BITS)) as usize;
+                if to == h {
+                    next[h] += 1;
+                } else {
+                    self.records.swap(next[h] as usize, next[to] as usize);
+                    next[to] += 1;
+                }
+            }
+        }
+        self.hour_start = start;
+    }
+
+    fn hour(&self, hour: u32) -> &[u64] {
+        &self.records[self.hour_start[hour as usize] as usize..self.hour_start[hour as usize + 1] as usize]
+    }
 }
 
 /// An endpoint's identity: its bytes zero-padded to 32, as four little-endian
@@ -534,7 +486,7 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 }
 
 /// Nearest rank: the value at 1-indexed rank ceil(p * n / 100) of sorted values.
-fn rank(sorted: &[u32], p: usize) -> u64 {
+fn rank_value(sorted: &[u32], p: usize) -> u64 {
     sorted[(p * sorted.len() + 99) / 100 - 1] as u64
 }
 
