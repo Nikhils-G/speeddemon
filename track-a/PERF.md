@@ -21,6 +21,9 @@ each, before pushing.
 | 11 | 3ffca82 | Endpoint names copied out of the chunk before its pages are dropped | run-e557e7f64a7c | 0.0367 | 26.0 | 595 | 75.3 |
 | 12 | 0030dfe | Exit as soon as the output is written (no frees) | run-bd4492babdc6 | 0.0307 | 26.1 | 595 | 77.2 |
 | 13 | 1d7dbb3, f15bc76 | Each output line built in a stack buffer; groups of up to 32 sorted, not selected; endpoint keys compared inline instead of through `memcmp` | run-9ca9494b04b1 | 0.0299 | 26.1 | 599 | 77.4 |
+| 14 | 689fffc | Parse loop on raw pointers into preallocated records (CRC hash, interner probe inlined); pass 2 without bounds checks; write fused into pass 2 (hours in order); record pages released early | run-d79597111386 | 0.0226 | 21.8 | 629 | 81.1 |
+| 15 | 1342bda | One endpoint table shared by the parse threads (CAS inserts), so no serial merge; statically linked binary | run-8e8d92a5861d | 0.0219 | 20.6 | 626 | 81.7 |
+| 16 | a1cf30b | The log read through 128 KB buffers per thread instead of mapped; whole names kept in the shared table | (board pending) | | | | |
 
 ## What each step taught
 
