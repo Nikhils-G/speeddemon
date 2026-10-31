@@ -21,10 +21,7 @@ pub fn no_huge_pages() {
 }
 
 const PROT_READ: c_int = 1;
-const PROT_WRITE: c_int = 2;
 const MAP_PRIVATE: c_int = 2;
-const MAP_ANONYMOUS: c_int = 0x20;
-const MAP_POPULATE: c_int = 0x8000;
 
 /// Maps the whole file read-only for the rest of the process. It is never
 /// unmapped: the process exits right after using it, and exit unmaps everything.
@@ -41,18 +38,4 @@ pub fn map(file: &File) -> io::Result<&'static [u8]> {
     }
     // SAFETY: the mapping is valid for `len` bytes and lives until exit.
     Ok(unsafe { std::slice::from_raw_parts(ptr as *const u8, len) })
-}
-
-/// `bytes` of zeroed memory, mapped and populated in this one call. Zeroed pages
-/// that threads fault in lazily are populated one page at a time under the
-/// kernel's page-table locks, and twelve threads filling one table that way
-/// spend a quarter of their time spinning on those locks; populating up front
-/// takes a few milliseconds, once. The memory lives until exit.
-pub fn zeroed(bytes: usize) -> io::Result<*mut u8> {
-    // SAFETY: a fresh private anonymous mapping, owned by nobody else.
-    let ptr = unsafe { mmap(std::ptr::null_mut(), bytes.max(1), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0) };
-    if ptr as isize == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(ptr as *mut u8)
 }
