@@ -59,6 +59,11 @@ each, before pushing.
 | Not releasing them at all | +1.3 ms: the exit then unmaps 58,000 pages on one core |
 | `MADV_POPULATE_READ` on each thread's chunk before parsing | 36.4 → 49 ms |
 | Groups up to 16 / 64 sorted instead of 32 | 32 was the best of the three (server, one thread) |
+| LF found from a 128-byte window, so the next line does not wait for the endpoint | +29 instructions per line, same cycles (one thread), no gain at 12 threads |
+| Software prefetch 1, 4 or 16 KB ahead of the parse | no gain |
+| Log-linear histogram selection for groups of 256+, AVX2 rank counting for groups of up to 32 | 13M fewer cycles on one thread, nothing at 12 threads once the count and scatter loops were fixed; not worth 120 lines |
+| Largest hours first in pass 2 | noise |
+| Removing the endpoint-name copy before the pages are released (9e6ed95) | board 0.0342 and 0.0332 s vs 0.0292–0.0307 with it: restored in 27cf731 |
 | Three nested selections read at the end | wrong output: each selection reorders the previous rank's slot. Each value is now read right after its own selection |
 
 ## Correctness checks run before every push
