@@ -501,6 +501,13 @@ fn parse_run(
     // The header comes first, so a record start is at least 8 bytes in.
     let fast_end = end.min(text.len().saturating_sub(256));
     while i < end {
+        // A non-temporal prefetch ~16 records ahead: the stream then takes less of
+        // L2, so more of the 1 MB region table stays there.
+        // SAFETY: a prefetch never faults, and wrapping_add keeps the address defined.
+        unsafe {
+            use std::arch::x86_64::*;
+            _mm_prefetch::<_MM_HINT_NTA>(text.as_ptr().wrapping_add(i + 1024).cast());
+        }
         // SAFETY: the record starts at least 8 bytes in, and 256 before the end.
         let fast = if i < fast_end {
             unsafe { fast_record(text, i) }
