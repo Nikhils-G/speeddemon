@@ -26,6 +26,8 @@ much higher than the box's, so only the board decided what stayed.
 | 16 | 007cea6 | Fewer lines: a byte-by-byte spec 2.1 parser replaces the SIMD general scanner; regions.csv in one pass, groups numbered as first seen and sorted at output; worker 0 is the main thread and exits right after writing; std locks instead of `UnsafeCell` | run-20006a569215 | 0.0273 | 16.2 | 753 | 75.3 |
 | 17 | 48290f6 | One-pass digit loop for regions.csv; name and note bytes packed in one column; branchy min/max; fast-path bounds check out of the loop | run-bf1770e98008 | 0.0260 | 16.7 | 740 | 75.8 |
 | 18 | 2bf221c | Each thread owns 4 name partitions (threads × 4) in every round: no locks, tables stay in its cache | run-b9a64cd5e4d6 | 0.0258 | 15.5 | 733 | 76.2 |
+| 19 | 7a7c57a | Non-temporal prefetch of the record stream 1 KB ahead, so the scan takes less of L2 and more of the 1 MB region table stays there (a box-only effect: no change on the AMD test server) | run-9389bfd9b77d | 0.0253 | 15.1 | 737 | 76.5 |
+| 20 | eba58c8 | Same engine in fewer lines: no NamesFull retry (tables sized from the generator's 100,000-name pool, 8 standard deviations of room), errors as strings, `aggregate` folded into `run`, a one-counter barrier, regions chunks cut by `run_start`, `parse_run` kept out of line | | | | 590 | |
 
 ## What each step taught
 
@@ -89,6 +91,31 @@ much higher than the box's, so only the board decided what stayed.
     load. It is cache footprint, not latency: with the id masked to a smaller table (wrong output,
     timing only) 16 KB saves 2.3 ms, 256 KB 1.6 ms, 512 KB 0.7 ms. Prefetching does not help (below).
 
+- **Step 20** (round 3) kept the speed: server, PGO + static, 22.35 ms vs 22.24 for 7a7c57a, 959M vs
+  955M user instructions single-threaded. Two things nearly lost it:
+  - Folding `aggregate` into `run` put `parse_run`, inlined, inside a bigger worker closure. Its
+    registers were then allocated with the worker's: +32M instructions under PGO, 2–4% slower.
+    `#[inline(never)]` on `parse_run` brought the speed back.
+  - A `while at < run_start(...)` loop bound recomputed the chunk end for every regions.csv line:
+    +10M instructions.
+  - Most of the 143 lines were rustfmt's own expansions. The harness formats with defaults (a
+    struct literal over 18 columns, or a call or chain over 60, goes vertical), so code written to
+    fit them costs fewer lines without any trick.
+- **The "lean kernel" did not pay off in Rust source.** On top of step 20, I tried these together:
+  - the next record start from an LF bitmap of the tail;
+  - the BOM from `p[0] == 0xEF`;
+  - quote state from the bitmap bits;
+  - every validity test folded into one `&`/`|` expression;
+  - unchecked KEEP and partition indexing;
+  - 64-byte Totals rows.
+
+  User instructions went from 985M to 1011M, and the 12-thread time was +0.5 ms. LLVM split the one
+  test back into six branches, and the hot loop kept about 21 stack references (the offset, the
+  pointer, `name_end`, both halves of the hash's multiply, the totals and pairs pointers). Two
+  checks must stay anyway: `digits_ok` and the field-width test. Without them, a wrong guessed cut
+  on spec 2.1 input (the spec's own RULES fixture has an LF followed by a BOM inside quotes) is
+  parsed silently instead of failing over to the one-run parse.
+
 ## Experiments that did not make it (measured, reverted)
 
 | Experiment | Where measured | Result |
@@ -120,6 +147,11 @@ much higher than the box's, so only the board decided what stayed.
 | Threads started as a binary tree | server | no change: thread starts still serialize in the kernel, about 55 µs each |
 | 128 partitions (before step 18) | server | 23.8 vs 23.6 ms |
 | ROUNDS 6 / 10 / 12 / 16 after step 18 (8 kept) | server | 22.6 / 22.5 / 22.7 / 23.2 ms vs 22.4; memory 17.5 / 14.8 / 14.4 / 13.8 MB vs 15.6 |
+| Lean kernel (see step 20) | server | 1011M vs 985M instructions, +0.5 ms |
+| A fast loop up to the last 256 bytes, then a slow loop for the tail | server | 982M vs 985M instructions; 22.60 vs 22.84 ms, within noise |
+| Unchecked partition index on top of that | server | 972M instructions; 22.73 ms, within noise |
+| cmov min/max instead of branches | server | +10M instructions, +0.4 ms |
+| First hash round always taken (no branch for 17–24-byte names) | server | branch misses 960k → 571k, but +30M instructions (+57M under PGO), +0.3 ms |
 
 ## Correctness checks run before every push
 
@@ -127,7 +159,7 @@ sha256 of the seed-1 output; byte comparison with the reference output for sampl
 holdout-like seed 99; the same output at 1, 2, 3, 5, 12 and 16 threads; 6 tiny and 6 sample seeds
 freshly generated and compared with the reference at 1, 3 and all threads; the `test_c_join.py`
 fixtures, as written and with their records repeated 300 times so the fast path sees them; forced
-wrong cuts, which must fall back to the quote-parity split and still give the same output; a tiny
-name table, which must overflow and retry; 60 mutated or truncated records.csv files and 21 mutated
+wrong cuts, which must fall back to one run and still give the same output; a tiny name table,
+which must exit non-zero; 60 mutated or truncated records.csv files and 21 mutated
 regions.csv files, which must exit as before, without a crash; `objdump | grep -c vpinsrb` = 0 on the
 server build.
