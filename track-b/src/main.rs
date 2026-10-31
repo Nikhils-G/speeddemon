@@ -84,8 +84,12 @@ fn main() {
         // unmapping all 62,000 at exit on one core.
         mmap::release(&docs[start..end]);
         let mut log = scan.answers.log;
-        // Sorted, the log holds each line's first ids in order.
+        // Back to line numbers; sorted, the log holds each line's first ids in
+        // order.
         log.truncate(scan.answers.logged);
+        for e in &mut log {
+            *e = (plan.line_of[(*e >> 32) as usize] as u64) << 32 | *e & u32::MAX as u64;
+        }
         log.sort_unstable();
         // The ids go on in the next slice. Every per-thread sum of ids is below
         // N^2 / 2, which must fit in SUM_BITS.
@@ -97,7 +101,7 @@ fn main() {
 
     // Format in parallel, one range of lines per thread.
     let (lines, parts) = (plan.lines, slices.len().max(1));
-    let chunks = par(parts, |p| format_lines(&results, part(lines, p, parts)));
+    let chunks = par(parts, |p| format_lines(&results, &plan.answer_of, part(lines, p, parts)));
     let path = format!("{out_dir}/results.txt");
     let mut file = std::fs::File::create(&path).expect(&path);
     for chunk in chunks {
@@ -121,9 +125,10 @@ fn part(len: usize, p: usize, parts: usize) -> std::ops::Range<usize> {
     len * p / parts..len * (p + 1) / parts
 }
 
-/// The output for `lines`: per line, the threads' counts and sums added up, and
-/// the first ten ids taken from the threads in slice order.
-fn format_lines(results: &[(Vec<u64>, Vec<u64>)], lines: std::ops::Range<usize>) -> Vec<u8> {
+/// The output for `lines`: per line, the threads' counts and sums added up (from
+/// the state of the line's answer), and the first ten ids taken from the threads
+/// in slice order.
+fn format_lines(results: &[(Vec<u64>, Vec<u64>)], answer_of: &[u32], lines: std::ops::Range<usize>) -> Vec<u8> {
     // Per line: the count, the sum, then the first ids.
     let (mut out, mut fields) = (Vec::with_capacity(lines.len() * 32), Vec::new());
     let first = |log: &Vec<u64>| log.partition_point(|&e| e >> 32 < lines.start as u64);
@@ -132,8 +137,9 @@ fn format_lines(results: &[(Vec<u64>, Vec<u64>)], lines: std::ops::Range<usize>)
         fields.clear();
         fields.extend([0, 0]);
         for ((state, log), cursor) in results.iter().zip(&mut cursors) {
-            fields[0] += state[line] >> SUM_BITS;
-            fields[1] += state[line] & ((1 << SUM_BITS) - 1);
+            let s = state[answer_of[line] as usize];
+            fields[0] += s >> SUM_BITS;
+            fields[1] += s & ((1 << SUM_BITS) - 1);
             while let Some(&entry) = log.get(*cursor).filter(|&&e| e >> 32 == line as u64) {
                 fields.push(entry & u32::MAX as u64);
                 *cursor += 1;
@@ -437,6 +443,9 @@ struct Plan {
     nb: usize,
     /// The number of lines, which is also the number of answers.
     lines: usize,
+    /// Each line's answer, the index of its state in each thread, and back.
+    answer_of: Vec<u32>,
+    line_of: Vec<u32>,
 }
 
 impl Plan {
@@ -491,7 +500,7 @@ impl Plan {
             for line in part(lines, p, parts) {
                 let (start, len, phrase) = q.lines[line];
                 let words = &terms[start as usize..(start + len) as usize];
-                let answer = line as u32; // the index of the line's answer in each thread's state
+                let answer = line as u32; // renumbered below
                 if phrase {
                     // The first of the rarest terms.
                     let rarest = |&k: &usize| sample_df[order[words[k] as usize] as usize];
@@ -534,8 +543,24 @@ impl Plan {
         }
         // By length and operators, so that `end_super` predicts its branches.
         always.sort_unstable_by_key(|e| (e.earlier, e.terms.map(|word| word >> 30)));
-        let (group, entries) = csr(by_trigger, nb + 1);
-        let (anchor, anchored) = csr(by_anchor, order.len());
+        let (group, mut entries) = csr(by_trigger, nb + 1);
+        let (anchor, mut anchored) = csr(by_anchor, order.len());
+        // Answers numbered in the order the scan visits them: the `always` ones
+        // first, so that each superblock reads and writes their state as one
+        // stream (47 KB instead of 4,000 scattered lines), then those of the
+        // entries in their order, then the phrases.
+        let (mut answer_of, mut line_of) = (vec![u32::MAX; lines], Vec::with_capacity(lines));
+        let mut number = |line: &mut u32| {
+            if answer_of[*line as usize] == u32::MAX {
+                answer_of[*line as usize] = line_of.len() as u32;
+                line_of.push(*line);
+            }
+            *line = answer_of[*line as usize];
+        };
+        always.iter_mut().for_each(|e| number(&mut e.answer));
+        entries.iter_mut().for_each(|e| number(&mut e.answer));
+        anchored.iter_mut().for_each(|a| number(&mut a.answer));
+        (0..lines as u32).for_each(|mut line| number(&mut line)); // none should be left
         let flag = |id: usize| (anchor[id] != anchor[id + 1]) as u32 * ANCHOR;
         let info = rank.iter().map(|&id| id | flag(id as usize)).collect();
         Plan {
@@ -549,6 +574,8 @@ impl Plan {
             info,
             nb,
             lines,
+            answer_of,
+            line_of,
         }
     }
 }
