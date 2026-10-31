@@ -111,10 +111,9 @@ fn main() {
     // The output is mapped shared at a size no output can exceed, and cut to its
     // length at the end. On tmpfs, where /out is, one write call per hour would
     // serialise on the file's lock; page faults on the mapping do not. A line is
-    // the 21-byte hour label and its space, the name, six numbers of at most 10
-    // digits after a space each, and LF: 21 + 1 + 6 * 11 + 1 = 89 bytes and the name.
-    let longest = 89 + endpoints.iter().map(|e| e.1.len()).max().unwrap();
-    let bound = hours.len() * endpoints.len() * longest;
+    // the 21-byte hour label and its space, the name (at most 125 bytes, checked by
+    // the parse), six numbers of at most 10 digits after a space each, and LF.
+    let bound = hours.len() * endpoints.len() * (21 + 1 + 125 + 6 * 11 + 1);
     output.set_len(bound as u64).expect("size the summary");
     // Kept as an address: a raw pointer could not be shared by the threads below,
     // which each write only their own hours' bytes.
@@ -127,7 +126,7 @@ fn main() {
         pending.retain(|&(hour, len, ref groups)| {
             let Some(at) = offset(hour) else { return true };
             // SAFETY: bytes at..at + len of the mapping are this hour's alone, and
-            // at + len <= bound: every line is at most `longest` bytes.
+            // at + len <= bound: every line is at most 214 bytes.
             let out = unsafe { std::slice::from_raw_parts_mut((file + at) as _, len) };
             let head = (hours[hour][0].0.0 << 24).to_be_bytes(); // its first 13 bytes
             let mut written = 0;
@@ -295,17 +294,19 @@ type Part = (Vec<u32>, Vec<u32>, Vec<(u128, usize, usize)>);
 /// "ts SP method SP endpoint SP status SP latency LF" (27-byte ts).
 fn parse(chunk: &[u8], table: &Interner) -> Part {
     // Sized for the worst case, so the loop writes without capacity checks; only
-    // the pages actually written are ever backed by memory. The shortest line is 40
-    // bytes: timestamp, "GET", "/", status, one digit, four spaces and LF.
-    let most = chunk.len() / 40 + 1;
+    // the pages actually written are ever backed by memory. The loop below moves on
+    // at least 35 bytes per line whatever the bytes are (the endpoint ends at byte 29
+    // or later, then 5 + 0 + 1), so no input makes more than `most` lines.
+    let most = chunk.len() / 35 + 1;
     let [mut records, mut escapes] = [(); 2].map(|_| Vec::<u32>::with_capacity(most));
     let mut runs = Vec::new();
-    // SAFETY: every load stays within the line (at most 177 bytes) and the PAD zero
-    // bytes after the log: the space windows end at most 188 bytes in, the endpoint
-    // starts at most 37 bytes in and its key loads read 64 bytes from there, and the
-    // latency load reads 16 bytes from the status's end, which hold the LF (at most
-    // 10 digits). Records and escapes are written below their capacity: there are at
-    // most `most` lines, and each line writes one record and one escape slot.
+    // SAFETY: whatever the bytes, every load starts at a line start below the log's
+    // end and stays within 256 (PAD) bytes of it: the space windows end at most 188
+    // bytes in, the endpoint starts at most 93 bytes in, its key loads read 64 bytes
+    // and its name 0 to 125 (62 at most unless asserted) from there, and the
+    // latency load reads 16 bytes from at most 193 in. Records and escapes are
+    // written below their capacity: there are at most `most` lines, each writing one
+    // record and one escape slot.
     unsafe {
         let space = _mm256_set1_epi8(b' ' as i8);
         let (mut record, mut escape) = (records.as_mut_ptr(), escapes.as_mut_ptr());
@@ -336,12 +337,16 @@ fn parse(chunk: &[u8], table: &Interner) -> Part {
             let mut to = 28 + rest.trailing_zeros() as usize;
             if rest == 0 {
                 // No second space in bytes 28..92, so the endpoint's space is further
-                // on (7.6% of lines): search on, 32 bytes at a time.
-                let mut at = 64; // an endpoint of about 60 bytes or more: on by 32
-                while spaces(at) == 0 {
+                // on (7.6% of lines): search on, 32 bytes at a time, at most to the
+                // window at 128, which holds the space after a 125-byte endpoint.
+                let mut at = 64;
+                while at < 128 && spaces(at) == 0 {
                     at += 32;
                 }
                 to = 28 + at + spaces(at).trailing_zeros() as usize;
+                // Tripwire for the spec's method and endpoint lengths, the only way to
+                // a negative or over-125-byte name: a file that breaks them stops here.
+                assert!(mask != 0 && to - from <= 125);
             }
             // The key: the endpoint's first 64 bytes, zero from the space on.
             let keep = KEEP.as_ptr().cast::<u8>().add(64 - (to - from).min(64));
