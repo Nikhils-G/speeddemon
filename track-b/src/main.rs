@@ -55,10 +55,7 @@ const HOT_BITS: u32 = 13;
 /// A thread's sum of matching ids is packed under its count in one u64.
 const SUM_BITS: u32 = 40;
 
-static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-
 fn main() {
-    START.get_or_init(std::time::Instant::now);
     let mut args = std::env::args().skip(1);
     let data_dir = args.next().unwrap_or_else(|| "/data".into());
     let out_dir = args.next().unwrap_or_else(|| "/out".into());
@@ -104,16 +101,15 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
     let plan = Plan::new(queries, &df, sampled, nb);
     vocab.finish(&plan, &df);
 
-    // TEMPORARY box probe (full-size input only): exit code = elapsed 0.25 ms units.
-    if text.len() > 100_000_000 {
-        std::process::exit((START.get().unwrap().elapsed().as_micros() / 250).min(255) as i32);
-    }
     let results: Vec<(Vec<u64>, Vec<u64>, u32)> = thread::scope(|s| {
         let handles: Vec<_> = (slices.iter())
             .map(|&(start, end, first)| {
                 let (vocab, plan) = (&vocab, &plan);
                 s.spawn(move || {
                     let scan = Scan::new(docs, vocab, Some(plan), &[], nb, lines).run(start, end, first)?;
+                    // Drop the slice's pages now, in parallel, instead of the kernel
+                    // unmapping all 62,000 at exit on one core.
+                    mmap::release(&docs[start..end]);
                     let Answers { state, mut log, logged } = scan.answers;
                     // Sorted, the log holds each line's first ids in order.
                     log.truncate(logged);
@@ -138,7 +134,9 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
     });
     let path = format!("{out_dir}/results.txt");
     let mut file = File::create(&path).map_err(|e| format!("create {path}: {e}"))?;
-    chunks.iter().try_for_each(|chunk| file.write_all(chunk)).map_err(|e| format!("write {path}: {e}"))
+    chunks.iter().try_for_each(|chunk| file.write_all(chunk)).map_err(|e| format!("write {path}: {e}"))?;
+    // Done: exit without freeing the tables and logs, one free at a time.
+    std::process::exit(0)
 }
 
 /// The output for `lines`: per line, the threads' counts and sums added up, and
