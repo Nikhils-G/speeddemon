@@ -345,7 +345,7 @@ fn parse_chunk(chunk: &'static [u8], table: &Interner) -> Part {
     let (mut records, mut escapes) = (Vec::with_capacity(most), Vec::with_capacity(most));
     let mut runs = Vec::new();
     // SAFETY: every load stays within the line (at most 177 bytes) and the mmap::PAD
-    // zero bytes after the log: the space window ends 92 bytes in, the endpoint
+    // zero bytes after the log: the space windows end at most 188 bytes in, the endpoint
     // starts at most 37 bytes in and its key loads read 64 bytes from there, and the
     // latency load reads 16 bytes from the status's end. Records and escapes are
     // written below their capacity: there are at most `most` lines.
@@ -379,11 +379,11 @@ fn parse_chunk(chunk: &'static [u8], table: &Interner) -> Part {
             let to = if rest != 0 {
                 28 + rest.trailing_zeros() as usize
             } else {
-                let mut e = 92; // an endpoint of about 60 bytes or more
-                while *line.add(e) != b' ' {
-                    e += 1;
+                let mut at = 64; // an endpoint of about 60 bytes or more: on by 32
+                while spaces(at) == 0 {
+                    at += 32;
                 }
-                e
+                28 + at + spaces(at).trailing_zeros() as usize
             };
             // The key: the endpoint's first 64 bytes, zero from the space on.
             let len = to - from;
