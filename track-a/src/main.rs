@@ -35,8 +35,9 @@ use std::fs::File;
 use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering::*};
 use std::thread;
 
-/// A record is `endpoint id << 21 | error << 20 | latency`. A latency of ESCAPE or
-/// more is stored as ESCAPE, its value appended to the part's `escapes`.
+/// A record is `endpoint id << 21 | error << 20 | latency`: 11 bits of endpoint id,
+/// bit 20 set for a 5xx status, and 20 bits of latency. A latency of ESCAPE or more
+/// is stored as ESCAPE, its value appended to the part's `escapes` (1.2% of lines).
 const ENDPOINT_SHIFT: u32 = 21;
 const ESCAPE: u32 = (1 << 20) - 1;
 /// Endpoint ids must fit the record's 11 bits: the spec has 1,842 endpoints.
@@ -75,16 +76,19 @@ fn main() {
     // The endpoint ids in byte order of their names.
     let endpoints = table.count.load(Relaxed);
     let names: Vec<&[u8]> = (0..endpoints).map(|id| table.name(id)).collect();
-    // First by the first 16 bytes as one number (zero-padded: a prefix sorts first),
-    // so few comparisons need the bytes themselves.
-    let prefixes: Vec<u128> = names.iter().map(|name| number(name)).collect();
+    // First by the first 16 bytes as one number, so few comparisons need the bytes
+    // themselves. The order is still exact byte order: the number compares like the
+    // zero-padded bytes, no endpoint byte is zero (so a proper prefix sorts first, as
+    // the spec requires), and names equal in 16 bytes fall through to the full slices.
+    let prefixes: Vec<u128> = names.iter().map(|name| sort_key(name)).collect();
     let mut order: Vec<usize> = (0..endpoints).collect();
     order.sort_unstable_by_key(|&id| (prefixes[id], names[id]));
 
     // The hours in order, and each hour's runs from every part.
     let all_runs = parts.iter().flat_map(|p| &p.runs);
     let mut hours: Vec<Head> = all_runs.map(|r| r.head).collect();
-    hours.sort_unstable_by_key(|head| number(head));
+    // A head is 13 bytes, so its key holds all of it: equal keys are equal hours.
+    hours.sort_unstable_by_key(|head| sort_key(head));
     hours.dedup();
     // Also how many hours still read each part's records: the hour that brings
     // its part's count to zero gives the rest of the records back. Runs of one
@@ -95,7 +99,7 @@ fn main() {
         for (k, run) in part.runs.iter().enumerate() {
             let next = part.runs.get(k + 1);
             let end = next.map_or(part.records.len(), |r| r.start as usize);
-            let hour = hours.binary_search_by_key(&number(&run.head), |h| number(h));
+            let hour = hours.binary_search_by_key(&sort_key(&run.head), |h| sort_key(h));
             let runs = &mut runs_of[hour.unwrap()];
             if runs.last().is_none_or(|r| r.0 != p) {
                 readers[p].fetch_add(1, Relaxed);
@@ -107,12 +111,16 @@ fn main() {
     // The output is mapped shared at a size no output can exceed (each group's
     // line is at most `longest` bytes) and cut to its length at the end. On tmpfs,
     // where /out is, one write call per hour would serialise on the file's lock;
-    // page faults on the mapping do not.
+    // page faults on the mapping do not. A line is the 21-byte hour label and its
+    // space, the name, six numbers of at most 10 digits after a space each, and LF;
+    // there are at most as many groups as lines, and at most hours x endpoints.
     let longest = 21 + names.iter().map(|n| n.len()).max().unwrap() + 6 * 11 + 1;
     let lines: usize = parts.iter().map(|p| p.records.len()).sum();
     let bound = (hours.len() * endpoints).min(lines) * longest;
     output.set_len(bound as u64).expect("size the summary");
-    let file = mmap::map_mut(&output, bound) as usize; // each hour its own bytes
+    // Kept as an address: a raw pointer could not be shared by the threads below,
+    // which each write only their own hours' bytes.
+    let file = mmap::map_mut(&output, bound) as usize;
     // ends[h] is where hour h's output starts once known: it is filled in from
     // the hours' lengths, in order, up to `known`.
     let unknown = |_| AtomicUsize::new(UNKNOWN);
@@ -126,6 +134,9 @@ fn main() {
     // statistics and the hour's length, then writes each of its hours once the
     // previous one's end is known, taking further hours meanwhile.
     // Writes the pending hours whose start is known; with `wait`, all of them.
+    // Any thread extends the chain of starts from `known` as far as the lengths
+    // allow. Two threads may do so at once: they compute and store the same values,
+    // and `fetch_max` keeps `known` from moving back.
     let flush = |pending: &mut Vec<(usize, Vec<Stats>)>, wait: bool| {
         while !pending.is_empty() {
             let mut h = known.load(Acquire);
@@ -181,6 +192,7 @@ fn main() {
                             counts[id] += 1 | ((record >> 20 & 1) as u64) << 32;
                         }
                     }
+                    // The low half of a count word is the record count (`as u32`).
                     let mut sum = 0;
                     for k in 0..endpoints {
                         start[k + 1] = sum;
@@ -210,7 +222,9 @@ fn main() {
                     // The records are no longer needed once placed.
                     for (k, &(p, run, end)) in runs.iter().enumerate() {
                         // Long runs (shard 0's hourly uploads: 142 runs, 93% of the
-                        // records) at once, the rest with their part.
+                        // records) at once, the rest with their part: a run under 4096
+                        // records (16 KB) frees at most three whole pages, too few for
+                        // a madvise call and its TLB shootdown each.
                         if end - run.start as usize >= 4096 {
                             mmap::release(&parts[p].records[run.start as usize..end]);
                         }
@@ -247,8 +261,9 @@ fn main() {
 /// The first 13 bytes of a timestamp, "YYYY-MM-DDTHH": one UTC hour.
 type Head = [u8; 13];
 
-/// Up to the first 16 bytes, zero-padded, as a number that sorts like them.
-fn number(bytes: &[u8]) -> u128 {
+/// Up to the first 16 bytes, zero-padded, as a number that sorts like them: big
+/// endian, so the first byte is the most significant.
+fn sort_key(bytes: &[u8]) -> u128 {
     let mut padded = [0; 16];
     let n = bytes.len().min(16);
     padded[..n].copy_from_slice(&bytes[..n]);
@@ -352,8 +367,9 @@ fn parse_chunk(chunk: &'static [u8], table: &Interner) -> Part {
     // SAFETY: every load stays within the line (at most 177 bytes) and the mmap::PAD
     // zero bytes after the log: the space windows end at most 188 bytes in, the endpoint
     // starts at most 37 bytes in and its key loads read 64 bytes from there, and the
-    // latency load reads 16 bytes from the status's end. Records and escapes are
-    // written below their capacity: there are at most `most` lines.
+    // latency load reads 16 bytes from the status's end, which hold the LF (at most
+    // 10 digits). Records and escapes are written below their capacity: there are at
+    // most `most` lines, and each line writes one record and one escape slot.
     unsafe {
         let space = _mm256_set1_epi8(b' ' as i8);
         let (first_record, first_escape): (*mut u32, *mut u32) =
@@ -365,6 +381,7 @@ fn parse_chunk(chunk: &'static [u8], table: &Interner) -> Part {
         // one 72-hour span (the spec), so lines that share them share the year.
         let mut last = u64::MAX;
         while line < stop {
+            // Bytes 5..13 of the timestamp, "MM-DDTHH", as one word.
             let hour = line.add(5).cast::<u64>().read_unaligned();
             if hour != last {
                 last = hour;
@@ -375,15 +392,20 @@ fn parse_chunk(chunk: &'static [u8], table: &Interner) -> Part {
                 });
             }
             // One 64-byte window after the timestamp: its first two spaces end the
-            // method and the endpoint (no branch on the method or the length).
+            // method and the endpoint (no branch on the method or the length). Byte 27
+            // is the space after the timestamp, so the window starts at the method,
+            // byte 28; the endpoint starts one byte after the method's space.
             let load = |at: usize| _mm256_loadu_si256(line.add(at).cast());
             let spaces = |at: usize| movemask(_mm256_cmpeq_epi8(load(28 + at), space)) as u64;
             let mask = spaces(0) | spaces(32) << 32;
             let from = 29 + mask.trailing_zeros() as usize;
+            // The mask without its lowest bit: its lowest bit is now the second space.
             let rest = mask & (mask - 1);
             let to = if rest != 0 {
                 28 + rest.trailing_zeros() as usize
             } else {
+                // No second space in bytes 28..92, so the endpoint's space is further
+                // on (7.6% of lines): search on, 32 bytes at a time.
                 let mut at = 64; // an endpoint of about 60 bytes or more: on by 32
                 while spaces(at) == 0 {
                     at += 32;
@@ -398,13 +420,17 @@ fn parse_chunk(chunk: &'static [u8], table: &Interner) -> Part {
             };
             let key = [half(0), half(32)];
             let endpoint = table.id(&key, std::slice::from_raw_parts(line.add(from), len));
-            // The latency: up to 10 digits from 5 bytes after the endpoint, to the LF.
+            // The latency: up to 10 digits from 5 bytes after the endpoint (its space,
+            // the three status digits and a space), to the LF.
             let digits = _mm_loadu_si128(line.add(to + 5).cast());
             let count = _mm_movemask_epi8(_mm_cmpeq_epi8(digits, _mm_set1_epi8(b'\n' as i8)))
                 .trailing_zeros() as usize;
             let latency = parse_digits(digits, count);
+            // The escape slot is written for every line and kept (the cursor moves
+            // on) only for a latency that does not fit: no branch.
             *escape = latency as u32;
             escape = escape.add((latency >= ESCAPE as u64) as usize);
+            // The status's first digit is right after the endpoint's space; '5' is 5xx.
             let error = ((*line.add(to + 1) == b'5') as u32) << 20;
             *record = endpoint << ENDPOINT_SHIFT | error | latency.min(ESCAPE as u64) as u32;
             record = record.add(1);
@@ -494,7 +520,10 @@ impl Interner {
     }
 
     /// The key of id `id`.
-    /// SAFETY: `id` must be published, or parsing over.
+    ///
+    /// # Safety
+    /// `id` must be published by a slot, or parsing must be over: before that its
+    /// key may still be being written by the inserting thread.
     #[inline(always)]
     unsafe fn key(&self, id: usize) -> &Key {
         unsafe { &*self.keys.get_unchecked(id).get() }
@@ -532,6 +561,9 @@ impl Interner {
     #[cold]
     #[inline(never)]
     fn insert(&self, mut i: usize, key: &Key, name: &'static [u8]) -> u32 {
+        // A lost race (below) also uses up an id: 2,048 ids leave 206 spare over the
+        // spec's 1,842 endpoints, and running out stops the program rather than
+        // writing a wrong record.
         let id = self.count.fetch_add(1, Relaxed);
         assert!(id < MAX_ENDPOINTS, "too many distinct endpoints");
         // A long name is also compared byte by byte later, after the input's pages
@@ -556,8 +588,10 @@ impl Interner {
     /// The bytes of endpoint `id`. One shorter than KEY_BYTES is read from its key,
     /// so the input's released pages do not fault back in to sort and print it.
     fn name(&self, id: usize) -> &[u8] {
-        // SAFETY: called once parsing is over; a Key is 64 plain bytes.
+        // SAFETY: called once parsing is over, so nothing writes the tables any more.
         let (key, name) = unsafe { (self.key(id), *self.names[id].get()) };
+        // SAFETY: a Key is two __m256i, 64 bytes with no padding, and any bytes are
+        // valid u8s; the result borrows the key, so it cannot outlive it.
         let bytes = unsafe { &*(key as *const Key).cast::<[u8; KEY_BYTES]>() };
         let long = name.len() >= KEY_BYTES;
         if long { name } else { &bytes[..name.len()] }
@@ -576,7 +610,7 @@ fn same(a: &Key, b: &Key) -> bool {
 }
 
 /// The key folded to 16 bytes, then two CRC steps: the slot to probe first.
-/// Collisions only cost a probe.
+/// Collisions only cost a probe. SLOTS is a power of two, so `%` is a mask.
 #[inline(always)]
 fn hash(key: &Key) -> usize {
     use std::arch::x86_64::*;
@@ -598,7 +632,9 @@ fn hash(key: &Key) -> usize {
 /// read at once: the next selection reorders that part, its own slot included.
 fn percentiles(values: &mut [u32]) -> [u32; 3] {
     let [r50, r95, r99] = [50, 95, 99].map(|p| (p * values.len()).div_ceil(100) - 1);
-    // Most groups are small: one insertion-sort pass beats three selections.
+    // Most groups are small: 91% have 32 values or fewer (28% of the records). There
+    // the standard library's small-input sort beats three selections; 32 was the
+    // best of 16, 32 and 64 (see PERF.md).
     if values.len() <= 32 {
         values.sort_unstable();
         return [r50, r95, r99].map(|r| values[r]);
@@ -609,7 +645,10 @@ fn percentiles(values: &mut [u32]) -> [u32; 3] {
     [p50, p95, p99]
 }
 
-/// Splits `data` into about `parts` slices, each ending just after a newline.
+/// Splits `data` into about `parts` slices, each ending just after a newline: cut
+/// p moves from byte len * p / parts to the end of the line holding it. Cuts that
+/// land on the same line give an empty slice, which is dropped (an input of only a
+/// few lines).
 fn split_at_lines(data: &[u8], parts: usize) -> Vec<&[u8]> {
     let cut = |p: usize| {
         let at = data.len() * p / parts;

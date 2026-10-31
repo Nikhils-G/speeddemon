@@ -23,8 +23,8 @@ unsafe extern "C" {
 
 /// Drops this process's pages for the whole pages inside `slice`, which is done
 /// with. At exit the kernel would otherwise unmap the 58,000 pages of the input one
-/// by one, on one core (about 9 ms); this does the same work in each parsing thread,
-/// in parallel. Reading the input again is still correct: the page faults back in
+/// by one, on one core (1.3 ms slower overall when measured, see PERF.md); this does
+/// the same work in each parsing thread, in parallel. Reading the input again is still correct: the page faults back in
 /// from the page cache. Anonymous memory (the records) is freed and would read as
 /// zeros, but it is never read again.
 pub fn release<T>(slice: &[T]) {
