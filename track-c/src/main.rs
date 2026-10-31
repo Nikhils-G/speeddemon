@@ -513,7 +513,7 @@ fn fast_record(text: &[u8], i: usize, fast_end: usize) -> Option<Record> {
     let region_len = bytes_eq(tail, b',').trailing_zeros() as usize;
     let dot = bytes_eq(tail, b'.').trailing_zeros() as usize;
     let id_len = id_end - if load(3) >> 40 == 0xBF_BBEF { 3 } else { 0 }; // a BOM: not data
-    let negative = at(note_end + 2 + region_len) == b'-';
+    let negative = bytes_eq(tail, b'-') >> (region_len + 1) & 1 != 0; // no byte load: its latency
     let (region_end, amount_end) = (note_end + 1 + region_len, note_end + 4 + dot);
     let whole = dot - region_len - 1 - negative as usize;
     let words = [load(id_end), load(region_end), load(amount_end)];
