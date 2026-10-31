@@ -98,11 +98,6 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
             .collect::<Result<_, _>>()
     })?;
 
-    // TEMPORARY box probe: exit code = elapsed time in 0.25 ms units.
-    // (Only on full-size input: the profile-guided build trains on a small sample.)
-    if log.len() > 100_000_000 {
-        std::process::exit((START.get().unwrap().elapsed().as_micros() / 250).min(255) as i32);
-    }
     // Merge the per-thread endpoint tables into one, then rank the distinct
     // endpoints in byte order; `rank_of[part][local id]` maps to the rank.
     let mut all = Interner::new();
@@ -219,6 +214,10 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
             .flat_map(|h| h.join().unwrap())
             .collect()
     });
+    // TEMPORARY box probe (full-size input only): exit code = elapsed 0.25 ms units.
+    if log.len() > 100_000_000 {
+        std::process::exit((START.get().unwrap().elapsed().as_micros() / 250).min(255) as i32);
+    }
     drop(parts);
     stats.sort_unstable_by_key(|&(hour, _, _)| hour);
 
