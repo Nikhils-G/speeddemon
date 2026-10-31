@@ -249,8 +249,9 @@ impl Table {
     /// The info of the key in bucket b, or MISS, without a branch: whether and
     /// where a key hits is random. `wide` is the key in both 128-bit lanes.
     #[inline(always)]
-    fn probe(&self, b: usize, wide: __m256i) -> u32 {
-        let slots = &self.buckets[b].0;
+    fn probe(&self, b: usize, wide: __m256i) -> (u32, u64) {
+        // SAFETY: callers pass b < buckets.len().
+        let slots = unsafe { &self.buckets.get_unchecked(b).0 };
         // SAFETY: two 32-byte loads that cover the 64-byte bucket; AVX2 is
         // enabled for the whole build.
         let half = |i| unsafe { _mm256_cmpeq_epi8(_mm256_loadu_si256((slots.as_ptr() as *const __m256i).add(i)), wide) };
@@ -259,7 +260,8 @@ impl Table {
         // Adding 1 to such a run of ones carries into bit 16j + 12.
         let hit = ((m & 0x0FFF_0FFF_0FFF_0FFF) + 0x0001_0001_0001_0001) & 0x1000_1000_1000_1000;
         let info = slots[hit.trailing_zeros() as usize / 16 & 3].info;
-        if hit != 0 { info } else { MISS }
+        // A miss with a full bucket also returns its last key, else 0.
+        (if_zero(hit, MISS as u64, info as u64) as u32, if_zero(hit, slots[3].lo, 0))
     }
 
     /// The info of the key whose `hash` is h, or MISS. A full bucket continues
@@ -269,12 +271,14 @@ impl Table {
         let wide = unsafe { _mm256_broadcastsi128_si256(key) };
         let mut b = (h >> self.shift) as usize;
         loop {
-            let info = self.probe(b, wide);
-            // Slots fill in order and are never removed: a free last slot ends the probe.
-            if info != MISS || self.buckets[b].0[3].lo == 0 {
-                return info;
+            // Slots fill in order and are never removed: a free last slot ends the
+            // probe. One branch, rarely taken: a miss in a full bucket.
+            let (info, full_miss) = self.probe(b, wide);
+            if full_miss != 0 {
+                b = (b + 1) & (self.buckets.len() - 1);
+                continue;
             }
-            b = (b + 1) & (self.buckets.len() - 1);
+            return info;
         }
     }
 
@@ -298,18 +302,20 @@ impl Table {
 /// digits; KEEP keeps only the token's bytes.
 #[inline(always)]
 fn key_at(bytes: &[u8], at: usize, len: usize) -> __m128i {
-    let (raw, keep) = (&bytes[at..at + 16], &KEEP[16 - len..32 - len]);
-    // SAFETY: 16-byte loads from two 16-byte slices; AVX2 is enabled for the
-    // whole build.
+    debug_assert!(at + 16 <= bytes.len() && len <= 16);
+    // SAFETY: 16-byte loads inside `bytes` (a token starts before the end of
+    // its file, which mmap::PAD zero bytes follow) and KEEP (len <= 16); AVX2
+    // is enabled for the whole build.
     unsafe {
-        let lower = _mm_or_si128(_mm_loadu_si128(raw.as_ptr() as *const __m128i), _mm_set1_epi8(0x20));
-        _mm_and_si128(lower, _mm_loadu_si128(keep.as_ptr() as *const __m128i))
+        let lower = _mm_or_si128(_mm_loadu_si128(bytes.as_ptr().add(at) as *const __m128i), _mm_set1_epi8(0x20));
+        _mm_and_si128(lower, _mm_loadu_si128(KEEP.as_ptr().add(16 - len) as *const __m128i))
     }
 }
 
-/// Multiplicative hashing: the top bits depend on every key byte.
+/// CRC32 of the key, in the top bits (the tables index by those).
 fn hash(lo: u64, hi: u32) -> u64 {
-    (lo.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ hi as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+    // SAFETY: SSE4.2 is enabled for the whole build (it comes with AVX2).
+    (unsafe { _mm_crc32_u64(hi as u64, lo) }) << 32
 }
 
 /// The first 8 and the next 4 bytes of a key.
@@ -578,7 +584,7 @@ impl<'a> Scan<'a> {
             df,
             nb,
             w: (0..nb + 2).map(|slot| if slot == nb + 1 { !0 } else { 0 }).collect(),
-            touched: vec![0; nb + 1],
+            touched: vec![0; nb + 2],
             n: 0,
             wide: (0..rows + 2).map(|row| Row([if row == rows + 1 { !0 } else { 0 }; 4])).collect(),
             pending: Vec::new(),
@@ -594,40 +600,67 @@ impl<'a> Scan<'a> {
     fn run(mut self, start: usize, end: usize, first: u32) -> Result<Self, String> {
         let docs = self.docs;
         self.doc = first.wrapping_sub(1);
-        let (mut bit, mut carry) = (0u64, 0u64);
+        // `line`: bit 0 is set when the next chunk starts a line, as the slice does.
+        let (mut bit, mut carry, mut line) = (0u64, 0u64, 1u64);
         let mut mask = token_mask(docs, start, end);
         for at in (start..end).step_by(64) {
             let next = token_mask(docs, at + 64, end);
             let mut starts = mask & !(mask << 1 | carry);
             carry = mask >> 63;
+            // The id tokens: those that start a line.
+            let lf = byte_mask(docs, at, b'\n');
+            let mut ids = starts & (lf << 1 | line);
+            line = lf >> 63;
             // A token is at most 32 bytes (longer ones match no term), so it
-            // ends within this chunk and the next.
-            let window = mask as u128 | (next as u128) << 64;
-            while starts != 0 {
+            // ends within this chunk and the next. `shifted(b)` is the window
+            // from bit b on: `next << (64 - b)` in two steps, valid for b = 0.
+            let (next1, mask0) = (next << 1, mask);
+            let shifted = |b: u32| mask0 >> b | next1 << (63 - b);
+            // A chunk has at most 32 tokens.
+            self.pending.reserve(32);
+            loop {
+                // The tokens before the next id token, if any.
+                let mut text = starts & (ids & ids.wrapping_neg()).wrapping_sub(1);
+                starts ^= text;
+                let (buf, mut n) = (self.pending.as_mut_ptr(), self.pending.len());
+                let (buckets, shift) = (self.vocab.table.buckets.as_ptr(), self.vocab.table.shift);
+                while text != 0 {
+                    let b = text.trailing_zeros();
+                    text &= text - 1;
+                    // Only 64 bits: a token that runs past them is too long to be
+                    // a term anyway.
+                    let len = (!shifted(b)).trailing_zeros() as usize;
+                    let p = at + b as usize;
+                    let token = if len <= KEY {
+                        let key = key_at(docs, p, len);
+                        let (lo, hi) = parts(key);
+                        let h = hash(lo, hi);
+                        // SAFETY: a prefetch of a bucket of the table.
+                        unsafe { _mm_prefetch::<_MM_HINT_T0>(buckets.add((h >> shift) as usize) as *const i8) };
+                        (key, h)
+                    } else {
+                        // SAFETY: AVX2 is enabled for the whole build.
+                        (unsafe { _mm_setzero_si128() }, self.vocab.get_long(&docs[p..p + len]) as u64)
+                    };
+                    // SAFETY: `reserve(32)` above made room for this chunk's tokens.
+                    unsafe { buf.add(n).write(token) };
+                    n += 1;
+                }
+                // SAFETY: the first n entries were written.
+                unsafe { self.pending.set_len(n) };
+                if ids == 0 {
+                    break;
+                }
+                ids &= ids - 1;
                 let b = starts.trailing_zeros();
                 starts &= starts - 1;
-                // Only the low 64 bits: a token that runs past them is too long
-                // to be a term anyway.
-                let len = (!((window >> b) as u64)).trailing_zeros() as usize;
+                let len = (!shifted(b)).trailing_zeros() as usize;
                 let p = at + b as usize;
-                // The raw byte: `)` | 0x20 would look like a TAB.
-                let token = if docs[p + len] == b'\t' {
-                    self.look_up(bit);
-                    bit = self.next_doc(&docs[p..p + len])?;
-                    continue;
-                } else if len <= KEY {
-                    let key = key_at(docs, p, len);
-                    let (lo, hi) = parts(key);
-                    let h = hash(lo, hi);
-                    let table = &self.vocab.table;
-                    // SAFETY: a prefetch of a bucket of the table.
-                    unsafe { _mm_prefetch::<_MM_HINT_T0>(table.buckets.as_ptr().add((h >> table.shift) as usize) as *const i8) };
-                    (key, h)
-                } else {
-                    // SAFETY: AVX2 is enabled for the whole build.
-                    (unsafe { _mm_setzero_si128() }, self.vocab.get_long(&docs[p..p + len]) as u64)
-                };
-                self.pending.push(token);
+                if docs[p + len] != b'\t' {
+                    return Err("docs.txt: a line without an id and a TAB".into());
+                }
+                self.look_up(bit);
+                bit = self.next_doc(&docs[p..p + len])?;
             }
             mask = next;
         }
@@ -643,27 +676,40 @@ impl<'a> Scan<'a> {
     /// of one step overlap: the buckets were fetched when the tokens were
     /// found, and the words are fetched while the tokens are probed.
     fn look_up(&mut self, bit: u64) {
+        let (nb, table) = (self.nb, &self.vocab.table);
+        self.toks.reserve(self.pending.len());
+        let (toks, mut len) = (self.toks.as_mut_ptr(), self.toks.len());
         for &(key, h) in &self.pending {
             // SAFETY: SSE4.1 is enabled for the whole build (it comes with AVX2).
-            let info = if unsafe { _mm_testz_si128(key, key) } == 1 { h as u32 } else { self.vocab.table.get(key, h) };
+            let info = if unsafe { _mm_testz_si128(key, key) } == 1 { h as u32 } else { table.get(key, h) };
             let id = info & MISS;
             // SAFETY: a prefetch of a word of `w`.
-            unsafe { _mm_prefetch::<_MM_HINT_T0>(self.w.as_ptr().add((id as usize).min(self.nb)) as *const i8) };
+            unsafe { _mm_prefetch::<_MM_HINT_T0>(self.w.as_ptr().add((id as usize).min(nb)) as *const i8) };
             if info & ANCHOR != 0 {
-                self.anchors.push(self.toks.len() as u32);
+                self.anchors.push(len as u32);
             }
-            self.toks.push(id);
+            // SAFETY: room for every pending token was reserved above.
+            unsafe { toks.add(len).write(id) };
+            len += 1;
         }
+        // SAFETY: the first len entries are written.
+        unsafe { self.toks.set_len(len) };
         self.pending.clear();
+        let (w, touched, mut n) = (self.w.as_mut_ptr(), self.touched.as_mut_ptr(), self.n);
         for &id in &self.toks {
             // Branch-free: a slot seen for the first time in this block is
             // kept in `touched`.
-            let slot = (id as usize).min(self.nb);
-            let x = self.w[slot];
-            self.touched[self.n] = slot as u32;
-            self.n += (x == 0) as usize;
-            self.w[slot] = x | bit;
+            let slot = (id as usize).min(nb);
+            // SAFETY: slot <= nb < w.len(), and n <= nb + 1 < touched.len(): n
+            // counts distinct slots, at most nb + 1.
+            unsafe {
+                let x = *w.add(slot);
+                *touched.add(n) = slot as u32;
+                n += (x == 0) as usize;
+                *w.add(slot) = x | bit;
+            }
         }
+        self.n = n;
     }
 
     /// Ends the current document at the id token of the next one; returns its bit.
@@ -853,6 +899,13 @@ fn count_positions(v: __m256i) -> (u64, u64) {
     }
 }
 
+/// Bit i is set when byte `at + i` is `byte`.
+fn byte_mask(docs: &[u8], at: usize, byte: u8) -> u64 {
+    // SAFETY: unaligned 32-byte loads from 32-byte slices; AVX2 is enabled for the whole build.
+    let half = |at: usize| movemask(unsafe { _mm256_cmpeq_epi8(_mm256_loadu_si256(docs[at..at + 32].as_ptr() as *const __m256i), _mm256_set1_epi8(byte as i8)) });
+    half(at) as u64 | (half(at + 32) as u64) << 32
+}
+
 /// Bit i is set when byte `at + i` is a token byte ([A-Za-z0-9]) before `end`.
 fn token_mask(docs: &[u8], at: usize, end: usize) -> u64 {
     let half = |at: usize| {
@@ -875,6 +928,15 @@ fn token_mask(docs: &[u8], at: usize, end: usize) -> u64 {
         64.. => mask,
         left => mask & ((1 << left) - 1),
     }
+}
+
+/// `if c == 0 { a } else { b }` as a cmov: LLVM turns such selects of loaded
+/// values into branches, which mispredict when c is random.
+fn if_zero(c: u64, a: u64, b: u64) -> u64 {
+    let mut r = b;
+    // SAFETY: register-only instructions.
+    unsafe { std::arch::asm!("test {c}, {c}", "cmovz {r}, {a}", c = in(reg) c, a = in(reg) a, r = inout(reg) r, options(pure, nomem, nostack)) };
+    r
 }
 
 /// `vpmovmskb` hidden from LLVM: on CPUs without AVX-512 it rewrites the
