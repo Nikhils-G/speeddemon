@@ -30,7 +30,7 @@ use std::cell::UnsafeCell;
 use std::fs::File;
 use std::io::Write;
 use std::sync::Barrier;
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering::Relaxed};
 use std::thread;
 
 const RECORDS_HEADER: &[u8] = b"id,name,note,region_id,amount";
@@ -64,9 +64,9 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
         let file = File::open(&path).map_err(|e| format!("open {path}: {e}"))?;
         mmap::map(&file).map_err(|e| format!("mmap {path}: {e}"))
     };
-    let regions = Regions::parse(open("regions.csv")?)?;
-    let records = open("records.csv")?;
     let threads = thread::available_parallelism().map_or(1, |n| n.get());
+    let regions = Regions::parse(open("regions.csv")?, threads)?;
+    let records = open("records.csv")?;
 
     // The header is the first record; everything after it is data.
     let body_start = skip_header(records)?;
@@ -87,7 +87,8 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
     };
 
     let mut out = Vec::new();
-    for g in regions.order() {
+    // Group numbers are in output order: codes sorted, then `_UNMATCHED` ("_" > "Z").
+    for g in 0..regions.keys.len() {
         let mut total = Totals::default();
         for part in &parts {
             total.merge(&part[g]);
@@ -254,60 +255,96 @@ impl Partition {
 }
 
 /// The join table: region id -> group index. Groups are the country codes in
-/// first-seen order, then `_UNMATCHED` as the last one.
+/// sorted order, then `_UNMATCHED` as the last one.
 struct Regions {
     /// Dense by region id; NO_GROUP for ids the table does not contain.
-    group_of: Vec<u8>,
+    group_of: Vec<AtomicU8>,
     /// Group index -> output key.
     keys: Vec<Vec<u8>>,
 }
 
 const NO_GROUP: u8 = u8::MAX;
+/// Country codes are `[A-Z]{3}` (spec 2.3), so each has an index below 26^3.
+const CODES: usize = 26 * 26 * 26;
 
 impl Regions {
-    fn parse(text: &[u8]) -> Result<Self, String> {
+    /// Two parallel passes over the lines: one finds which countries occur, which
+    /// numbers the groups; the other fills `group_of`.
+    fn parse(text: &[u8], threads: usize) -> Result<Self, String> {
         let body = text.strip_prefix(REGIONS_HEADER).ok_or("unexpected regions.csv header")?;
-        let mut group_of_code = vec![NO_GROUP; 26 * 26 * 26];
-        let (mut keys, mut group_of) = (Vec::new(), Vec::new());
-        let mut i = 0;
-        while i < body.len() {
-            // `region_id "," [A-Z]{3} LF` (spec 2.3)
-            let comma = i + body[i..].iter().position(|&b| b == b',').ok_or("regions.csv: a line without a comma")?;
-            let id = parse_digits(&body[i..comma]).ok_or("regions.csv: bad region_id")? as usize;
-            let code = body.get(comma + 1..comma + 4).filter(|c| c.iter().all(u8::is_ascii_uppercase));
-            let code = code.filter(|_| body.get(comma + 4) == Some(&b'\n')).ok_or("regions.csv: bad country")?;
-            let group = &mut group_of_code[code.iter().fold(0, |acc, &b| acc * 26 + (b - b'A') as usize)];
-            if *group == NO_GROUP {
-                if keys.len() + 1 >= NO_GROUP as usize {
-                    return Err("regions.csv: too many countries".into());
-                }
-                *group = keys.len() as u8;
-                keys.push(code.to_vec());
+        let chunks = split_at_lines(body, threads);
+        let seen: Vec<AtomicBool> = (0..CODES).map(|_| AtomicBool::new(false)).collect();
+        let max_id = each_region(&chunks, &|_, code| {
+            if !seen[code].load(Relaxed) {
+                seen[code].store(true, Relaxed);
             }
-            if id >= group_of.len() {
-                group_of.resize(id + 1, NO_GROUP);
+        })?;
+        let mut group_of_code = vec![NO_GROUP; CODES];
+        let mut keys = Vec::new();
+        for code in (0..CODES).filter(|&c| seen[c].load(Relaxed)) {
+            if keys.len() + 1 >= NO_GROUP as usize {
+                return Err("regions.csv: too many countries".into());
             }
-            group_of[id] = *group;
-            i = comma + 5;
+            group_of_code[code] = keys.len() as u8;
+            keys.push([code / 676, code / 26 % 26, code % 26].map(|letter| b'A' + letter as u8).to_vec());
         }
+        let group_of: Vec<AtomicU8> = (0..max_id.map_or(0, |id| id + 1)).map(|_| AtomicU8::new(NO_GROUP)).collect();
+        each_region(&chunks, &|id, code| group_of[id].store(group_of_code[code], Relaxed))?;
         keys.push(UNMATCHED.to_vec());
         Ok(Regions { group_of, keys })
     }
 
     fn group(&self, region_id: u64) -> usize {
-        match self.group_of.get(region_id as usize) {
-            Some(&g) if g != NO_GROUP => g as usize,
+        match self.group_of.get(region_id as usize).map(|g| g.load(Relaxed)) {
+            Some(g) if g != NO_GROUP => g as usize,
             _ => self.keys.len() - 1,
         }
     }
-
-    /// Group indices in output order: bytewise by key.
-    fn order(&self) -> Vec<usize> {
-        let mut order: Vec<usize> = (0..self.keys.len()).collect();
-        order.sort_by(|&a, &b| self.keys[a].cmp(&self.keys[b]));
-        order
-    }
 }
+
+/// Calls `visit(region_id, country code index)` for every `region_id "," [A-Z]{3}
+/// LF` line, one thread per chunk; returns the largest region id, if any.
+fn each_region(chunks: &[&[u8]], visit: &(dyn Fn(usize, usize) + Sync)) -> Result<Option<usize>, String> {
+    thread::scope(|s| {
+        let handles: Vec<_> = chunks
+            .iter()
+            .map(|&chunk| {
+                s.spawn(move || -> Result<Option<usize>, String> {
+                    let (mut i, mut max) = (0, None);
+                    while i < chunk.len() {
+                        let comma = i + chunk[i..].iter().position(|&b| b == b',').ok_or("regions.csv: a line without a comma")?;
+                        let id = parse_digits(&chunk[i..comma]).ok_or("regions.csv: bad region_id")? as usize;
+                        let code = chunk.get(comma + 1..comma + 4).filter(|c| c.iter().all(u8::is_ascii_uppercase));
+                        let code = code.filter(|_| chunk.get(comma + 4) == Some(&b'\n')).ok_or("regions.csv: bad country")?;
+                        visit(id, code.iter().fold(0, |acc, &b| acc * 26 + (b - b'A') as usize));
+                        max = max.max(Some(id));
+                        i = comma + 5;
+                    }
+                    Ok(max)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).try_fold(None, |acc, max| Ok(acc.max(max?)))
+    })
+}
+
+/// Splits `data` into about `parts` slices, each ending just after a newline.
+fn split_at_lines(data: &[u8], parts: usize) -> Vec<&[u8]> {
+    let mut chunks = Vec::with_capacity(parts);
+    let mut start = 0;
+    for p in 1..=parts {
+        let mut end = (data.len() * p / parts).max(start);
+        while end < data.len() && (end == 0 || data[end - 1] != b'\n') {
+            end += 1;
+        }
+        if end > start {
+            chunks.push(&data[start..end]);
+        }
+        start = end;
+    }
+    chunks
+}
+
 #[derive(Clone)]
 struct Totals {
     count: u64,
