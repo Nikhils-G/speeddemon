@@ -22,6 +22,7 @@ much higher than the box's, so only the board decided what stayed.
 | 12 | 470e7e3, cb90a23 | Fewer lines: a wrong guessed cut reruns the file as one run (no second splitter); `format!` output; the mapping parsed directly again (pread gave nothing on the box) | run-2b4b2c97a9c1 | 0.0461 | 15.7 | 722 | 69.9 |
 | 13 | 152db08 | The barrier's spin is bounded, then waiters sleep on a condition variable | | | | | |
 | 14 | 0030dfe | Exit as soon as the output is written; each run's pages dropped by the thread that parsed it | run-a476140e0850 | 0.0422 | 15.7 | 744 | 70.8 |
+| 15 | eb2cf64 | Per-record fast path (one 64-byte bitmap window, one 32-byte tail compare, one AVX2 number pass); batched dedupe; mallopt top pad; regions passes in the parse threads | run-db85f475f012 | 0.0268 | 16.0 | 914 | 75.0 |
 
 ## What each step taught
 
@@ -46,6 +47,27 @@ much higher than the box's, so only the board decided what stayed.
   code). On the box, regions and cuts take 2.25 ms, the parse rounds 36.75 ms (only about 4.5 of
   them deduplication), and about 6 ms went to the kernel unmapping the 202 MB input at exit.
 
+- **Step 15** (not yet on the board). Server, PGO builds as the Dockerfile makes them, 12 threads:
+  38.3 → 24.5 ms. Single thread on full-seed1: 1.78G → 0.98G instructions, 590M → 372M cycles,
+  about 506 → 282 instructions per record (45M of the total is fixed cost: regions, startup).
+  - The fast path takes the common record (`id,"name","note",region,amount` with quoted or empty
+    text) from the 64 bytes at its start (128 when the note runs long). Any other shape, or any
+    failed check, goes to the old scanner, now `#[cold]` and `#[inline(never)]`: inlined, it took
+    the hot loop's registers (-18 instructions per record).
+  - Id, region and amount are converted in one AVX2 pass. pshufb drops the dot, a byte table
+    masks each field's digits, and `maddubs`/`madd`/`packus`/`madd` do the conversion.
+  - Branches must not depend on CRLF vs LF, which is a coin toss. One `||` on it cost
+    +1.7M branch misses and +15 cycles per record.
+  - The name hash has no branch on the length for 16 bytes or fewer. It is not recursive any
+    more: the recursion had kept it from being inlined (+20 instructions).
+  - The dedupe takes a whole slice of pairs at a time, with the partition's fields as locals. Its
+    probe compares a bucket of 4 slots at once, which halved the branch misses (2.0M → 1.0M).
+  - Worker threads got their own malloc heaps, which grew by mprotect, 800 calls per run. Each one
+    stalls every other thread's page faults. `mallopt(M_TOP_PAD, 32 MB)` brought it to 68 calls:
+    -14 ms of system time and -2.8 ms wall on the server.
+  - Each thread finds its own cuts. regions.csv lines go through a SWAR fast path. Both
+    regions.csv passes run in the parse threads (one spawn of threads instead of three).
+
 ## Experiments that did not make it (measured, reverted)
 
 | Experiment | Where measured | Result |
@@ -62,6 +84,12 @@ much higher than the box's, so only the board decided what stayed.
 | Rounds 4 / 16 instead of 8 | server | 4: −1 ms but +4 MB; 16: +1.8 ms for −1.7 MB |
 | Runs claimed dynamically within a round | server | no change |
 | Dense name ids from one shared hash table, so pairs are u32 and dedupe needs no probing | server | 12 threads 45 → 67 ms: early inserts contend |
+| Fast path over a 128-byte window from the record start (u128 bitmaps) | server | 519 instructions per record; u128 shifts and counts, and spills. Replaced by 64 bytes plus the tail |
+| Region comma and dot found by SWAR in 8-byte words | server | about the same instructions as one 32-byte compare, more lines |
+| Fast path not inlined | server | 344 vs 317 instructions per record |
+| All tables and pair buffers in a few big zeroed allocations, fixed pair segments | server | 44 ms vs 26: twice the page faults (zero-page read, then write) and 171 ms of system time |
+| 128 or 256 partitions so that a table fits in L1 | server | no change single-threaded |
+| Hash computed before the record's checks | fuzz | crashed: a rejected record can have a negative name length. Hash only after the checks |
 
 ## Correctness checks run before every push
 

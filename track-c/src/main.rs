@@ -9,11 +9,15 @@
 //!    LF that is followed by a digit or a BOM. Every cut is then checked: the run
 //!    before it must end exactly there. If one does not (impossible for generator
 //!    data), the file is parsed again as one run, which needs only spec 2.1.
-//! 3. Each run is parsed 64 bytes at a time with SIMD bitmaps, as simdjson does for
-//!    JSON: one bitmap of `"`, one of `,` and LF, and a carry-less multiply that
-//!    turns the quote bits into an "inside quotes" mask. What is left are exactly
-//!    the field separators, and counting quote bits gives each text field's
-//!    unescaped length (each `""` is one byte) without looking at its bytes.
+//! 3. Records are found with SIMD bitmaps, as simdjson does for JSON: one bitmap of
+//!    `"`, one of `,`, and a carry-less multiply that turns the quote bits into an
+//!    "inside quotes" mask. What is left are exactly the field separators, and
+//!    counting quote bits gives each text field's unescaped length (each `""` is
+//!    one byte) without looking at its bytes. The common record takes one such
+//!    window of 64 bytes at its start, one 32-byte compare for the region's comma
+//!    and the amount's dot, and one AVX2 pass that converts its three numbers; every
+//!    check is a predictable branch to the general parser, which handles any other
+//!    record (and gives the error message).
 //! 4. Distinct names per country: a name's identity is its raw inner bytes (inside
 //!    quotes, `""` maps one to one to the unescaped value, and an unquoted value
 //!    cannot contain `"`), reduced to a 56-bit hash; with the spec's 100,000 names
@@ -48,6 +52,12 @@ const ROUNDS: usize = 8;
 /// Names are split by their top hash bits into this many partitions.
 const PARTITION_BITS: u32 = 6;
 const PARTITIONS: usize = 1 << PARTITION_BITS;
+/// Group indices are bytes: country codes from 0, `_UNMATCHED` the last one, so
+/// that tables indexed by a group need no bounds checks.
+const GROUPS: usize = 256;
+const UNMATCHED_GROUP: usize = GROUPS - 1;
+/// Words of group bits per name.
+const WORDS: usize = GROUPS / 64;
 /// Names per partition for the first attempt: the spec's 100,000 names are about
 /// 1,560 per partition.
 const FIRST_SLOTS: usize = 1 << 11;
@@ -71,15 +81,19 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
         mmap::map(&file).map_err(|e| format!("mmap {path}: {e}"))
     };
     let threads = thread::available_parallelism().map_or(1, |n| n.get());
-    let regions = Regions::parse(open("regions.csv")?, threads)?;
+    let regions = open("regions.csv")?;
+    let region_lines = regions
+        .strip_prefix(REGIONS_HEADER)
+        .ok_or("unexpected regions.csv header")?;
+    let region_chunks = split_at_lines(region_lines, threads);
     let records = open("records.csv")?;
 
     // The header is the first record; everything after it is data.
     let body_start = skip_header(records)?;
     let (mut guessed, mut slots) = (true, FIRST_SLOTS);
-    let parts = loop {
-        match aggregate(records, body_start, guessed, threads, &regions, slots) {
-            Ok(parts) => break parts,
+    let (parts, keys) = loop {
+        match aggregate(records, body_start, guessed, threads, &region_chunks, slots) {
+            Ok(done) => break done,
             Err(ParseError::NamesFull) => slots *= 2,
             // A wrong guessed cut shows up as a misaligned run or as a parse error.
             Err(ParseError::Misaligned | ParseError::Bad(_)) if guessed => {
@@ -95,10 +109,15 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
 
     let mut out = Vec::new();
     // Group numbers are in output order: codes sorted, then `_UNMATCHED` ("_" > "Z").
-    for g in 0..regions.keys.len() {
+    for g in 0..keys.len() {
+        let index = if g + 1 == keys.len() {
+            UNMATCHED_GROUP
+        } else {
+            g
+        };
         let mut total = Totals::default();
         for part in &parts {
-            total.merge(&part[g]);
+            total.merge(&part[index]);
         }
         if total.count == 0 {
             continue;
@@ -109,7 +128,7 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
             money(t.amount_min),
             money(t.amount_max),
         );
-        let key = String::from_utf8_lossy(&regions.keys[g]);
+        let key = String::from_utf8_lossy(&keys[g]);
         let (count, ids, names) = (t.count, t.id_sum, t.names_distinct);
         let line = format!(
             "{key} {count} {ids} {sum} {min} {max} {names} {} {}\n",
@@ -125,18 +144,20 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
     std::process::exit(0)
 }
 
-/// Parses and aggregates every run, one round of `threads` runs at a time, and
-/// returns each thread's totals.
+/// Builds the join table from regions.csv, then parses and aggregates every run,
+/// one round of `threads` runs at a time, and returns each thread's totals and
+/// the groups' keys. One set of threads does all of it.
 fn aggregate(
     text: &[u8],
     body_start: usize,
     guessed: bool,
     threads: usize,
-    regions: &Regions,
+    region_chunks: &[&[u8]],
     slots: usize,
-) -> Result<Vec<Vec<Totals>>, ParseError> {
-    let groups = regions.keys.len();
-    let words = groups.div_ceil(64);
+) -> Result<(Vec<Box<[Totals; GROUPS]>>, Vec<Vec<u8>>), ParseError> {
+    let seen: Vec<AtomicBool> = (0..CODES).map(|_| AtomicBool::new(false)).collect();
+    let ids = AtomicUsize::new(0); // the largest region id + 1
+    let table: Turns<Option<Result<(Regions, Vec<u8>), String>>> = Turns::new(None);
     // Each table is made by the first thread to take it, so their pages fault in
     // in parallel rather than all on this thread.
     let partitions: Vec<Turns<Option<Partition>>> =
@@ -148,28 +169,66 @@ fn aggregate(
     let pairs: Vec<Turns<Vec<Vec<u64>>>> = (0..threads).map(|_| Turns::new(Vec::new())).collect();
     let next_partition: Vec<AtomicUsize> = (0..ROUNDS).map(|_| AtomicUsize::new(0)).collect();
     let barrier = SpinBarrier::new(threads);
-    let results: Vec<Result<Vec<Totals>, ParseError>> = thread::scope(|s| {
+    let results: Vec<Result<Box<[Totals; GROUPS]>, ParseError>> = thread::scope(|s| {
         let handles: Vec<_> = (0..threads)
             .map(|w| {
                 let (partitions, pairs, next_partition, barrier) =
                     (&partitions, &pairs, &next_partition, &barrier);
+                let (seen, ids, table) = (&seen, &ids, &table);
                 s.spawn(move || {
-                    let mut totals = vec![Totals::default(); groups];
+                    let mut totals: Box<[Totals; GROUPS]> =
+                        vec![Totals::default(); GROUPS].try_into().ok().unwrap();
                     let mut error = None;
                     // SAFETY: before the first barrier, only this thread touches its buffers.
                     // (Not `vec![...; PARTITIONS]`: cloning a Vec does not keep its capacity.)
                     *unsafe { pairs[w].get() } = (0..PARTITIONS)
                         .map(|_| Vec::with_capacity(capacity))
                         .collect();
+                    // regions.csv, in two passes over this thread's lines: the first finds
+                    // the countries, which numbers the groups; the second fills the table.
+                    let lines = region_chunks.get(w).copied().unwrap_or_default();
+                    // (A load first: storing every time would bounce the lines between cores.)
+                    let mark = |_, code: usize| {
+                        _ = seen[code].load(Relaxed) || seen[code].swap(true, Relaxed)
+                    };
+                    match scan_regions(lines, mark) {
+                        Ok(n) => _ = ids.fetch_max(n, Relaxed),
+                        Err(e) => error = Some(ParseError::Bad(e)),
+                    }
+                    barrier.wait();
+                    if w == 0 {
+                        // SAFETY: between these two barriers only this thread touches it.
+                        *unsafe { table.get() } = Some(Regions::number(seen, ids.load(Relaxed)));
+                    }
+                    barrier.wait();
+                    // SAFETY: from here on the table is only read (its atomics stored to).
+                    let regions = match unsafe { table.read() } {
+                        Some(Ok((regions, codes))) if error.is_none() => {
+                            let fill = |id: usize, code: usize| {
+                                regions.group_of[id].store(codes[code], Relaxed)
+                            };
+                            if let Err(e) = scan_regions(lines, fill) {
+                                error = Some(ParseError::Bad(e));
+                            }
+                            Some(regions)
+                        }
+                        Some(Err(e)) => {
+                            error = Some(ParseError::Bad(e.clone()));
+                            None
+                        }
+                        _ => None,
+                    };
+                    barrier.wait();
                     for round in 0..ROUNDS {
                         let run = round * threads + w;
-                        if error.is_none() {
+                        if let (None, Some(regions)) = (&error, regions) {
                             // SAFETY: while parsing, each thread touches only its own buffers.
                             let mine = unsafe { pairs[w].get() };
                             mine.iter_mut().for_each(Vec::clear);
                             // Each thread finds its own cuts, so their pages fault in in parallel.
                             let start = run_start(text, body_start, run, units, guessed);
                             let end = run_start(text, body_start, run + 1, units, guessed);
+                            let mine = mine.as_mut_slice().try_into().unwrap();
                             match parse_run(text, start, end, regions, &mut totals, mine) {
                                 // Drop the run's pages now, in parallel, instead of
                                 // the kernel unmapping all 50,000 at exit on one core.
@@ -187,10 +246,10 @@ fn aggregate(
                             // SAFETY: the counter gives partition p to this thread alone
                             // for this round, and every buffer's writer is past the barrier.
                             let partition = unsafe { partitions[p].get() }
-                                .get_or_insert_with(|| Partition::new(slots, words));
+                                .get_or_insert_with(|| Partition::new(slots));
                             for buffers in pairs {
                                 let mine = &unsafe { buffers.read() }[p];
-                                if let Err(e) = partition.add(mine, words, &mut totals) {
+                                if let Err(e) = partition.add(mine, &mut totals) {
                                     error = Some(e);
                                 }
                             }
@@ -214,9 +273,11 @@ fn aggregate(
         }
     }
     if full {
-        Err(ParseError::NamesFull)
-    } else {
-        Ok(parts)
+        return Err(ParseError::NamesFull);
+    }
+    match table.0.into_inner() {
+        Some(Ok((regions, _))) => Ok((parts, regions.keys)),
+        _ => Err(ParseError::Bad("regions.csv: no table".into())),
     }
 }
 
@@ -292,35 +353,30 @@ impl<T> Turns<T> {
     }
 }
 
-/// One partition's names: an open-addressing table of name hashes, kept at most
-/// half full so that a lookup is nearly always one probe, with a dense id per
+/// One partition's names: an open-addressing table of name hashes in buckets of
+/// 4, kept at most half full so that a lookup is nearly always one bucket, with a dense id per
 /// name, and one row of bits per id, a bit per group.
 struct Partition {
     keys: Vec<u64>, // 0 = empty, else the name hash with its low byte set to 0xFF
     ids: Vec<u16>,  // by slot
-    seen: Vec<u64>, // `words` per id
+    seen: Vec<u64>, // WORDS per id
     used: usize,
 }
 
 impl Partition {
     /// A table for up to `names` names.
-    fn new(names: usize, words: usize) -> Self {
+    fn new(names: usize) -> Self {
         Partition {
             keys: vec![0; names * 2],
             ids: vec![0; names * 2],
-            seen: vec![0; names * words],
+            seen: vec![0; names * WORDS],
             used: 0,
         }
     }
 
     /// Marks each (name hash, group) pair, and counts in `totals` the pairs seen
     /// for the first time.
-    fn add(
-        &mut self,
-        pairs: &[u64],
-        words: usize,
-        totals: &mut [Totals],
-    ) -> Result<(), ParseError> {
+    fn add(&mut self, pairs: &[u64], totals: &mut [Totals; GROUPS]) -> Result<(), ParseError> {
         // Fields as locals: no store through them can change the others.
         let Partition {
             keys,
@@ -328,29 +384,42 @@ impl Partition {
             seen,
             used,
         } = self;
-        let (mask, full) = (keys.len() - 1, keys.len() / 2);
+        let (buckets, full) = (keys.len() / 4, keys.len() / 2);
         for &pair in pairs {
             let (key, group) = (pair | 0xFF, (pair & 0xFF) as usize);
-            // The top hash bits picked the partition; the bits above the group pick the slot.
-            let mut i = (pair >> 8) as usize & mask;
-            // SAFETY: slots are masked to the table's length (a power of two), ids are
-            // below `used` <= names, and `seen` has `words` per name (the group's word
-            // is below `words`, which covers every group).
+            // The top hash bits picked the partition; the bits above the group pick
+            // a bucket of 4 slots, compared at once. Slots fill in order and are never
+            // emptied, so a bucket with an empty slot ends the search.
+            let mut bucket = (pair >> 8) as usize & (buckets - 1);
+            // SAFETY: buckets are masked to the table (a multiple of 4 slots), ids are
+            // below `used` <= names, and `seen` has WORDS per name, which cover every
+            // group. AVX2 is enabled.
             unsafe {
-                while *keys.get_unchecked(i) != key {
-                    if *keys.get_unchecked(i) == 0 {
+                use std::arch::x86_64::*;
+                let wanted = _mm256_set1_epi64x(key as i64);
+                let slot = loop {
+                    let v = _mm256_loadu_si256(keys.as_ptr().add(bucket * 4).cast());
+                    let found =
+                        _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(v, wanted)));
+                    if found != 0 {
+                        break bucket * 4 + found.trailing_zeros() as usize;
+                    }
+                    let free = _mm256_cmpeq_epi64(v, _mm256_setzero_si256());
+                    let free = _mm256_movemask_pd(_mm256_castsi256_pd(free));
+                    if free != 0 {
                         if *used == full {
                             return Err(ParseError::NamesFull);
                         }
-                        *keys.get_unchecked_mut(i) = key;
-                        *ids.get_unchecked_mut(i) = *used as u16;
+                        let slot = bucket * 4 + free.trailing_zeros() as usize;
+                        *keys.get_unchecked_mut(slot) = key;
+                        *ids.get_unchecked_mut(slot) = *used as u16;
                         *used += 1;
-                        break;
+                        break slot;
                     }
-                    i = (i + 1) & mask;
-                }
+                    bucket = (bucket + 1) & (buckets - 1);
+                };
                 let word =
-                    seen.get_unchecked_mut(*ids.get_unchecked(i) as usize * words + group / 64);
+                    seen.get_unchecked_mut(*ids.get_unchecked(slot) as usize * WORDS + group / 64);
                 let bit = 1 << (group % 64);
                 totals[group].names_distinct += (*word & bit == 0) as u64;
                 *word |= bit;
@@ -373,34 +442,27 @@ struct Regions {
 const CODES: usize = 26 * 26 * 26;
 
 impl Regions {
-    /// Two parallel passes over the lines: one finds which countries occur, which
-    /// numbers the groups; the other fills `group_of`.
-    fn parse(text: &[u8], threads: usize) -> Result<Self, String> {
-        let body = text
-            .strip_prefix(REGIONS_HEADER)
-            .ok_or("unexpected regions.csv header")?;
-        let chunks = split_at_lines(body, threads);
-        let seen: Vec<AtomicBool> = (0..CODES).map(|_| AtomicBool::new(false)).collect();
-        let max_id = each_region(&chunks, &|_, code| {
-            if !seen[code].load(Relaxed) {
-                seen[code].store(true, Relaxed);
-            }
-        })?;
-        let mut group_of_code = vec![0; CODES];
+    /// Numbers the groups from the codes seen in the first pass (codes sorted, then
+    /// `_UNMATCHED`), with an empty table for region ids below `ids`. Also returns
+    /// what the second pass stores for each code: its group + 1.
+    fn number(seen: &[AtomicBool], ids: usize) -> Result<(Self, Vec<u8>), String> {
+        let mut codes = vec![0; CODES];
         let mut keys = Vec::new();
         for code in (0..CODES).filter(|&c| seen[c].load(Relaxed)) {
             if keys.len() + 2 > u8::MAX as usize {
                 return Err("regions.csv: too many countries".into());
             }
-            group_of_code[code] = keys.len() as u8 + 1;
+            codes[code] = keys.len() as u8 + 1;
             keys.push(
                 [code / 676, code / 26 % 26, code % 26]
                     .map(|letter| b'A' + letter as u8)
                     .to_vec(),
             );
         }
+        keys.push(UNMATCHED.to_vec());
         // Zeroed by calloc, so the pages fault in on the threads that fill them.
-        let mut zeros = std::mem::ManuallyDrop::new(vec![0u8; max_id.map_or(0, |id| id + 1)]);
+        // One more entry than the largest id, for every id above it.
+        let mut zeros = std::mem::ManuallyDrop::new(vec![0u8; ids + 1]);
         // SAFETY: AtomicU8 has the size, alignment and bit validity of u8.
         let group_of = unsafe {
             Vec::from_raw_parts(
@@ -409,74 +471,52 @@ impl Regions {
                 zeros.capacity(),
             )
         };
-        each_region(&chunks, &|id, code| {
-            group_of[id].store(group_of_code[code], Relaxed)
-        })?;
-        keys.push(UNMATCHED.to_vec());
-        Ok(Regions { group_of, keys })
+        Ok((Regions { group_of, keys }, codes))
     }
 
-    fn group(&self, region_id: u64) -> usize {
-        match self
-            .group_of
-            .get(region_id as usize)
-            .map(|g| g.load(Relaxed))
-        {
-            Some(g) if g != 0 => g as usize - 1,
-            _ => self.keys.len() - 1,
-        }
+    /// The group of a region id: its stored value minus 1, so 0 (not in the
+    /// table) wraps to UNMATCHED_GROUP.
+    #[inline(always)]
+    fn group(&self, region_id: u64) -> u8 {
+        let k = (region_id as usize).min(self.group_of.len() - 1);
+        // SAFETY: k is below the length (which is at least 1).
+        unsafe { self.group_of.get_unchecked(k) }
+            .load(Relaxed)
+            .wrapping_sub(1)
     }
 }
 
 /// Calls `visit(region_id, country code index)` for every `region_id "," [A-Z]{3}
-/// LF` line, one thread per chunk; returns the largest region id, if any.
-fn each_region(
-    chunks: &[&[u8]],
-    visit: &(dyn Fn(usize, usize) + Sync),
-) -> Result<Option<usize>, String> {
-    thread::scope(|s| {
-        let handles: Vec<_> = chunks
+/// LF` line of `chunk`; returns the largest region id + 1 (0 for none).
+fn scan_regions(chunk: &[u8], visit: impl Fn(usize, usize)) -> Result<usize, String> {
+    let (mut i, mut ids) = (0, 0);
+    while i < chunk.len() {
+        if let Some((id, code, len)) = region_line(&chunk[i..]) {
+            visit(id, code);
+            ids = ids.max(id + 1);
+            i += len;
+            continue;
+        }
+        let comma = i + chunk[i..]
             .iter()
-            .map(|&chunk| {
-                s.spawn(move || -> Result<Option<usize>, String> {
-                    let (mut i, mut max) = (0, None);
-                    while i < chunk.len() {
-                        if let Some((id, code, len)) = region_line(&chunk[i..]) {
-                            visit(id, code);
-                            max = max.max(Some(id));
-                            i += len;
-                            continue;
-                        }
-                        let comma = i + chunk[i..]
-                            .iter()
-                            .position(|&b| b == b',')
-                            .ok_or("regions.csv: a line without a comma")?;
-                        let id = parse_digits(&chunk[i..comma])
-                            .ok_or("regions.csv: bad region_id")?
-                            as usize;
-                        let code = chunk
-                            .get(comma + 1..comma + 4)
-                            .filter(|c| c.iter().all(u8::is_ascii_uppercase));
-                        let code = code
-                            .filter(|_| chunk.get(comma + 4) == Some(&b'\n'))
-                            .ok_or("regions.csv: bad country")?;
-                        visit(
-                            id,
-                            code.iter()
-                                .fold(0, |acc, &b| acc * 26 + (b - b'A') as usize),
-                        );
-                        max = max.max(Some(id));
-                        i = comma + 5;
-                    }
-                    Ok(max)
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| h.join().unwrap())
-            .try_fold(None, |acc, max| Ok(acc.max(max?)))
-    })
+            .position(|&b| b == b',')
+            .ok_or("regions.csv: a line without a comma")?;
+        let id = parse_digits(&chunk[i..comma]).ok_or("regions.csv: bad region_id")? as usize;
+        let code = chunk
+            .get(comma + 1..comma + 4)
+            .filter(|c| c.iter().all(u8::is_ascii_uppercase));
+        let code = code
+            .filter(|_| chunk.get(comma + 4) == Some(&b'\n'))
+            .ok_or("regions.csv: bad country")?;
+        visit(
+            id,
+            code.iter()
+                .fold(0, |acc, &b| acc * 26 + (b - b'A') as usize),
+        );
+        ids = ids.max(id + 1);
+        i = comma + 5;
+    }
+    Ok(ids)
 }
 
 /// The common `region_id "," [A-Z]{3} LF` line, with at most 7 digits, from two
@@ -609,8 +649,8 @@ fn parse_run(
     start: usize,
     end: usize,
     regions: &Regions,
-    totals: &mut [Totals],
-    pairs: &mut [Vec<u64>],
+    totals: &mut [Totals; GROUPS],
+    pairs: &mut [Vec<u64>; PARTITIONS],
 ) -> Result<usize, ParseError> {
     let mut i = start;
     while i < end {
@@ -619,7 +659,7 @@ fn parse_run(
             None => slow_record(text, i)?,
         };
         let group = regions.group(r.region_id);
-        let total = &mut totals[group];
+        let total = &mut totals[group as usize];
         total.count += 1;
         total.id_sum += r.id;
         total.amount_sum += r.cents;
@@ -665,18 +705,24 @@ fn fast_record(text: &[u8], i: usize) -> Option<Record> {
     let mut out = commas & !inside;
     let id_end = out.trailing_zeros() as usize;
     out &= out.wrapping_sub(1);
-    let name_end = out.trailing_zeros() as usize; // 64 if none
+    let name_end = out.trailing_zeros() as usize;
     out &= out.wrapping_sub(1);
-    // A text field `s..e`: whether it is quoted (else it must be empty).
-    let quoted = |s: usize, e: usize| (at(s) == b'"') & (at(e - 1) == b'"');
-    // The name.
-    let name_quoted = quoted(id_end + 1, name_end);
-    let name_quotes = (quotes & !(u64::MAX << (name_end & 63))).count_ones() as usize;
+    // The name: quoted (its first and last bytes are quotes), or empty.
+    let name_quoted = (quotes >> (id_end + 1)) & (quotes >> (name_end - 1)) & 1 == 1;
+    if name_end >= 64
+        || !name_quoted && name_end != id_end + 1
+        || name_end < id_end + 3 && name_quoted
+    {
+        return None;
+    }
+    let name_quotes = (quotes & !(u64::MAX << name_end)).count_ones() as usize;
     let name_bytes = name_end - id_end - 1 - name_quoted as usize - name_quotes / 2;
     let (name_s, name_e) = (
         id_end + 1 + name_quoted as usize,
         name_end - name_quoted as usize,
     );
+    // SAFETY: `name_s <= name_e`, inside the 64 bytes at `i`, which has 8 bytes before it.
+    let hash = unsafe { hash_words(text, i + name_s, i + name_e) };
     let (note_end, quotes_to_note) = if out != 0 {
         let e = out.trailing_zeros() as usize;
         (e, (quotes & !(u64::MAX << e)).count_ones())
@@ -688,6 +734,10 @@ fn fast_record(text: &[u8], i: usize) -> Option<Record> {
         let before = quotes.count_ones() + (quotes2 & !(u64::MAX << (e & 63))).count_ones();
         (64 + e, before)
     };
+    let note_quoted = (at(name_end + 1) == b'"') & (at(note_end - 1) == b'"');
+    if note_end >= 128 || !note_quoted && note_end != name_end + 1 {
+        return None;
+    }
     let note_quotes = quotes_to_note as usize - name_quotes;
     // The tail, `region_id,amount`: its first comma and dot, from its 32 bytes.
     let (tail_commas, dots) = {
@@ -703,27 +753,22 @@ fn fast_record(text: &[u8], i: usize) -> Option<Record> {
     // `-?[0-9]{1,5}\.[0-9]{2}`, then CRLF or LF.
     let amount_end = note_end + 4 + dot;
     let whole = dot.wrapping_sub(region_len + 1 + negative as usize);
-    let ([id, region_id, cents], digits_ok) = numbers(
-        [
-            load(id_end),
-            load(note_end + 1 + region_len),
-            load(amount_end),
-        ],
-        [id_len, region_len, whole.wrapping_add(2)],
-    );
     let terminator = unsafe { p.add(amount_end).cast::<u16>().read_unaligned() };
     let crlf = terminator == 0x0A0D;
-    let note_quoted = quoted(name_end + 1, note_end);
-    let ok = digits_ok
-        & ((id_len.wrapping_sub(1) | region_len.wrapping_sub(1)) < 8)
-        & (whole.wrapping_sub(1) < 5)
-        & (crlf | (terminator & 0xFF == 0x0A))
-        & (name_quoted | (name_end == id_end + 1))
-        & (note_quoted | (note_end == name_end + 1))
-        & (name_end < 64)
-        & (name_s <= name_e)
-        & (note_end < 128);
-    ok.then(|| Record {
+    // (`|`, not `||`: CRLF or LF is a coin toss, so no branch on it.)
+    if ((id_len.wrapping_sub(1) | region_len.wrapping_sub(1)) >= 8)
+        | (whole.wrapping_sub(1) >= 5)
+        | !crlf & (terminator as u8 != b'\n')
+    {
+        return None;
+    }
+    let words = [
+        load(id_end),
+        load(note_end + 1 + region_len),
+        load(amount_end),
+    ];
+    let ([id, region_id, cents], digits_ok) = numbers(words, [id_len, region_len, whole + 2]);
+    digits_ok.then(|| Record {
         id,
         region_id,
         cents: if negative {
@@ -733,9 +778,7 @@ fn fast_record(text: &[u8], i: usize) -> Option<Record> {
         },
         name_bytes: name_bytes as u64,
         note_bytes: (note_end - name_end - 1 - note_quoted as usize - note_quotes / 2) as u64,
-        // SAFETY: `name_s..name_e` is inside the 64 bytes at `i`, which has 8 bytes
-        // before it.
-        hash: unsafe { hash_words(text, i + name_s, i + name_e) },
+        hash,
         next: i + amount_end + 1 + crlf as usize,
     })
 }
@@ -925,7 +968,8 @@ fn digits(text: &[u8], s: usize, e: usize) -> Option<u64> {
 
 /// Three numbers at once, from the 8 bytes ending at each (the id, the region id,
 /// and the amount with its dot, which is squeezed out as in `amount`), and how
-/// many digits each has. Returns the numbers, and whether every digit was one.
+/// many digits each has (at most 8). Returns the numbers, and whether every digit
+/// was one.
 #[inline(always)]
 fn numbers(words: [u64; 3], lens: [usize; 3]) -> ([u64; 3], bool) {
     use std::arch::x86_64::*;
@@ -940,10 +984,13 @@ fn numbers(words: [u64; 3], lens: [usize; 3]) -> ([u64; 3], bool) {
             -128, 0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
         );
         let v = _mm256_shuffle_epi8(v, squeeze);
-        // Keep the top `len` bytes of each word (a shift of 64 or more gives 0).
-        let [x, y, z] = lens.map(|n| 64i64.wrapping_sub((n as i64).wrapping_mul(8)));
-        let keep = _mm256_sllv_epi64(_mm256_set1_epi8(-1), _mm256_set_epi64x(64, z, y, x));
-        let v = _mm256_and_si256(v, keep);
+        // Keep the top `len` bytes of each word: 8 bytes of a table of 8 zero bytes
+        // then 8 of 0xFF, starting at `len`.
+        const KEEP: [u8; 16] = [
+            0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255,
+        ];
+        let [x, y, z] = lens.map(|n| u64::from_le_bytes(KEEP[n..n + 8].try_into().unwrap()) as i64);
+        let v = _mm256_and_si256(v, _mm256_set_epi64x(0, z, y, x));
         let above_9 = _mm256_subs_epu8(v, _mm256_set1_epi8(9));
         let ok = _mm256_testz_si256(above_9, above_9) == 1;
         // Pairs of digits (x10 + 1), then pairs of those (x100 + 1), packed to
