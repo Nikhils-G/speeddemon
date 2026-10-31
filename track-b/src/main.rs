@@ -278,42 +278,12 @@ struct Table {
 
 impl Table {
     fn new(bits: u32) -> Self {
-        Table { buckets: vec![Bucket::default(); 1 << bits], shift: 64 - bits, len: 0 }
+        Table { buckets: vec![Bucket::default(); 1 << bits], shift: 32 - bits, len: 0 }
     }
 
-    /// The info of the key in bucket b, or MISS, without a branch: whether and
-    /// where a key hits is random. `wide` is the key in both 128-bit lanes.
-    #[inline(always)]
-    fn probe(&self, b: usize, wide: __m256i) -> (u32, u64) {
-        // SAFETY: callers pass b < buckets.len().
-        let slots = unsafe { &self.buckets.get_unchecked(b).0 };
-        // SAFETY: two 32-byte loads that cover the 64-byte bucket; AVX2 is
-        // enabled for the whole build.
-        let half = |i| unsafe { _mm256_cmpeq_epi8(_mm256_loadu_si256((slots.as_ptr() as *const __m256i).add(i)), wide) };
-        let m = movemask(half(0)) as u64 | (movemask(half(1)) as u64) << 32;
-        // Slot j matches when its 12 key bytes do: bits 16j..16j + 12 of m.
-        // Adding 1 to such a run of ones carries into bit 16j + 12.
-        let hit = ((m & 0x0FFF_0FFF_0FFF_0FFF) + 0x0001_0001_0001_0001) & 0x1000_1000_1000_1000;
-        let info = slots[hit.trailing_zeros() as usize / 16 & 3].info;
-        // A miss with a full bucket also returns its last key, else 0.
-        (if_zero(hit, MISS as u64, info as u64) as u32, if_zero(hit, slots[3].lo, 0))
-    }
-
-    /// The info of the key whose home bucket is b, or MISS. A full bucket continues
-    /// into the next one, as `insert` does.
-    fn get(&self, key: __m128i, mut b: usize) -> u32 {
-        // SAFETY: AVX2 is enabled for the whole build.
-        let wide = unsafe { _mm256_broadcastsi128_si256(key) };
-        loop {
-            // Slots fill in order and are never removed: a free last slot ends the
-            // probe. One branch, rarely taken: a miss in a full bucket.
-            let (info, full_miss) = self.probe(b, wide);
-            if full_miss != 0 {
-                b = (b + 1) & (self.buckets.len() - 1);
-                continue;
-            }
-            return info;
-        }
+    /// The info of the key whose home bucket is b, or MISS.
+    fn get(&self, key: __m128i, b: usize) -> u32 {
+        find(self.buckets.as_ptr(), self.buckets.len() - 1, b, key)
     }
 
     /// Adds a key that is not in the table yet.
@@ -328,6 +298,34 @@ impl Table {
             }
             b = (b + 1) & mask;
         }
+    }
+}
+
+/// The info of `key` in the buckets from b on, or MISS: a full bucket continues
+/// into the next one, as `Table::insert` does. A raw pointer and mask, so that
+/// a loop that calls it keeps them in registers.
+#[inline(always)]
+fn find(buckets: *const Bucket, mask: usize, mut b: usize, key: __m128i) -> u32 {
+    // SAFETY: AVX2 is enabled for the whole build.
+    let wide = unsafe { _mm256_broadcastsi128_si256(key) };
+    loop {
+        // SAFETY: b <= mask, and the table has mask + 1 buckets.
+        let slots = unsafe { &(*buckets.add(b)).0 };
+        // SAFETY: two 32-byte loads that cover the 64-byte bucket.
+        let half = |i| unsafe { _mm256_cmpeq_epi32(_mm256_loadu_si256((slots.as_ptr() as *const __m256i).add(i)), wide) };
+        let m = movemask_ps(half(0)) | movemask_ps(half(1)) << 8;
+        // Slot j matches when its 3 key dwords do: bits 4j..4j + 3 of m.
+        // Adding 1 to such a run of ones carries into bit 4j + 3.
+        let hit = (((m & 0x7777) + 0x1111) & 0x8888) as u64;
+        let info = slots[hit.trailing_zeros() as usize / 4 & 3].info;
+        // Without a branch (whether and where a key hits is random), except on
+        // a miss in a full bucket: slots fill in order and are never removed,
+        // so a free last slot ends the probe.
+        if if_zero(hit, slots[3].lo, 0) != 0 {
+            b = (b + 1) & mask;
+            continue;
+        }
+        return if_zero(hit, MISS as u64, info as u64) as u32;
     }
 }
 
@@ -346,10 +344,10 @@ fn key_at(bytes: &[u8], at: usize, len: usize) -> __m128i {
     }
 }
 
-/// CRC32 of the key, in the top bits (the tables index by those).
+/// CRC32 of the key: the tables index by its top bits.
 fn hash(lo: u64, hi: u32) -> u64 {
     // SAFETY: SSE4.2 is enabled for the whole build (it comes with AVX2).
-    (unsafe { _mm_crc32_u64(hi as u64, lo) }) << 32
+    unsafe { _mm_crc32_u64(hi as u64, lo) }
 }
 
 /// The first 8 and the next 4 bytes of a key.
@@ -400,7 +398,7 @@ impl Vocab {
             match self.table.get(key, (hash(lo, hi) >> self.table.shift) as usize) {
                 MISS => {
                     if (self.table.len + 1) * 2 > self.table.buckets.len() * 5 {
-                        let bigger = Table::new(65 - self.table.shift);
+                        let bigger = Table::new(33 - self.table.shift);
                         let old = std::mem::replace(&mut self.table, bigger);
                         for slot in old.buckets.iter().flat_map(|b| b.0).filter(|s| s.lo != 0) {
                             self.table.insert(slot.lo, slot.hi, slot.info);
@@ -427,6 +425,8 @@ impl Vocab {
         self.long.values_mut().for_each(|info| *info = renumber(*info));
     }
 
+    #[cold]
+    #[inline(never)]
     fn get_long(&self, token: &[u8]) -> u32 {
         if token.len() > MAX_TERM {
             return MISS;
@@ -719,11 +719,12 @@ impl<'a> Scan<'a> {
     /// found, and the words are fetched while the tokens are probed.
     fn look_up(&mut self, bit: u64) {
         let (nb, table) = (self.nb, &self.vocab.table);
+        let (buckets, mask) = (table.buckets.as_ptr(), table.buckets.len() - 1);
         self.toks.reserve(self.pending.len());
         let (toks, mut len) = (self.toks.as_mut_ptr(), self.toks.len());
         for &(key, b) in &self.pending {
             // SAFETY: SSE4.1 is enabled for the whole build (it comes with AVX2).
-            let info = if unsafe { _mm_testz_si128(key, key) } == 1 { b as u32 } else { table.get(key, b as usize) };
+            let info = if unsafe { _mm_testz_si128(key, key) } == 1 { b as u32 } else { find(buckets, mask, b as usize, key) };
             let id = info & MISS;
             // SAFETY: a prefetch of a word of `w`.
             unsafe { _mm_prefetch::<_MM_HINT_T0>(self.w.as_ptr().add((id as usize).min(nb)) as *const i8) };
@@ -983,6 +984,14 @@ fn token_mask(docs: &[u8], at: usize, end: usize) -> u64 {
         64.. => mask,
         left => mask & ((1 << left) - 1),
     }
+}
+
+/// `vmovmskps`, hidden from LLVM like `movemask`.
+fn movemask_ps(v: __m256i) -> u32 {
+    let mask: u32;
+    // SAFETY: AVX2 is enabled for this build; the instruction reads one register.
+    unsafe { std::arch::asm!("vmovmskps {0:e}, {1}", out(reg) mask, in(ymm_reg) v, options(pure, nomem, nostack)) };
+    mask
 }
 
 /// `if c == 0 { a } else { b }` as a cmov: LLVM turns such selects of loaded
