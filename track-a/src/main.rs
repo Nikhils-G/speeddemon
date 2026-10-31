@@ -16,7 +16,7 @@
 //!    runs, keyed by the timestamp's first 13 bytes "YYYY-MM-DDTHH". Sorting those
 //!    bytes sorts the hours, and they are the start of the output's hour label, so
 //!    no calendar arithmetic is needed and any amount of disorder is handled.
-//! 4. Endpoints are ranked in byte order, and the threads take the hours in order:
+//! 4. Endpoints are sorted in byte order, and the threads take the hours in order:
 //!    a thread gathers one hour's runs from every part, groups them by endpoint
 //!    with a counting sort small enough to stay in L1/L2, gives back the records
 //!    it no longer needs, and selects exact percentiles per group.
@@ -72,17 +72,11 @@ fn main() {
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    // Rank the distinct endpoints in byte order: `rank[id]`.
-    let count = table.count.load(Relaxed);
-    let found: Vec<&[u8]> = (0..count).map(|id| table.name(id)).collect();
-    let mut order: Vec<u32> = (0..found.len() as u32).collect();
-    order.sort_unstable_by_key(|&id| found[id as usize]);
-    let mut rank = vec![0u32; found.len()];
-    for (r, &id) in order.iter().enumerate() {
-        rank[id as usize] = r as u32;
-    }
-    let names: Vec<&[u8]> = order.iter().map(|&id| found[id as usize]).collect();
-    let endpoints = names.len();
+    // The endpoint ids in byte order of their names.
+    let endpoints = table.count.load(Relaxed);
+    let names: Vec<&[u8]> = (0..endpoints).map(|id| table.name(id)).collect();
+    let mut order: Vec<usize> = (0..endpoints).collect();
+    order.sort_unstable_by_key(|&id| names[id]);
 
     // The hours in order, and each hour's runs from every part.
     let all_runs = parts.iter().flat_map(|p| &p.runs);
@@ -124,7 +118,7 @@ fn main() {
     let (known, next) = (AtomicUsize::new(0), AtomicUsize::new(0));
 
     // Pass 2, parallel over hours: each thread takes the next hour, gathers its
-    // records from every part, groups them by endpoint rank, computes each group's
+    // records from every part, groups them by endpoint id, computes each group's
     // statistics and the hour's length, then writes each of its hours once the
     // previous one's end is known, taking further hours meanwhile.
     // Writes the pending hours whose start is known; with `wait`, all of them.
@@ -171,17 +165,16 @@ fn main() {
                     let Some(runs) = runs_of.get(hour) else {
                         break flush(&mut pending, true);
                     };
-                    // Count per endpoint rank, errors in the high half of the same
-                    // word (one increment per record), then set start[r + 1] to the
-                    // start of rank r's group and place each latency at it: start[r]
-                    // then runs from rank r's first value to its end.
+                    // Count per endpoint id, errors in the high half of the same
+                    // word (one increment per record), then set start[i + 1] to the
+                    // start of id i's group and place each latency at it: start[i]
+                    // then runs from id i's first value to its end. The groups are
+                    // then taken in byte order of their names.
                     counts.fill(0);
                     for &(p, run, end) in runs {
                         for &record in &parts[p].records[run.start as usize..end] {
-                            // SAFETY: records hold ids of the table, which has a rank each.
-                            let rank =
-                                unsafe { *rank.get_unchecked((record >> ENDPOINT_SHIFT) as usize) };
-                            counts[rank as usize] += 1 | ((record >> 20 & 1) as u64) << 32;
+                            let id = (record >> ENDPOINT_SHIFT) as usize;
+                            counts[id] += 1 | ((record >> 20 & 1) as u64) << 32;
                         }
                     }
                     let mut sum = 0;
@@ -199,12 +192,12 @@ fn main() {
                                 ESCAPE => *escapes.next().unwrap(),
                                 latency => latency,
                             };
-                            // SAFETY: ids have a rank each, and each rank's cursor stays
-                            // below the next rank's start, which is at most values.len():
+                            // SAFETY: ids are below `endpoints`, and each id's cursor stays
+                            // below the next id's start, which is at most values.len():
                             // the counts above are this hour's.
                             unsafe {
-                                let rank = *rank.get_unchecked((record >> ENDPOINT_SHIFT) as usize);
-                                let at = start.get_unchecked_mut(rank as usize + 1);
+                                let id = (record >> ENDPOINT_SHIFT) as usize;
+                                let at = start.get_unchecked_mut(id + 1);
                                 *values.get_unchecked_mut(*at as usize) = latency;
                                 *at += 1;
                             }
@@ -223,13 +216,13 @@ fn main() {
                         }
                     }
                     let (mut groups, mut len) = (Vec::with_capacity(endpoints), 0);
-                    for r in 0..endpoints {
-                        let group = &mut values[start[r] as usize..start[r + 1] as usize];
+                    for &id in &order {
+                        let group = &mut values[start[id] as usize..start[id + 1] as usize];
                         if !group.is_empty() {
                             let [p50, p95, p99] = percentiles(group);
-                            let errors = (counts[r] >> 32) as u32;
-                            let stat = [r as u32, group.len() as u32, p50, p95, p99, errors];
-                            len += line_len(names[r], &stat);
+                            let errors = (counts[id] >> 32) as u32;
+                            let stat = [id as u32, group.len() as u32, p50, p95, p99, errors];
+                            len += line_len(names[id], &stat);
                             groups.push(stat);
                         }
                     }
@@ -259,7 +252,7 @@ struct Run {
     escapes: u32,
 }
 
-/// One group's output: endpoint rank, count, p50, p95, p99 and errors.
+/// One group's output: endpoint id, count, p50, p95, p99 and errors.
 type Stats = [u32; 6];
 
 /// The six numbers after the endpoint: the error rate is in parts per million.
