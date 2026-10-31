@@ -802,7 +802,22 @@ fn amount(text: &[u8], s: usize, mut e: usize) -> Option<i64> {
     if e < start + 4 || text[e - 3] != b'.' {
         return None;
     }
-    let cents = (digits(text, start, e - 3)? * 100 + digits(text, e - 2, e)?) as i64;
+    let whole = e - 3 - start;
+    let cents = if (1..=5).contains(&whole) && e >= 8 {
+        // One SWAR conversion for the whole amount: the 8 bytes ending at the field,
+        // minus '0', with the dot (byte 5) squeezed out and the bytes before the
+        // field zeroed, read as digits (whole * 100 + cents).
+        let word = u64::from_le_bytes(text[e - 8..e].try_into().unwrap()) ^ 0x3030_3030_3030_3030;
+        let word = (word & 0x0000_00FF_FFFF_FFFF) << 8 | word & 0xFFFF_0000_0000_0000;
+        let word = word & u64::MAX << (8 * (6 - whole));
+        // Every byte must now be 0..=9 (see `digits`).
+        if (word.wrapping_add(0x7676_7676_7676_7676) | word) & 0x8080_8080_8080_8080 != 0 {
+            return None;
+        }
+        eight_digits(word) as i64
+    } else {
+        (digits(text, start, e - 3)? * 100 + digits(text, e - 2, e)?) as i64
+    };
     Some(if negative { -cents } else { cents })
 }
 
