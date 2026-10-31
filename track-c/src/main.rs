@@ -22,11 +22,12 @@
 //!    quotes, `""` maps one to one to the unescaped value, and an unquoted value
 //!    cannot contain `"`), reduced to a 56-bit hash; with the spec's 100,000 names
 //!    the chance that two share one is about 7e-8. Parsing only files a (hash,
-//!    group) pair under one of 64 partitions picked by the hash. Between parsing
-//!    rounds, each thread takes whole partitions and marks pairs in that
-//!    partition's own small table of names with a bit per group, which stays in its
-//!    cache. No two threads ever write the same memory, so there are no atomics or
-//!    cache lines bouncing between cores, and the rounds keep the pair buffers small.
+//!    group) pair under one of 4 partitions per thread picked by the hash. Between
+//!    parsing rounds, each thread marks the pairs of the partitions it owns (the
+//!    same ones every round) in their small tables of names with a bit per group,
+//!    which stay in its cache. No two threads ever write the same memory, so there
+//!    are no atomics or cache lines bouncing between cores, and the rounds keep the
+//!    pair buffers small.
 
 mod mmap;
 
@@ -45,18 +46,15 @@ const BOM: &[u8] = b"\xEF\xBB\xBF";
 /// The file is parsed in this many rounds of one run per thread, so the pair
 /// buffers only ever hold one round's pairs (about 3 MB in all).
 const ROUNDS: usize = 8;
-/// Names are split by their top hash bits into this many partitions.
-const PARTITION_BITS: u32 = 6;
-const PARTITIONS: usize = 1 << PARTITION_BITS;
+/// Names are split by their top hash bits into this many partitions per thread;
+/// each thread owns the same ones in every round, so their tables stay in its cache.
+const PARTITIONS_PER_THREAD: usize = 4;
 /// Group indices are bytes, so that tables indexed by a group need no bounds
 /// checks: countries in the order they are first seen, `_UNMATCHED` the last one.
 const GROUPS: usize = 256;
 const UNMATCHED_GROUP: usize = GROUPS - 1;
 /// Words of group bits per name.
 const WORDS: usize = GROUPS / 64;
-/// Names per partition for the first attempt: the spec's 100,000 names are about
-/// 1,570 per partition.
-const FIRST_SLOTS: usize = 1 << 11;
 /// regions.csv is entered in this many parts.
 const REGION_CHUNKS: usize = 64;
 /// Country codes are `[A-Z]{3}` (spec 2.3), so each has an index below 26^3.
@@ -105,7 +103,9 @@ fn run(data_dir: &str, out_dir: &str) -> Result<std::convert::Infallible, String
     // has the largest. One entry more, for every id above it.
     let last_line = lines.trim_ascii_end().rsplit(|&b| b == b'\n').next();
     let ids = (digits(last_line.unwrap_or_default(), &mut 0).0 as usize).min(1 << 30) + 2;
-    let (mut guessed, mut slots) = (true, FIRST_SLOTS);
+    // Slots for the spec's 100,000 names at most 5/8 full, a power of two.
+    let first_slots = (160_000 / (threads * PARTITIONS_PER_THREAD)).next_power_of_two();
+    let (mut guessed, mut slots) = (true, first_slots.max(4));
     loop {
         match aggregate(
             records, body_start, guessed, threads, lines, slots, ids, out_dir,
@@ -186,18 +186,12 @@ fn aggregate(
     // regions.csv is entered in chunks that threads claim as they start, so the
     // ones that start first do more of it.
     let (next_chunk, chunks_done) = (AtomicUsize::new(0), AtomicUsize::new(0));
-    // Each table is made by the first thread to take it, so their pages fault in
-    // in parallel rather than all on this thread.
-    let partitions: Vec<Mutex<Option<Partition>>> =
-        (0..PARTITIONS).map(|_| Mutex::new(None)).collect();
     // Pairs per thread per partition in one run, with room to spare (records are
     // about 60 bytes), so the buffers are allocated once, by their own thread.
     let units = threads * ROUNDS;
-    let capacity = text.len() / (units * 60 * PARTITIONS) * 5 / 4 + 16;
-    let pairs: Vec<RwLock<Box<[Vec<u64>; PARTITIONS]>>> = (0..threads)
-        .map(|_| RwLock::new(Box::new(std::array::from_fn(|_| Vec::new()))))
-        .collect();
-    let next_partition: Vec<AtomicUsize> = (0..ROUNDS).map(|_| AtomicUsize::new(0)).collect();
+    let parts = threads * PARTITIONS_PER_THREAD;
+    let capacity = text.len() / (units * 60 * parts) * 5 / 4 + 16;
+    let pairs: Vec<RwLock<Vec<Vec<u64>>>> = (0..threads).map(|_| RwLock::new(Vec::new())).collect();
     let (arrived, generation) = (AtomicUsize::new(0), AtomicUsize::new(0));
     let barrier = SpinBarrier {
         threads,
@@ -211,8 +205,11 @@ fn aggregate(
         let mut totals = [EMPTY; GROUPS];
         // Allocated here: buffer lengths next to another thread's would share
         // cache lines with it (+1 ms).
-        *pairs[w].write().unwrap() =
-            Box::new(std::array::from_fn(|_| Vec::with_capacity(capacity)));
+        *pairs[w].write().unwrap() = (0..parts).map(|_| Vec::with_capacity(capacity)).collect();
+        // This thread's partitions, p = w + k * threads; made here, so they are in its cache.
+        let mut partitions: Vec<_> = (0..PARTITIONS_PER_THREAD)
+            .map(|_| Partition::new(slots))
+            .collect();
         let mut error = None;
         loop {
             let chunk = next_chunk.fetch_add(1, Relaxed);
@@ -242,16 +239,10 @@ fn aggregate(
                 }
             }
             barrier.wait();
-            loop {
-                let p = next_partition[round].fetch_add(1, Relaxed);
-                if p >= PARTITIONS || error.is_some() {
-                    break;
-                }
-                // The counter gives partition p to this thread alone this round.
-                let mut partition = partitions[p].lock().unwrap();
-                let partition = partition.get_or_insert_with(|| Partition::new(slots));
+            for (k, partition) in partitions.iter_mut().enumerate() {
                 for buffers in &pairs {
-                    if let Err(e) = partition.add(&buffers.read().unwrap()[p], &mut totals) {
+                    let mine = &buffers.read().unwrap()[w + k * threads];
+                    if let (None, Err(e)) = (&error, partition.add(mine, &mut totals)) {
                         error = Some(e);
                     }
                 }
@@ -323,10 +314,10 @@ impl SpinBarrier {
 }
 
 /// One partition's names: an open-addressing table of name hashes in buckets of
-/// 4, kept at most half full so that a lookup is nearly always one bucket, with a
-/// dense id per name, and one row of bits per id, a bit per group. (Rows by slot
-/// instead, in a 7/8 full table: 23% less memory, but 13% of lookups leave their
-/// first bucket, +0.8M branch misses.)
+/// 4, at most 5/8 full so that a lookup is nearly always one bucket, with a dense
+/// id per name, and one row of bits per id, a bit per group. (Rows by slot instead,
+/// in a 7/8 full table: 23% less memory, but 13% of lookups leave their first
+/// bucket, +0.8M branch misses.)
 struct Partition {
     keys: Vec<u64>, // 0 = empty, else the name hash with its low byte set to 0xFF
     ids: Vec<u16>,  // by slot
@@ -335,12 +326,12 @@ struct Partition {
 }
 
 impl Partition {
-    /// A table for up to `names` names.
-    fn new(names: usize) -> Self {
+    /// A table of `slots` slots (a power of two), for up to 5/8 as many names.
+    fn new(slots: usize) -> Self {
         Partition {
-            keys: vec![0; names * 2],
-            ids: vec![0; names * 2],
-            seen: vec![0; names * WORDS],
+            keys: vec![0; slots],
+            ids: vec![0; slots],
+            seen: vec![0; slots / 8 * 5 * WORDS],
             used: 0,
         }
     }
@@ -355,7 +346,7 @@ impl Partition {
             seen,
             used,
         } = self;
-        let (buckets, full) = (keys.len() / 4, keys.len() / 2);
+        let (buckets, full) = (keys.len() / 4, keys.len() / 8 * 5);
         for &pair in pairs {
             let (key, group) = (pair | 0xFF, (pair & 0xFF) as usize);
             // The top hash bits picked the partition; the bits above the group pick
@@ -452,7 +443,7 @@ impl Regions {
 }
 
 enum ParseError {
-    /// A partition's name table passed half full; retry with bigger ones.
+    /// A partition's name table passed 5/8 full; retry with bigger ones.
     NamesFull,
     /// A run did not end where the next one starts (only possible for a guessed cut).
     Misaligned,
@@ -504,7 +495,7 @@ fn parse_run(
     end: usize,
     group_of: &[AtomicU8],
     totals: &mut [Totals; GROUPS],
-    pairs: &mut [Vec<u64>; PARTITIONS],
+    pairs: &mut [Vec<u64>],
 ) -> Result<usize, ParseError> {
     let mut i = start;
     // The header comes first, so a record start is at least 8 bytes in.
@@ -539,7 +530,9 @@ fn parse_run(
             t[4] = r.cents;
         }
         t[6] += r.bytes as i64;
-        pairs[(r.hash >> (64 - PARTITION_BITS)) as usize].push(r.hash & !0xFF | group as u64);
+        // The partition from the top hash bits, by multiply-shift: any count.
+        let p = ((r.hash >> 32) * pairs.len() as u64 >> 32) as usize;
+        pairs[p].push(r.hash & !0xFF | group as u64);
         i = r.next;
     }
     Ok(i.min(text.len()))
