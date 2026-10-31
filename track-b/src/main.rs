@@ -813,7 +813,9 @@ impl<'a> Scan<'a> {
         let w = &mut self.w;
         if let Some(plan) = self.plan {
             for t in self.touched[..self.n].iter().map(|&t| t as usize) {
-                for e in &plan.entries[plan.group[t] as usize..plan.group[t + 1] as usize] {
+                // SAFETY: touched slots are at most nb, and group has nb + 2 entries.
+                let entries = unsafe { plan.entries.get_unchecked(*plan.group.get_unchecked(t) as usize..*plan.group.get_unchecked(t + 1) as usize) };
+                for e in entries {
                     let bit = |b: u32| 0u64.wrapping_sub((b & 1) as u64);
                     let r = e.terms.iter().fold(0u64, |r, &word| {
                         // SAFETY: the plan's slots are below w.len().
@@ -829,8 +831,11 @@ impl<'a> Scan<'a> {
         }
         let (rows, block) = (self.wide.len() - 2, (base / 64 % (SUPER / 64)) as usize);
         for &t in &self.touched[..self.n] {
-            self.wide[(t as usize).min(rows)].0[block] = w[t as usize];
-            w[t as usize] = 0;
+            // SAFETY: min(t, rows) < wide.len(), t <= nb < w.len(), block < 4.
+            unsafe {
+                *self.wide.get_unchecked_mut((t as usize).min(rows)).0.get_unchecked_mut(block) = *w.get_unchecked(t as usize);
+                *w.get_unchecked_mut(t as usize) = 0;
+            }
         }
         self.n = 0;
     }
@@ -841,10 +846,11 @@ impl<'a> Scan<'a> {
         let Some(plan) = self.plan else { return };
         let wide = &self.wide;
         for e in &plan.always {
-            // SAFETY: aligned 32-byte loads of rows; AVX2 is enabled for the whole build.
+            // SAFETY: aligned 32-byte loads of rows (the plan's rows are below
+            // wide.len()); AVX2 is enabled for the whole build.
             let hits = unsafe {
                 e.terms[..e.earlier as usize].iter().fold(_mm256_setzero_si256(), |r, &word| {
-                    let x = _mm256_load_si256(wide[(word & TERM) as usize].0.as_ptr() as *const __m256i);
+                    let x = _mm256_load_si256(wide.get_unchecked((word & TERM) as usize).0.as_ptr() as *const __m256i);
                     match word >> 30 {
                         AND => _mm256_and_si256(r, x),
                         NOT => _mm256_andnot_si256(x, r),
