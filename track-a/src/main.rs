@@ -148,26 +148,25 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
                     (&parts, &rank_of, &names, &runs_of, &next);
                 s.spawn(move || {
                     let mut done = Vec::new();
-                    let (mut start, mut errors, mut values) =
-                        (vec![0u32; endpoints + 1], vec![0u32; endpoints], Vec::new());
+                    let (mut start, mut counts, mut values) =
+                        (vec![0u32; endpoints + 1], vec![0u64; endpoints], Vec::new());
                     loop {
                         let hour = next.fetch_add(1, Relaxed);
                         let Some(runs) = runs_of.get(hour) else {
                             break done;
                         };
-                        // Count per endpoint rank (shifted by one), then turn the
-                        // counts into start offsets, then place each latency.
-                        start.fill(0);
-                        errors.fill(0);
+                        // Count per endpoint rank, errors in the high half of the same
+                        // word (one increment per record), then turn the counts into
+                        // start offsets, then place each latency.
+                        counts.fill(0);
                         for &(p, run, end) in runs {
                             for &record in &parts[p].records[run.start as usize..end] {
                                 let rank = rank_of[p][(record >> ENDPOINT_SHIFT) as usize] as usize;
-                                start[rank + 1] += 1;
-                                errors[rank] += (record & ERROR_BIT != 0) as u32;
+                                counts[rank] += 1 | ((record & ERROR_BIT != 0) as u64) << 32;
                             }
                         }
                         for k in 0..endpoints {
-                            start[k + 1] += start[k];
+                            start[k + 1] = start[k] + counts[k] as u32;
                         }
                         values.resize(start[endpoints] as usize, 0);
                         let mut cursor = start.clone();
@@ -192,7 +191,13 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
                                 let [p50, p95, p99] = percentiles(group);
                                 let stat = Stats {
                                     rank: rank as u32,
-                                    fields: [group.len() as u32, p50, p95, p99, errors[rank]],
+                                    fields: [
+                                        group.len() as u32,
+                                        p50,
+                                        p95,
+                                        p99,
+                                        (counts[rank] >> 32) as u32,
+                                    ],
                                 };
                                 len += stat.line_len(names);
                                 groups.push(stat);
