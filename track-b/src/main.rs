@@ -328,20 +328,40 @@ struct Vocab {
     buckets: Vec<Bucket>,
     /// The home bucket of a key is its hash >> shift.
     shift: u32,
+    /// A one-word Bloom filter in front of the table, 1 KB per 512 buckets
+    /// (64 KB for 50,000 queries): `filter_bits(h)` are set in word
+    /// `h & (filter.len() - 1)` for every key's hash h. A fifth of the corpus
+    /// tokens are words no query uses, each a different random bucket of the
+    /// 2 MB table, nearly always a cache miss; the filter, which stays in L2,
+    /// turns away most of them without that miss: they are looked up in the
+    /// extra empty bucket at the end, which no key reaches by its hash and
+    /// whose probe ends at once (an empty slot matches no token's key).
+    filter: Vec<u64>,
     /// Terms of 13 to 32 bytes: about 0.2% of the corpus tokens are that long.
     long: std::collections::HashMap<&'static [u8], u32>,
     count: u32,
 }
 
+/// The two bits of a hash's filter word, from bits above the word's index.
+fn filter_bits(h: u64) -> u64 {
+    1 << (h >> 13 & 63) | 1 << (h >> 19 & 63)
+}
+
 impl Vocab {
+    /// The mask of a bucket index: the buckets but the extra empty one.
+    fn mask(&self) -> usize {
+        self.buckets.len() - 2
+    }
+
     fn home(&self, (lo, hi): (u64, u32)) -> usize {
         (hash(lo, hi) >> self.shift) as usize
     }
 
     /// Moves the terms to a table of `buckets` buckets, a power of two.
     fn rebuild(&mut self, buckets: usize) {
-        let old = std::mem::replace(&mut self.buckets, vec![Bucket::default(); buckets]);
+        let old = std::mem::replace(&mut self.buckets, vec![Bucket::default(); buckets + 1]);
         self.shift = 32 - buckets.trailing_zeros();
+        self.filter = vec![0; buckets / 4];
         for slot in old.iter().flat_map(|b| b.0).filter(|s| s.lo != 0) {
             self.insert((slot.lo, slot.hi), slot.info);
         }
@@ -350,9 +370,12 @@ impl Vocab {
     /// Adds a key that is not in the table yet, in the first free slot from its
     /// home bucket on (slots fill in order, so a bucket is full when its last is).
     fn insert(&mut self, (lo, hi): (u64, u32), info: u32) {
+        let h = hash(lo, hi);
+        let word = h as usize & (self.filter.len() - 1);
+        self.filter[word] |= filter_bits(h);
         let mut b = self.home((lo, hi));
         while self.buckets[b].0[3].lo != 0 {
-            b = (b + 1) & (self.buckets.len() - 1);
+            b = (b + 1) & self.mask();
         }
         *self.buckets[b].0.iter_mut().find(|s| s.lo == 0).unwrap() = Slot { lo, hi, info };
     }
@@ -362,11 +385,10 @@ impl Vocab {
         let id = if term.len() > KEY {
             *self.long.entry(term).or_insert(self.count)
         } else {
-            let mask = self.buckets.len() - 1;
-            let id = find(self.buckets.as_ptr(), mask, self.home(parts(key)), key);
+            let id = find(self.buckets.as_ptr(), self.mask(), self.home(parts(key)), key);
             if id == MISS {
-                if (self.count as usize + 1) * 2 > self.buckets.len() * 5 {
-                    self.rebuild(2 * self.buckets.len());
+                if (self.count as usize + 1) * 2 > (self.mask() + 1) * 5 {
+                    self.rebuild(2 * (self.mask() + 1));
                 }
                 self.insert(parts(key), self.count);
             }
@@ -688,6 +710,8 @@ impl<'a> Scan<'a> {
                 starts ^= text;
                 let (buf, mut n) = (self.pending.as_mut_ptr(), self.pending.len());
                 let (buckets, shift) = (self.vocab.buckets.as_ptr(), self.vocab.shift);
+                let (filter, words) = (self.vocab.filter.as_ptr(), self.vocab.filter.len() - 1);
+                let empty = self.vocab.mask() as u64 + 1;
                 while text != 0 {
                     let b = text.trailing_zeros();
                     text &= text - 1;
@@ -699,8 +723,13 @@ impl<'a> Scan<'a> {
                         let key = key_at(docs, p, len);
                         let (lo, hi) = parts(key);
                         let h = hash(lo, hi);
+                        // A token the filter turns away is looked up, without a
+                        // branch, in the extra empty bucket.
+                        // SAFETY: h & words < filter.len().
+                        let bits = filter_bits(h);
+                        let absent = unsafe { *filter.add(h as usize & words) } & bits ^ bits;
+                        let b = if_zero(absent, h >> shift, empty) as usize;
                         // SAFETY: a prefetch of a bucket of the table.
-                        let b = (h >> shift) as usize;
                         unsafe { _mm_prefetch::<_MM_HINT_T0>(buckets.add(b) as *const i8) };
                         (key, b as u64)
                     } else {
@@ -742,7 +771,7 @@ impl<'a> Scan<'a> {
     fn look_up(&mut self, bit: u64) {
         // The number of BOOL terms.
         let (nb, table) = (self.w.len() - 2, self.vocab);
-        let (buckets, mask) = (table.buckets.as_ptr(), table.buckets.len() - 1);
+        let (buckets, mask) = (table.buckets.as_ptr(), table.mask());
         self.toks.reserve(self.pending.len());
         let (toks, mut len) = (self.toks.as_mut_ptr(), self.toks.len());
         for &(key, b) in &self.pending {
