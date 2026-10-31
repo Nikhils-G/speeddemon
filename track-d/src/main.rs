@@ -7,18 +7,22 @@
 //!    with atomic increments, then a prefix sum and a second atomic cursor scatter
 //!    the edges into one CSR array (offsets + packed (head, weight) pairs), so the
 //!    graph is built in parallel with no per-node allocation.
-//! 3. Queries run in parallel, one Dijkstra per query, each thread reusing its own
-//!    distance array and resetting only the nodes it touched. Nodes are first
-//!    renumbered in BFS order so that a search's nodes sit close together in memory.
-//! 4. A target with no in-edges is answered -1 at once: the reference settles the
+//! 3. Nodes are renumbered so that a search's nodes sit close together in memory:
+//!    each thread grows a breadth-first region from its own seed (see `relabel`).
+//! 4. Queries run in parallel, one Dijkstra per query with a radix heap, each
+//!    thread reusing a 32-bit distance array and resetting only what it touched.
+//! 5. A target with no in-edges is answered -1 at once: the reference settles the
 //!    whole graph to find that out.
 
 mod mmap;
 
 use std::fs::File;
 use std::io::Write;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering::Relaxed};
 use std::thread;
+
+const UNCLAIMED: u8 = u8::MAX;
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -176,41 +180,69 @@ fn build_graph(text: &[u8], threads: usize) -> Result<Graph, String> {
     Ok(Graph { offsets, edges, has_in })
 }
 
-/// Renumbers the nodes in breadth-first order. Node ids in the input are a random
-/// relabelling, so a Dijkstra ball of 10,000 nodes touched 10,000 random cache
-/// lines in each of `offsets`, `edges` and `dist`. In BFS order, nodes a few hops
-/// apart get nearby ids, and the same ball reads a few hundred compact runs.
-/// Returns the renumbered graph and `new_id[old id]`.
+/// Renumbers the nodes so that nodes close in the graph get close ids. Input ids
+/// are a random relabelling, so a Dijkstra ball of 10,000 nodes touched 10,000
+/// random cache lines in each of `offsets`, `edges` and `dist`. Each thread runs a
+/// breadth-first search from its own seed, claiming every node it reaches first
+/// with a compare-and-swap, so the threads carve the graph into compact regions;
+/// new ids go region by region, in BFS order within each, and the same ball then
+/// reads a few hundred compact runs. Nodes no region reached (islands, nodes
+/// without in-edges) come last. Returns the renumbered graph and `new_id[old id]`.
 fn relabel(graph: Graph, threads: usize) -> (Graph, Vec<u32>) {
     let n = graph.offsets.len() - 1;
     let edges_of = |u: u32| &graph.edges[graph.offsets[u as usize] as usize..graph.offsets[u as usize + 1] as usize];
-    let mut new_id = vec![u32::MAX; n];
-    let mut order: Vec<u32> = Vec::with_capacity(n);
-    for root in 0..n as u32 {
-        if new_id[root as usize] != u32::MAX {
-            continue;
-        }
-        new_id[root as usize] = order.len() as u32;
-        order.push(root);
-        let mut head = order.len() - 1;
-        while head < order.len() {
+    let owner: Vec<AtomicU8> = (0..n).map(|_| AtomicU8::new(UNCLAIMED)).collect();
+    let claim = |v: u32, by: usize| {
+        owner[v as usize].load(Relaxed) == UNCLAIMED
+            && owner[v as usize].compare_exchange(UNCLAIMED, by as u8, Relaxed, Relaxed).is_ok()
+    };
+    let grow = |queue: &mut Vec<u32>, by: usize| {
+        let mut head = queue.len() - 1;
+        while head < queue.len() {
             // The queue says which nodes come next: prefetch their offsets and edges
-            // so the misses overlap instead of stalling one after another.
-            if let Some(&ahead) = order.get(head + 16) {
+            // so the cache misses overlap instead of stalling one after another.
+            if let Some(&ahead) = queue.get(head + 16) {
                 prefetch(graph.offsets.get(ahead as usize));
             }
-            if let Some(&ahead) = order.get(head + 8) {
+            if let Some(&ahead) = queue.get(head + 8) {
                 prefetch(graph.edges.get(graph.offsets[ahead as usize] as usize));
             }
-            let u = order[head];
+            let u = queue[head];
             head += 1;
             for &(v, _) in edges_of(u) {
-                if new_id[v as usize] == u32::MAX {
-                    new_id[v as usize] = order.len() as u32;
-                    order.push(v);
+                if claim(v, by) {
+                    queue.push(v);
                 }
             }
         }
+    };
+    let regions = threads.min(UNCLAIMED as usize);
+    let mut order: Vec<u32> = thread::scope(|s| {
+        let handles: Vec<_> = (0..regions)
+            .map(|t| {
+                let (claim, grow) = (&claim, &grow);
+                s.spawn(move || {
+                    let seed = (n * t / regions) as u32;
+                    let mut queue = Vec::new();
+                    if n > 0 && claim(seed, t) {
+                        queue.push(seed);
+                        grow(&mut queue, t);
+                    }
+                    queue
+                })
+            })
+            .collect();
+        handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
+    });
+    for root in 0..n as u32 {
+        if claim(root, 0) {
+            order.push(root);
+            grow(&mut order, 0);
+        }
+    }
+    let mut new_id = vec![0u32; n];
+    for (x, &u) in order.iter().enumerate() {
+        new_id[u as usize] = x as u32;
     }
 
     // Copy every node's edges to its new position, heads renamed, in parallel.
@@ -259,36 +291,63 @@ unsafe impl Sync for SharedEdges {}
 
 /// One thread's reusable Dijkstra state.
 struct Search {
-    /// Distance + 1, or 0 for "not reached". Zero-filled memory comes from calloc,
-    /// so pages of nodes this thread never reaches are never touched or charged.
-    dist: Vec<u64>,
+    /// Distance + 1, or 0 for "not reached", in 32 bits to halve the memory and
+    /// cache footprint. A distance that does not fit (a path through one of the
+    /// weights near 2^32) is stored as BIG with its exact value in `big`. Zero-filled
+    /// memory comes from calloc, so pages this thread never reaches cost nothing.
+    dist: Vec<u32>,
+    big: HashMap<u32, u64>,
     touched: Vec<u32>,
     heap: RadixHeap,
 }
 
+const BIG: u32 = u32::MAX;
+
 impl Search {
     fn new(n: usize) -> Self {
-        Search { dist: vec![0; n], touched: Vec::new(), heap: RadixHeap::new() }
+        Search { dist: vec![0; n], big: HashMap::new(), touched: Vec::new(), heap: RadixHeap::new() }
+    }
+
+    fn get(&self, node: u32) -> u64 {
+        match self.dist[node as usize] {
+            0 => u64::MAX,
+            BIG => self.big[&node],
+            stored => stored as u64 - 1,
+        }
+    }
+
+    fn set(&mut self, node: u32, d: u64) {
+        let slot = &mut self.dist[node as usize];
+        if *slot == 0 {
+            self.touched.push(node);
+        }
+        if d + 1 < BIG as u64 {
+            *slot = d as u32 + 1;
+        } else {
+            *slot = BIG;
+            self.big.insert(node, d);
+        }
     }
 
     fn distance(&mut self, graph: &Graph, source: u32, target: u32) -> i64 {
         if source == target {
             return 0;
         }
-        if graph.has_in[target as usize].load(Relaxed) == 0 {
-            return -1; // nothing points at the target, so no path can end there
+        let leaves = graph.offsets[source as usize + 1] > graph.offsets[source as usize];
+        if graph.has_in[target as usize].load(Relaxed) == 0 || !leaves {
+            return -1; // no path can end at the target, or leave the source
         }
         for &u in &self.touched {
             self.dist[u as usize] = 0;
         }
         self.touched.clear();
+        self.big.clear();
         self.heap.clear();
 
-        self.dist[source as usize] = 1;
-        self.touched.push(source);
+        self.set(source, 0);
         self.heap.push(0, source);
         while let Some((d, u)) = self.heap.pop() {
-            if d + 1 > self.dist[u as usize] {
+            if d > self.get(u) {
                 continue; // stale entry
             }
             if u == target {
@@ -297,12 +356,8 @@ impl Search {
             let range = graph.offsets[u as usize] as usize..graph.offsets[u as usize + 1] as usize;
             for &(v, w) in &graph.edges[range] {
                 let candidate = d + w as u64;
-                let slot = &mut self.dist[v as usize];
-                if *slot == 0 || candidate + 1 < *slot {
-                    if *slot == 0 {
-                        self.touched.push(v);
-                    }
-                    *slot = candidate + 1;
+                if candidate < self.get(v) {
+                    self.set(v, candidate);
                     self.heap.push(candidate, v);
                 }
             }
