@@ -9,8 +9,8 @@
 //!    graph is built in parallel with no per-node allocation.
 //! 3. Nodes are renumbered so that a search's nodes sit close together in memory:
 //!    each thread grows a breadth-first region from its own seed (see `relabel`).
-//! 4. Queries run in parallel, one Dijkstra per query with a radix heap, each
-//!    thread reusing a 32-bit distance array and resetting only what it touched.
+//! 4. Queries run in parallel, one Dijkstra per query with a radix heap and a
+//!    paged distance table that stays in cache (see `Search`).
 //! 5. A target with no in-edges is answered -1 at once: the reference settles the
 //!    whole graph to find that out.
 
@@ -291,25 +291,35 @@ unsafe impl Sync for SharedEdges {}
 
 /// One thread's reusable Dijkstra state.
 struct Search {
-    /// Distance + 1, or 0 for "not reached", in 32 bits to halve the memory and
-    /// cache footprint. A distance that does not fit (a path through one of the
-    /// weights near 2^32) is stored as BIG with its exact value in `big`. Zero-filled
-    /// memory comes from calloc, so pages this thread never reaches cost nothing.
-    dist: Vec<u32>,
+    /// Tentative distances, as distance + 1 in 32 bits (0 = not reached), kept in
+    /// pages of PAGE nodes handed out on first touch. A search reaches thousands
+    /// of nodes that the locality-friendly numbering keeps in a few dozen pages, so
+    /// its working set stays in L2 instead of spreading over one entry per node,
+    /// and a thread's pool is a few MB instead of 7. A distance that does not fit
+    /// (a path through one of the weights near 2^32) is stored as BIG with its
+    /// exact value in `big`.
+    page_of: Vec<u16>, // node >> PAGE_BITS -> pool page + 1, or 0
+    pool: Vec<u32>,
+    used: Vec<u32>, // the node pages in use by this search
     big: HashMap<u32, u64>,
-    touched: Vec<u32>,
     heap: RadixHeap,
 }
 
 const BIG: u32 = u32::MAX;
+const PAGE_BITS: u32 = 12;
+const PAGE: usize = 1 << PAGE_BITS;
 
 impl Search {
     fn new(n: usize) -> Self {
-        Search { dist: vec![0; n], big: HashMap::new(), touched: Vec::new(), heap: RadixHeap::new() }
+        Search { page_of: vec![0; n.div_ceil(PAGE)], pool: Vec::new(), used: Vec::new(), big: HashMap::new(), heap: RadixHeap::new() }
     }
 
     fn get(&self, node: u32) -> u64 {
-        match self.dist[node as usize] {
+        let page = self.page_of[(node >> PAGE_BITS) as usize];
+        if page == 0 {
+            return u64::MAX;
+        }
+        match self.pool[(page as usize - 1) * PAGE + (node as usize & (PAGE - 1))] {
             0 => u64::MAX,
             BIG => self.big[&node],
             stored => stored as u64 - 1,
@@ -317,16 +327,33 @@ impl Search {
     }
 
     fn set(&mut self, node: u32, d: u64) {
-        let slot = &mut self.dist[node as usize];
-        if *slot == 0 {
-            self.touched.push(node);
+        let mut page = self.page_of[(node >> PAGE_BITS) as usize];
+        if page == 0 {
+            self.used.push(node >> PAGE_BITS);
+            page = self.used.len() as u16;
+            self.page_of[(node >> PAGE_BITS) as usize] = page;
+            if self.pool.len() < self.used.len() * PAGE {
+                self.pool.resize(self.used.len() * PAGE, 0);
+            }
         }
+        let slot = &mut self.pool[(page as usize - 1) * PAGE + (node as usize & (PAGE - 1))];
         if d + 1 < BIG as u64 {
             *slot = d as u32 + 1;
         } else {
             *slot = BIG;
             self.big.insert(node, d);
         }
+    }
+
+    /// Returns every page used by the last search, zeroed.
+    fn clear(&mut self) {
+        for &page in &self.used {
+            self.page_of[page as usize] = 0;
+        }
+        self.pool[..self.used.len() * PAGE].fill(0);
+        self.used.clear();
+        self.big.clear();
+        self.heap.clear();
     }
 
     fn distance(&mut self, graph: &Graph, source: u32, target: u32) -> i64 {
@@ -337,13 +364,7 @@ impl Search {
         if graph.has_in[target as usize].load(Relaxed) == 0 || !leaves {
             return -1; // no path can end at the target, or leave the source
         }
-        for &u in &self.touched {
-            self.dist[u as usize] = 0;
-        }
-        self.touched.clear();
-        self.big.clear();
-        self.heap.clear();
-
+        self.clear();
         self.set(source, 0);
         self.heap.push(0, source);
         while let Some((d, u)) = self.heap.pop() {
