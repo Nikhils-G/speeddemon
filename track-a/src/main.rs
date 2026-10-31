@@ -66,7 +66,11 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
             .iter()
             .map(|&chunk| {
                 let start = chunk.as_ptr() as usize - log.as_ptr() as usize;
-                s.spawn(move || parse_chunk(log, start, start + chunk.len(), base))
+                s.spawn(move || {
+                    let part = parse_chunk(log, start, start + chunk.len(), base);
+                    mmap::release(chunk);
+                    part
+                })
             })
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect::<Result<_, _>>()

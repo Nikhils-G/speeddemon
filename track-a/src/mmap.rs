@@ -8,6 +8,24 @@ use std::os::raw::{c_int, c_long, c_void};
 unsafe extern "C" {
     fn mmap(addr: *mut c_void, len: usize, prot: c_int, flags: c_int, fd: c_int, offset: c_long) -> *mut c_void;
     fn prctl(option: c_int, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> c_int;
+    fn madvise(addr: *mut c_void, len: usize, advice: c_int) -> c_int;
+}
+
+/// Drops this process's page-table entries for the whole pages inside `slice`, a
+/// part of a read-only file mapping that is done with. At exit the kernel would
+/// otherwise unmap the 58,000 pages of the input one by one, on one core (about
+/// 9 ms); this does the same work in each parsing thread, in parallel. Reading the
+/// bytes again is still correct: the page faults back in from the page cache.
+pub fn release(slice: &[u8]) {
+    const PAGE: usize = 4096;
+    const MADV_DONTNEED: c_int = 4;
+    let start = (slice.as_ptr() as usize).next_multiple_of(PAGE);
+    let end = (slice.as_ptr() as usize + slice.len()) / PAGE * PAGE;
+    if end > start {
+        // SAFETY: whole pages inside a private, read-only file mapping that is
+        // never written; dropping them loses nothing.
+        unsafe { madvise(start as *mut c_void, end - start, MADV_DONTNEED) };
+    }
 }
 
 const PR_SET_THP_DISABLE: c_int = 41;
