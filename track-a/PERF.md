@@ -17,7 +17,10 @@ each, before pushing.
 | 7 | c9daf53 | p50/p95/p99 by nested selection instead of a full sort; drop the input's page-table entries in each parsing thread instead of at exit | run-73fe01d551bc | 0.0417 | 44.7 | 559 | 71.7 |
 | 8 | 9e3cfa8 | u32 records (latencies of 2^20 − 1 or more escape to a side list); hour runs keyed by the timestamp's first 13 bytes, so no calendar code; keep only per-group statistics, free the records, then write | run-6154ff9e18eb | 0.0377 | 24.3 | 548 | 75.5 |
 | 9 | 96c87ac | Branch-free method and endpoint ends from one 64-byte space mask; 64-byte endpoint keys | run-10fd036ecbb9 | 0.0361 | 24.8 | 565 | 75.8 |
-| 10 | 9b51547 | Output written through a shared mapping instead of one pwrite per hour | (pending) | | | | |
+| 10 | 9b51547 | Output written through a shared mapping instead of one pwrite per hour | run-d92454f8ba54 | 0.0353 | 25.2 | 590 | 75.9 |
+| 11 | 3ffca82 | Endpoint names copied out of the chunk before its pages are dropped | run-e557e7f64a7c | 0.0367 | 26.0 | 595 | 75.3 |
+| 12 | 0030dfe | Exit as soon as the output is written (no frees) | run-bd4492babdc6 | 0.0307 | 26.1 | 595 | 77.2 |
+| 13 | 1d7dbb3, f15bc76 | Each output line built in a stack buffer; groups of up to 32 sorted, not selected; endpoint keys compared inline instead of through `memcmp` | run-9ca9494b04b1 | 0.0299 | 26.1 | 599 | 77.4 |
 
 ## What each step taught
 
@@ -37,6 +40,16 @@ each, before pushing.
   directory the same change measured 1.3 ms slower, on tmpfs 1.6 ms faster (pwrite calls serialise
   on the file's lock; page faults on a shared mapping do not).
 
+- **Step 11** shows the limits of the test server: 36.2 → 29.9 ms there (released pages were
+  faulting back in), no change on the box, where page faults are much cheaper than in the VM.
+- **Step 12 came from measuring the box itself.** The board only reports T, so for one run the
+  program exited right after a phase with the elapsed time as its exit code (0.25 ms units; the
+  board shows a failed run's exit code). Three such runs split A on the box: parse 17.5 ms, merge
+  1.25 ms, pass 2 about 6.75 ms, write about 3.5 ms, and then 4–5 ms of freeing the tables before
+  the process ended. Exiting right after the write took 35.3 → 30.7 ms.
+- **Step 13.** A profile showed 12% of one thread's cycles in libc's `memcmp`: `==` on the 64-byte
+  key array compiled to a library call per line. An XOR fold over the eight words is inline.
+
 ## Experiments that did not make it (measured, reverted)
 
 | Experiment | Result |
@@ -45,6 +58,7 @@ each, before pushing.
 | Releasing the input's pages in pass 2 instead of right after parsing | +1.6 ms: the TLB shootdowns interrupt the other pass-2 threads |
 | Not releasing them at all | +1.3 ms: the exit then unmaps 58,000 pages on one core |
 | `MADV_POPULATE_READ` on each thread's chunk before parsing | 36.4 → 49 ms |
+| Groups up to 16 / 64 sorted instead of 32 | 32 was the best of the three (server, one thread) |
 | Three nested selections read at the end | wrong output: each selection reorders the previous rank's slot. Each value is now read right after its own selection |
 
 ## Correctness checks run before every push

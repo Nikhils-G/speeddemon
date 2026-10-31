@@ -19,6 +19,9 @@ much higher than the box's, so only the board decided what stayed.
 | 9 | 6e3aed6 | Every pair buffer gets its capacity (`vec![v; n]` had cloned them empty) | run-1cd5ca162a83 | 0.0478 | 16.3 | 780 | 69.1 |
 | 10 | 2246001 | Spinning barrier between rounds | run-7ace82c8c895 | 0.0454 | 16.5 | 816 | 69.5 |
 | 11 | a3acbf3 | Partition tables at most half full, with a dense id per name | run-6a39052adf13 | 0.0446 | 17.1 | 815 | 69.5 |
+| 12 | 470e7e3, cb90a23 | Fewer lines: a wrong guessed cut reruns the file as one run (no second splitter); `format!` output; the mapping parsed directly again (pread gave nothing on the box) | run-2b4b2c97a9c1 | 0.0461 | 15.7 | 722 | 69.9 |
+| 13 | 152db08 | The barrier's spin is bounded, then waiters sleep on a condition variable | | | | | |
+| 14 | 0030dfe | Exit as soon as the output is written; each run's pages dropped by the thread that parsed it | run-a476140e0850 | 0.0422 | 15.7 | 744 | 70.8 |
 
 ## What each step taught
 
@@ -35,6 +38,14 @@ much higher than the box's, so only the board decided what stayed.
 - **Step 9** was a plain bug, found by reading: cloning a `Vec` does not keep its capacity, so 63 of
   64 buffers grew by doubling.
 
+- **Step 13** followed a run of the unchanged code that took 0.0778 s instead of 0.045. A thread
+  that loses its core to another process can be starved by eleven spinning siblings; with a
+  bounded spin that cannot happen, and the time is the same.
+- **Step 14 came from measuring the box itself**: for one run the program exited right after a
+  phase with the elapsed time as its exit code (0.25 ms units; the board shows a failed run's exit
+  code). On the box, regions and cuts take 2.25 ms, the parse rounds 36.75 ms (only about 4.5 of
+  them deduplication), and about 6 ms went to the kernel unmapping the 202 MB input at exit.
+
 ## Experiments that did not make it (measured, reverted)
 
 | Experiment | Where measured | Result |
@@ -50,6 +61,7 @@ much higher than the box's, so only the board decided what stayed.
 | Separator offsets written for 4 KB at a time, simdjson stage-1 style | server | instructions +15%, cycles +14% |
 | Rounds 4 / 16 instead of 8 | server | 4: −1 ms but +4 MB; 16: +1.8 ms for −1.7 MB |
 | Runs claimed dynamically within a round | server | no change |
+| Dense name ids from one shared hash table, so pairs are u32 and dedupe needs no probing | server | 12 threads 45 → 67 ms: early inserts contend |
 
 ## Correctness checks run before every push
 
