@@ -38,10 +38,7 @@ const ESCAPE: u32 = ERROR_BIT - 1;
 /// Local endpoint ids must fit the record's 11 bits: the spec has 1,842 endpoints.
 const MAX_ENDPOINTS: u32 = 1 << (32 - ENDPOINT_SHIFT);
 
-static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-
 fn main() {
-    START.get_or_init(std::time::Instant::now);
     mmap::no_huge_pages();
     let mut args = std::env::args().skip(1);
     let data_dir = args.next().unwrap_or_else(|| "/data".into());
@@ -214,10 +211,6 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
             .flat_map(|h| h.join().unwrap())
             .collect()
     });
-    // TEMPORARY box probe (full-size input only): exit code = elapsed 0.25 ms units.
-    if log.len() > 100_000_000 {
-        std::process::exit((START.get().unwrap().elapsed().as_micros() / 250).min(255) as i32);
-    }
     drop(parts);
     stats.sort_unstable_by_key(|&(hour, _, _)| hour);
 
