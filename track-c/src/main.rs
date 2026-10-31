@@ -8,7 +8,7 @@
 //!    terminator by the next record's BOM or id digit, so a cut goes after the first
 //!    LF that is followed by a digit or a BOM. Every cut is then checked: the run
 //!    before it must end exactly there. If one does not (impossible for generator
-//!    data), the cuts are redone from quote parity, which needs only spec 2.1.
+//!    data), the file is parsed again as one run, which needs only spec 2.1.
 //! 3. Each run is parsed 64 bytes at a time with SIMD bitmaps, as simdjson does for
 //!    JSON: one bitmap of `"`, one of `,` and LF, and a carry-less multiply that
 //!    turns the quote bits into an "inside quotes" mask. What is left are exactly
@@ -84,7 +84,10 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
             Err(ParseError::NamesFull) => slots *= 2,
             // A wrong guessed cut shows up as a misaligned run or as a parse error.
             Err(ParseError::Misaligned | ParseError::Bad(_)) if guessed => {
-                (starts, guessed) = (record_starts(records, body_start, units), false);
+                // Fall back to one run over the whole file: exact under spec 2.1.
+                starts = vec![body_start; units];
+                starts.push(records.len());
+                guessed = false;
             }
             Err(ParseError::Misaligned) => {
                 return Err(format!("records.csv: a record is longer than {READ} bytes"));
@@ -103,21 +106,19 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
         if total.count == 0 {
             continue;
         }
-        out.extend_from_slice(&regions.keys[g]);
-        for field in [
-            Field::Int(total.count),
-            Field::Int(total.id_sum),
-            Field::Money(total.amount_sum),
-            Field::Money(total.amount_min),
-            Field::Money(total.amount_max),
-            Field::Int(total.names_distinct),
-            Field::Int(total.name_bytes),
-            Field::Int(total.note_bytes),
-        ] {
-            out.push(b' ');
-            field.write(&mut out);
-        }
-        out.push(b'\n');
+        let t = total;
+        let (sum, min, max) = (
+            money(t.amount_sum),
+            money(t.amount_min),
+            money(t.amount_max),
+        );
+        let key = String::from_utf8_lossy(&regions.keys[g]);
+        let (count, ids, names) = (t.count, t.id_sum, t.names_distinct);
+        let line = format!(
+            "{key} {count} {ids} {sum} {min} {max} {names} {} {}\n",
+            t.name_bytes, t.note_bytes
+        );
+        out.extend_from_slice(line.as_bytes());
     }
     let output_path = format!("{out_dir}/aggregates.txt");
     File::create(&output_path)
@@ -526,38 +527,6 @@ fn skip_header(text: &[u8]) -> Result<usize, String> {
     Ok(start + RECORDS_HEADER.len() + terminator)
 }
 
-/// Splits `text[from..]` into about `parts` runs of whole records and returns their
-/// start offsets, ending with `text.len()`.
-fn record_starts(text: &[u8], from: usize, parts: usize) -> Vec<usize> {
-    let bounds: Vec<usize> = (0..=parts)
-        .map(|p| from + (text.len() - from) * p / parts)
-        .collect();
-    // Pass 1, parallel: quote parity of each raw slice.
-    let odd: Vec<bool> = thread::scope(|s| {
-        let handles: Vec<_> = bounds
-            .windows(2)
-            .map(|w| {
-                s.spawn(move || text[w[0]..w[1]].iter().filter(|&&b| b == b'"').count() % 2 == 1)
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-    let mut starts = vec![from];
-    let mut in_quotes = false;
-    for p in 1..parts {
-        in_quotes ^= odd[p - 1];
-        // Walk to the first LF outside quotes; the record after it starts here.
-        let (mut i, mut quoted) = (bounds[p], in_quotes);
-        while i < text.len() && (quoted || text[i] != b'\n') {
-            quoted ^= text[i] == b'"';
-            i += 1;
-        }
-        starts.push((i + 1).min(text.len()).max(*starts.last().unwrap()));
-    }
-    starts.push(text.len());
-    starts
-}
-
 /// Splits `text[from..]` into `parts` runs at guessed record starts (see the top
 /// of the file), with one pass over a few bytes at each cut.
 fn guessed_starts(text: &[u8], from: usize, parts: usize) -> Vec<usize> {
@@ -868,29 +837,10 @@ fn amount(text: &[u8], s: usize, mut e: usize) -> Option<i64> {
     Some(if negative { -cents } else { cents })
 }
 
-enum Field {
-    Int(u64),
-    Money(i64),
-}
-
-impl Field {
-    fn write(&self, out: &mut Vec<u8>) {
-        match *self {
-            Field::Int(v) => push_decimal(out, v),
-            Field::Money(cents) => {
-                if cents < 0 {
-                    out.push(b'-');
-                }
-                let abs = cents.unsigned_abs();
-                push_decimal(out, abs / 100);
-                out.extend_from_slice(&[
-                    b'.',
-                    b'0' + (abs % 100 / 10) as u8,
-                    b'0' + (abs % 10) as u8,
-                ]);
-            }
-        }
-    }
+/// Cents as money: sign, integer part, two decimals ("-0.05", "0.00").
+fn money(cents: i64) -> String {
+    let (sign, abs) = (if cents < 0 { "-" } else { "" }, cents.unsigned_abs());
+    format!("{sign}{}.{:02}", abs / 100, abs % 100)
 }
 
 /// A wyhash-style 64-bit hash of `text[s..e]`: each 8-byte word goes through a
@@ -919,18 +869,4 @@ fn hash(text: &[u8], s: usize, e: usize) -> u64 {
     }
     let tail = load(at) & ((1 << (8 * (e - at))) - 1);
     mix(h ^ tail ^ P1, P0 ^ (e - s) as u64)
-}
-
-fn push_decimal(out: &mut Vec<u8>, mut value: u64) {
-    let mut digits = [0u8; 20];
-    let mut i = digits.len();
-    loop {
-        i -= 1;
-        digits[i] = b'0' + (value % 10) as u8;
-        value /= 10;
-        if value == 0 {
-            break;
-        }
-    }
-    out.extend_from_slice(&digits[i..]);
 }
