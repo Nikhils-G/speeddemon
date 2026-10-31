@@ -26,8 +26,8 @@ use std::arch::x86_64::*;
 use std::cmp::Reverse;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
-#[cfg(not(target_feature = "avx2"))]
-compile_error!("track-b needs AVX2: build with RUSTFLAGS=\"-C target-cpu=native\"");
+#[cfg(not(all(target_feature = "avx2", target_feature = "bmi2")))]
+compile_error!("track-b needs AVX2 and BMI2: build with RUSTFLAGS=\"-C target-cpu=native\"");
 
 /// A token's info word: its term id, plus ANCHOR if a phrase is anchored on it.
 /// A token that no query uses gets MISS.
@@ -69,7 +69,7 @@ fn main() {
 
     // Sample the start of every slice for each term's document frequency.
     let df: Vec<AtomicU32> = (0..vocab.count).map(|_| AtomicU32::new(0)).collect();
-    let sampled = par(slices.len(), |i| {
+    let sampled = par(slices.len(), &|i| {
         let (start, end, first) = slices[i];
         let stop = line_after(text, start + SAMPLE_BYTES / slices.len()).min(end);
         let scan = Scan::new(&vocab, None, &df).run(docs, start, stop, first);
@@ -79,7 +79,7 @@ fn main() {
     let plan = Plan::new(queries, &df, sampled.iter().sum::<u32>().max(1), threads);
     vocab.finish(&plan);
 
-    let results = par(slices.len(), |i| {
+    let results = par(slices.len(), &|i| {
         let (start, end, first) = slices[i];
         let scan = Scan::new(&vocab, Some(&plan), &[]).run(docs, start, end, first);
         // Drop the slice's pages now, in parallel, instead of the kernel
@@ -100,9 +100,38 @@ fn main() {
         (scan.answers.state, log)
     });
 
-    // Format in parallel, one range of lines per thread.
-    let (lines, parts) = (plan.lines, slices.len().max(1));
-    let chunks = par(parts, |p| format_lines(&results, &plan.answer_of, part(lines, p, parts)));
+    // Format in parallel, one range of lines per thread. Per line: the threads'
+    // counts and sums added up (from the state of its answer: no copy of the
+    // states, which would cost 4.5 MB), then the first ten ids taken from the
+    // threads in slice order. The packed states add up as they are: all ids are
+    // below 2^20, so any sum of them is below 2^39 and never carries into the count.
+    let parts = slices.len().max(1);
+    let chunks = par(parts, &|p| {
+        let lines = part(plan.answer_of.len(), p, parts);
+        let (mut out, mut fields) = (Vec::with_capacity(lines.len() * 32), Vec::new());
+        let first = |log: &Vec<u64>| log.partition_point(|&e| e >> 32 < lines.start as u64);
+        let mut cursors: Vec<usize> = results.iter().map(|r| first(&r.1)).collect();
+        for line in lines {
+            let s: u64 = results
+                .iter()
+                .map(|r| r.0[plan.answer_of[line] as usize])
+                .sum();
+            fields.clear();
+            fields.extend([s >> SUM_BITS, s & ((1 << SUM_BITS) - 1)]);
+            for ((_, log), cursor) in results.iter().zip(&mut cursors) {
+                while let Some(&entry) = log.get(*cursor).filter(|&&e| e >> 32 == line as u64) {
+                    fields.push(entry & u32::MAX as u64);
+                    *cursor += 1;
+                }
+            }
+            for &value in fields.iter().take(12) {
+                push_decimal(&mut out, value);
+                out.push(b' ');
+            }
+            *out.last_mut().unwrap() = b'\n';
+        }
+        out
+    });
     let mut file = std::fs::File::create(format!("{out_dir}/results.txt")).expect("results.txt");
     for chunk in chunks {
         std::io::Write::write_all(&mut file, &chunk).expect("write results.txt");
@@ -112,8 +141,7 @@ fn main() {
 }
 
 /// f(0), f(1), ... f(n - 1), each on its own thread.
-fn par<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
-    let f = &f;
+fn par<T: Send>(n: usize, f: &(impl Fn(usize) -> T + Sync)) -> Vec<T> {
     std::thread::scope(|s| {
         let threads: Vec<_> = (0..n).map(|i| s.spawn(move || f(i))).collect();
         threads.into_iter().map(|t| t.join().unwrap()).collect()
@@ -125,41 +153,10 @@ fn part(len: usize, p: usize, parts: usize) -> std::ops::Range<usize> {
     len * p / parts..len * (p + 1) / parts
 }
 
-/// The output for `lines`: per line, the threads' counts and sums added up (from
-/// the state of its answer: no copy of the states, which would cost 4.5 MB), and
-/// the first ten ids taken from the threads in slice order.
-fn format_lines(results: &[(Vec<u64>, Vec<u64>)], answer_of: &[u32], lines: std::ops::Range<usize>) -> Vec<u8> {
-    // Per line: the count, the sum, then the first ids.
-    let (mut out, mut fields) = (Vec::with_capacity(lines.len() * 32), Vec::new());
-    let first = |log: &Vec<u64>| log.partition_point(|&e| e >> 32 < lines.start as u64);
-    let mut cursors: Vec<usize> = results.iter().map(|r| first(&r.1)).collect();
-    for line in lines {
-        fields.clear();
-        fields.extend([0, 0]);
-        for ((state, log), cursor) in results.iter().zip(&mut cursors) {
-            let s = state[answer_of[line] as usize];
-            (fields[0], fields[1]) = (fields[0] + (s >> SUM_BITS), fields[1] + (s & ((1 << SUM_BITS) - 1)));
-            while let Some(&entry) = log.get(*cursor).filter(|&&e| e >> 32 == line as u64) {
-                fields.push(entry & u32::MAX as u64);
-                *cursor += 1;
-            }
-        }
-        for &value in fields.iter().take(12) {
-            push_decimal(&mut out, value);
-            out.push(b' ');
-        }
-        *out.last_mut().unwrap() = b'\n';
-    }
-    out
-}
-
-struct Queries {
-    /// Per line of queries.txt: its terms `terms[start..start + len]`, and
-    /// whether it is a phrase.
-    lines: Vec<(u32, u32, bool)>,
-    /// BOOL terms as `id | op << 30`, the first with OR; phrase terms as ids.
-    terms: Vec<u32>,
-}
+/// `(spans, terms)`. Per line of queries.txt, its span `(start, len, phrase)`:
+/// its terms `terms[start..start + len]`, and whether it is a phrase. The terms
+/// are BOOL terms as `id | op << 30`, the first with OR, and phrase terms as ids.
+type Queries = (Vec<(u32, u32, bool)>, Vec<u32>);
 
 /// Splits `chunk`, whole lines of `padded` (the file and mmap::PAD zero bytes),
 /// into its lines, as in `Queries` but from 0, and their terms: each with its
@@ -169,12 +166,12 @@ fn split_lines(chunk: &'static [u8], padded: &'static [u8]) -> Split {
     for line in chunk.split_inclusive(|&b| b == b'\n') {
         let line = line.strip_suffix(b"\n").unwrap_or(line);
         let bad = || -> ! { panic!("queries.txt: bad query {:?}", String::from_utf8_lossy(line)) };
+        // Panics unless ok.
+        let check = |ok: bool| ok || bad();
         let start = terms.len();
         let mut term = |term: &'static [u8], op: u32| {
             let ok = term.iter().all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9'));
-            if !ok || !(1..=MAX_TERM).contains(&term.len()) {
-                bad();
-            }
+            check(ok && (1..=MAX_TERM).contains(&term.len()));
             let at = term.as_ptr() as usize - padded.as_ptr() as usize;
             // Length 0 gives the zero key, which marks a long term.
             let key = key_at(padded, at, if term.len() > KEY { 0 } else { term.len() });
@@ -186,12 +183,9 @@ fn split_lines(chunk: &'static [u8], padded: &'static [u8]) -> Split {
             loop {
                 term(words.next().unwrap_or_else(|| bad()), op);
                 let Some(word) = words.next() else { break };
-                op = match word {
-                    b"AND" => AND,
-                    b"OR" => OR,
-                    b"NOT" => NOT,
-                    _ => bad(),
-                };
+                // An op's index here is its code; " " is never a word.
+                let ops: [&[u8]; 4] = [b"AND", b"NOT", b" ", b"OR"];
+                op = ops.iter().position(|&o| o == word).unwrap_or_else(|| bad()) as u32;
             }
         } else {
             let inner = line.strip_prefix(b"PHRASE \"").unwrap_or_else(|| bad());
@@ -199,9 +193,7 @@ fn split_lines(chunk: &'static [u8], padded: &'static [u8]) -> Split {
             inner.split(|&b| b == b' ').for_each(|word| term(word, 0));
         }
         let (len, phrase) = (terms.len() - start, !line.starts_with(b"BOOL "));
-        if !phrase && len > MAX_BOOL_TERMS {
-            bad();
-        }
+        check(phrase || len <= MAX_BOOL_TERMS);
         lines.push((start as u32, len as u32, phrase));
     }
     (lines, terms)
@@ -214,7 +206,7 @@ type Split = (Vec<(u32, u32, bool)>, Vec<(&'static [u8], __m128i, u32)>);
 fn parse_queries(padded: &'static [u8], threads: usize) -> (Queries, Vocab) {
     let text = &padded[..padded.len() - mmap::PAD];
     let cut = |p: usize| cut(text, p, threads);
-    let splits = par(threads, |p| split_lines(&text[cut(p)..cut(p + 1)], padded));
+    let splits = par(threads, &|p| split_lines(&text[cut(p)..cut(p + 1)], padded));
     // The term table is sized for about 1.5 distinct terms per query, about 2.3
     // per bucket (2 MB for 50,000 queries): twice that is 1% faster but 2 MB more
     // memory. It still grows if there are more terms.
@@ -228,16 +220,14 @@ fn parse_queries(padded: &'static [u8], threads: usize) -> (Queries, Vocab) {
         let base = terms.len() as u32;
         lines.extend(chunk_lines.iter().map(|&(s, n, p)| (base + s, n, p)));
         for &(term, key, op) in chunk_terms {
-            if let Some(&(_, key, _)) = ahead.next() {
-                // SAFETY: a prefetch of a bucket of the table (a 32-bit CRC, so
-                // hash >> shift < buckets.len()); a prefetch never faults anyway.
-                let bucket = vocab.buckets.as_ptr().wrapping_add(vocab.home(parts(key)));
-                unsafe { _mm_prefetch::<_MM_HINT_T0>(bucket as *const i8) };
-            }
+            // A bucket of the table: a 32-bit CRC, so hash >> shift < buckets.len().
+            // (The last 16 terms fetch their own.)
+            let ahead = ahead.next().map_or(key, |a| a.1);
+            prefetch(vocab.buckets.as_ptr(), vocab.home(parts(ahead)));
             terms.push(vocab.intern(term, key) | op);
         }
     }
-    (Queries { lines, terms }, vocab)
+    ((lines, terms), vocab)
 }
 
 #[derive(Clone, Copy, Default)]
@@ -265,19 +255,18 @@ fn find(buckets: *const Bucket, mask: usize, mut b: usize, key: __m128i) -> u32 
         // SAFETY: two 32-byte loads that cover the 64-byte bucket.
         let ptr = slots.as_ptr() as *const __m256i;
         let half = |i| unsafe { _mm256_cmpeq_epi32(_mm256_loadu_si256(ptr.add(i)), wide) };
-        let m = movemask_ps(half(0)) | movemask_ps(half(1)) << 8;
-        // Slot j matches when its 3 key dwords do: bits 4j..4j + 3 of m.
-        // Adding 1 to such a run of ones carries into bit 4j + 3.
-        let hit = (((m & 0x7777) + 0x1111) & 0x8888) as u64;
-        let info = slots[hit.trailing_zeros() as usize / 4 & 3].info;
+        let m = movemask(half(0)) as u64 | (movemask(half(1)) as u64) << 32;
+        // Slot j matches when its 3 key dwords do: bits 16j..16j + 12 of m.
+        // Adding 1 to such a run of ones carries into bit 16j + 12.
+        let hit = ((m & 0x0FFF_0FFF_0FFF_0FFF) + 0x0001_0001_0001_0001) & 0x1000_1000_1000_1000;
+        let info = slots[hit.trailing_zeros() as usize / 16 & 3].info;
         // Without a branch (whether and where a key hits is random), except on
         // a miss in a full bucket: slots fill in order and are never removed,
         // so a free last slot ends the probe.
-        if if_zero(hit, slots[3].lo, 0) != 0 {
-            b = (b + 1) & mask;
-            continue;
+        if if_zero(hit, slots[3].lo, 0) == 0 {
+            return if_zero(hit, MISS as u64, info as u64) as u32;
         }
-        return if_zero(hit, MISS as u64, info as u64) as u32;
+        b = (b + 1) & mask;
     }
 }
 
@@ -383,10 +372,9 @@ impl Vocab {
     #[cold]
     #[inline(never)]
     fn get_long(&self, token: &[u8]) -> u32 {
-        let mut lower = [0u8; MAX_TERM];
-        let Some(lower) = lower.get_mut(..token.len()) else {
-            return MISS;
-        };
+        // A token is at most 64 bytes (its length comes from a 64-bit mask); one
+        // longer than MAX_TERM is in no table.
+        let lower = &mut [0u8; 64][..token.len()];
         lower.copy_from_slice(token);
         lower.make_ascii_lowercase();
         self.long.get(&*lower).copied().unwrap_or(MISS)
@@ -406,15 +394,6 @@ struct Entry {
     earlier: u32,
 }
 
-#[derive(Clone, Copy, Default)]
-struct Anchored {
-    answer: u32,
-    /// The anchor's position in the phrase.
-    offset: u32,
-    start: u32,
-    len: u32,
-}
-
 /// What the scan does with each query, decided from the sample.
 #[derive(Default)]
 struct Plan {
@@ -427,16 +406,17 @@ struct Plan {
     rows: usize,
     /// Phrases anchored on term t: `anchored[anchor[t]..anchor[t + 1]]`.
     anchor: Vec<u32>,
-    anchored: Vec<Anchored>,
+    /// Per phrase: `(answer, offset, start, len)`, its answer, the anchor's
+    /// position in the phrase, and its terms `terms[start..start + len]`.
+    anchored: Vec<(u32, u32, u32, u32)>,
     /// The queries' term words, with the new ids.
     terms: Vec<u32>,
     /// The info word of each term, by its old id: its new id, and ANCHOR.
     info: Vec<u32>,
     /// The BOOL terms have the new ids 0..nb.
     nb: usize,
-    /// The number of lines, which is also the number of answers.
-    lines: usize,
-    /// Each line's answer, the index of its state in each thread, and back.
+    /// Each line's answer, the index of its state in each thread, and back (one
+    /// answer per line).
     answer_of: Vec<u32>,
     line_of: Vec<u32>,
 }
@@ -445,25 +425,23 @@ impl Plan {
     /// `sample_df` counts the documents of each term in a sample of `sampled`
     /// documents (at least 1). The per-line work runs on `parts` threads, a
     /// range of lines each.
-    fn new(q: Queries, sample_df: &[u32], sampled: u32, parts: usize) -> Self {
-        let lines = q.lines.len();
-        let line_terms = |start: u32, len: u32| &q.terms[start as usize..(start + len) as usize];
+    fn new((spans, mut terms): Queries, sample_df: &[u32], sampled: u32, parts: usize) -> Self {
+        let lines = spans.len();
+        let line_terms = |start: u32, len: u32| &terms[start as usize..(start + len) as usize];
         // The expected share of 64-document blocks that contain t: the cost of
         // triggering on it.
         let cost = |t: u32| 1.0 - (1.0 - sample_df[t as usize] as f64 / sampled as f64).powi(64);
         // Whether each line is a BOOL query evaluated in every superblock.
         let always_line = |line: usize| {
-            let (start, len, phrase) = q.lines[line];
-            !phrase && {
-                let (cover, n) = cover(line_terms(start, len), cost);
-                cover[..n].iter().map(|&t| cost(t)).sum::<f64>() > ALWAYS
-            }
+            let (start, len, phrase) = spans[line];
+            let (cover, n) = cover(line_terms(start, len), cost);
+            !phrase && cover[..n].iter().map(|&t| cost(t)).sum::<f64>() > ALWAYS
         };
         let always_part = |p| part(lines, p, parts).map(always_line).collect::<Vec<_>>();
-        let always_lines = par(parts, always_part).concat();
+        let always_lines = par(parts, &always_part).concat();
         // Per old id: bit 0 for a BOOL term, bit 1 for a term of an `always` query.
         let mut kind = vec![0u8; sample_df.len()];
-        for (&(start, len, _), &always) in q.lines.iter().zip(&always_lines).filter(|l| !l.0.2) {
+        for (&(start, len, _), &always) in spans.iter().zip(&always_lines).filter(|l| !l.0.2) {
             for &word in line_terms(start, len) {
                 kind[(word & TERM) as usize] |= 1 | (always as u8) << 1;
             }
@@ -480,7 +458,6 @@ impl Plan {
         for (id, &old) in order.iter().enumerate() {
             rank[old as usize] = id as u32;
         }
-        let mut terms = q.terms;
         for word in &mut terms {
             *word = rank[(*word & TERM) as usize] | *word & !TERM;
         }
@@ -489,20 +466,14 @@ impl Plan {
         let lines_part = |p: usize| {
             let (mut by_trigger, mut by_anchor, mut always) = (Vec::new(), Vec::new(), Vec::new());
             for line in part(lines, p, parts) {
-                let (start, len, phrase) = q.lines[line];
+                let (start, len, phrase) = spans[line];
                 let words = &terms[start as usize..(start + len) as usize];
                 let answer = line as u32; // renumbered below
                 if phrase {
                     // The first of the rarest terms.
                     let rarest = |&k: &usize| sample_df[order[words[k] as usize] as usize];
                     let offset = (0..words.len()).min_by_key(rarest).unwrap();
-                    let anchored = Anchored {
-                        answer,
-                        offset: offset as u32,
-                        start,
-                        len,
-                    };
-                    by_anchor.push((words[offset], anchored));
+                    by_anchor.push((words[offset], (answer, offset as u32, start, len)));
                     continue;
                 }
                 // Padded with AND of the all-ones slot (or row).
@@ -519,17 +490,16 @@ impl Plan {
                 }
                 let (cover, n) = cover(words, cost);
                 for (i, &c) in cover[..n].iter().enumerate() {
-                    entry.earlier = 0;
-                    for (k, &word) in words.iter().enumerate() {
-                        entry.earlier |= (cover[..i].contains(&(word & TERM)) as u32) << k;
-                    }
+                    // Bit k: term k is in cover[..i] (the bits are distinct, so + is |).
+                    let early = |k: usize| (cover[..i].contains(&(words[k] & TERM)) as u32) << k;
+                    entry.earlier = (0..words.len()).map(early).sum();
                     by_trigger.push((c, entry));
                 }
             }
             (by_trigger, by_anchor, always)
         };
         let (mut by_trigger, mut by_anchor, mut always) = (Vec::new(), Vec::new(), Vec::new());
-        for (t, a, e) in par(parts, lines_part) {
+        for (t, a, e) in par(parts, &lines_part) {
             (by_trigger.extend(t), by_anchor.extend(a), always.extend(e));
         }
         // By length and operators, so that `end_super` predicts its branches.
@@ -552,11 +522,10 @@ impl Plan {
         always.iter_mut().for_each(|e| number(&mut e.answer));
         plan.entries.iter_mut().for_each(|e| number(&mut e.answer));
         // Every line has an entry (a cover has at least one term) or is a phrase.
-        plan.anchored.iter_mut().for_each(|a| number(&mut a.answer));
+        plan.anchored.iter_mut().for_each(|a| number(&mut a.0));
         let flag = |id: usize| (plan.anchor[id] != plan.anchor[id + 1]) as u32 * ANCHOR;
         plan.info = rank.iter().map(|&id| id | flag(id as usize)).collect();
-        (plan.always, plan.terms) = (always, terms);
-        (plan.rows, plan.nb, plan.lines) = (rows, nb, lines);
+        (plan.always, plan.terms, plan.rows, plan.nb) = (always, terms, rows, nb);
         plan
     }
 }
@@ -625,6 +594,7 @@ struct Scan<'a> {
 impl<'a> Scan<'a> {
     fn new(vocab: &'a Vocab, plan: Option<&'a Plan>, df: &'a [AtomicU32]) -> Self {
         let (nb, rows) = plan.map_or((0, 0), |p| (p.nb, p.rows));
+        let answers = plan.map_or(0, |p| p.line_of.len());
         let (mut w, mut wide) = (written_zeros(nb + 2), vec![Row([0; 4]); rows + 2]);
         (w[nb + 1], wide[rows + 1]) = (!0, Row([!0; 4]));
         Scan {
@@ -640,7 +610,12 @@ impl<'a> Scan<'a> {
             toks: Vec::new(),
             anchors: Vec::new(),
             doc: 0,
-            answers: Answers::new(plan.map_or(0, |p| p.lines)),
+            answers: Answers {
+                state: written_zeros(answers),
+                // One more: `add` always writes the slot after the logged ids.
+                log: vec![0; answers * 10 + 1],
+                logged: 0,
+            },
             last: vec![u32::MAX; plan.map_or(0, |p| p.anchored.len())],
         }
     }
@@ -650,13 +625,12 @@ impl<'a> Scan<'a> {
         self.doc = first.wrapping_sub(1);
         // `line`: bit 0 is set when the next chunk starts a line, as the slice does.
         let (mut bit, mut carry, mut line) = (0u64, 0u64, 1u64);
-        let mut mask = token_mask(docs, start, end);
+        let (mut mask, mut lf) = masks(docs, start, end);
         for at in (start..end).step_by(64) {
-            let next = token_mask(docs, at + 64, end);
+            let (next, next_lf) = masks(docs, at + 64, end);
             let mut starts = mask & !(mask << 1 | carry);
             carry = mask >> 63;
             // The id tokens: those that start a line.
-            let lf = byte_mask(docs, at, b'\n');
             let mut ids = starts & (lf << 1 | line);
             line = lf >> 63;
             // A token is at most 32 bytes (longer ones match no term), so it
@@ -683,9 +657,8 @@ impl<'a> Scan<'a> {
                     let token = if len <= KEY {
                         let key = key_at(docs, p, len);
                         let b = (hash(parts(key)) >> shift) as usize;
-                        // SAFETY: a prefetch of a bucket of the table (a 32-bit CRC, so
-                        // b < buckets.len()); a prefetch never faults anyway.
-                        unsafe { _mm_prefetch::<_MM_HINT_T0>(buckets.add(b) as *const i8) };
+                        // A bucket of the table: a 32-bit CRC, so b < buckets.len().
+                        prefetch(buckets, b);
                         (key, b as u64)
                     } else {
                         let info = self.vocab.get_long(&docs[p..p + len]) as u64;
@@ -706,12 +679,14 @@ impl<'a> Scan<'a> {
                 starts &= starts - 1;
                 let len = (!shifted(b)).trailing_zeros() as usize;
                 let p = at + b as usize;
-                assert!(docs[p + len] == b'\t', "docs.txt: no TAB after an id");
-                self.look_up(bit);
-                // End the current document at the id token of the next one.
                 let id = parse_id(&docs[p..p + len]);
-                let ok = id == self.doc.wrapping_add(1);
-                assert!(ok, "docs.txt: ids must be 0, 1, 2, ... in order");
+                let ok = docs[p + len] == b'\t' && id == self.doc.wrapping_add(1);
+                assert!(
+                    ok,
+                    "docs.txt: ids must be 0, 1, 2, ... in order, each before a TAB"
+                );
+                // End the current document at the id token of the next one.
+                self.look_up(bit);
                 self.end_doc();
                 if id % 64 == 0 && self.n > 0 {
                     self.end_block(id - 64);
@@ -724,7 +699,7 @@ impl<'a> Scan<'a> {
                 self.doc = id;
                 bit = 1 << (id % 64);
             }
-            mask = next;
+            (mask, lf) = (next, next_lf);
         }
         self.look_up(bit);
         self.end_doc();
@@ -781,30 +756,26 @@ impl<'a> Scan<'a> {
 
     fn end_doc(&mut self) {
         let doc = self.doc;
-        match self.plan {
-            None => {
-                self.toks.sort_unstable();
-                self.toks.dedup();
-                for &t in self.toks.iter().filter(|&&t| t != MISS) {
-                    self.df[t as usize].fetch_add(1, Relaxed);
-                }
-            }
-            Some(plan) => {
-                for &at in &self.anchors {
-                    let anchor = self.toks[at as usize] as usize;
-                    for i in plan.anchor[anchor] as usize..plan.anchor[anchor + 1] as usize {
-                        let a = plan.anchored[i];
-                        let Some(from) = (at as usize).checked_sub(a.offset as usize) else {
-                            continue;
-                        };
-                        let phrase = &plan.terms[a.start as usize..(a.start + a.len) as usize];
-                        let hit = self.toks.get(from..from + phrase.len()) == Some(phrase);
-                        if hit && self.last[i] != doc {
-                            self.last[i] = doc;
-                            self.answers.add(a.answer, 1 << (doc % 64), doc & !63);
-                        }
+        if let Some(plan) = self.plan {
+            for &at in &self.anchors {
+                let anchor = self.toks[at as usize] as usize;
+                for i in plan.anchor[anchor] as usize..plan.anchor[anchor + 1] as usize {
+                    let (answer, offset, start, len) = plan.anchored[i];
+                    let phrase = &plan.terms[start as usize..(start + len) as usize];
+                    let from = (at as usize).checked_sub(offset as usize);
+                    let hit = from.and_then(|f| self.toks.get(f..f + phrase.len())) == Some(phrase);
+                    if hit && self.last[i] != doc {
+                        self.last[i] = doc;
+                        self.answers.add(answer, 1 << (doc % 64), doc & !63);
                     }
                 }
+            }
+        } else {
+            // The sample: count the document's distinct terms.
+            self.toks.sort_unstable();
+            self.toks.dedup();
+            for &t in self.toks.iter().filter(|&&t| t != MISS) {
+                self.df[t as usize].fetch_add(1, Relaxed);
             }
         }
         self.toks.clear();
@@ -826,32 +797,27 @@ impl<'a> Scan<'a> {
             let (entries, work) = (plan.entries.as_ptr(), self.work.as_mut_ptr());
             let mut m = 0;
             for (i, &t) in touched.iter().enumerate() {
-                // SAFETY: touched slots are at most nb, group has nb + 2 entries,
-                // and work has room for every touched slot. The prefetches are of
-                // the plan's arrays (an empty range fetches entry 0 instead, which
-                // stays in L1); a prefetch never faults anyway.
-                let (from, to) = unsafe {
-                    _mm_prefetch::<_MM_HINT_T0>(group.add(*touched.get(i + 16).unwrap_or(&0) as usize) as *const i8);
-                    let (from, to) = (*group.add(t as usize), *group.add(t as usize + 1));
-                    _mm_prefetch::<_MM_HINT_T0>(entries.add(if_zero((from ^ to) as u64, 0, from as u64) as usize) as *const i8);
-                    work.add(m).write((from, to));
-                    (from, to)
-                };
+                prefetch(group, *touched.get(i + 16).unwrap_or(&0) as usize);
+                // SAFETY: touched slots are at most nb, and group has nb + 2 entries.
+                let (from, to) = unsafe { (*group.add(t as usize), *group.add(t as usize + 1)) };
+                // An empty range fetches entry 0 instead, which stays in L1.
+                let first = if_zero((from ^ to) as u64, 0, from as u64);
+                prefetch(entries, first as usize);
+                // SAFETY: work has room for every touched slot.
+                unsafe { work.add(m).write((from, to)) };
                 m += (from != to) as usize;
             }
             // SAFETY: the first m ranges were written.
             unsafe { self.work.set_len(m) };
             let state = self.answers.state.as_ptr();
             for (k, &(from, to)) in self.work.iter().enumerate() {
-                // SAFETY: prefetches; the plan's slots are below w.len() and its
-                // answers below state.len(), and the first pass fetched the entry.
-                unsafe {
-                    let e = &*entries.add(self.work.get(k + 4).map_or(0, |r| r.0) as usize);
-                    for &word in &e.terms {
-                        _mm_prefetch::<_MM_HINT_T0>(w.as_ptr().add((word & TERM) as usize) as *const i8);
-                    }
-                    _mm_prefetch::<_MM_HINT_T0>(state.add(e.answer as usize) as *const i8);
+                // SAFETY: an entry of the plan (entry 0 at the end), which the first
+                // pass fetched.
+                let e = unsafe { &*entries.add(self.work.get(k + 4).map_or(0, |r| r.0) as usize) };
+                for &word in &e.terms {
+                    prefetch(w.as_ptr(), (word & TERM) as usize);
                 }
+                prefetch(state, e.answer as usize);
                 // SAFETY: group holds ranges of entries.
                 for e in unsafe { plan.entries.get_unchecked(from as usize..to as usize) } {
                     // All ones when bit 0 of b is set: bit(op) for NOT and OR,
@@ -914,9 +880,7 @@ impl<'a> Scan<'a> {
 /// `len` zeros, written now: a lazily zeroed page that is read first faults
 /// again when written, and that fault flushes the TLB of every thread.
 fn written_zeros(len: usize) -> Vec<u64> {
-    let mut zeros = Vec::with_capacity(len);
-    zeros.resize(len, std::hint::black_box(0));
-    zeros
+    std::iter::repeat_n(std::hint::black_box(0), len).collect()
 }
 
 /// One `wide` row, aligned for 32-byte loads.
@@ -935,15 +899,6 @@ struct Answers {
 }
 
 impl Answers {
-    fn new(answers: usize) -> Self {
-        Answers {
-            state: written_zeros(answers),
-            // One more: `add` always writes the slot after the logged ids.
-            log: vec![0; answers * 10 + 1],
-            logged: 0,
-        }
-    }
-
     /// Adds the documents `base + i` for each bit i of `hits`, which may be 0.
     fn add(&mut self, answer: u32, hits: u64, base: u32) {
         // SAFETY: answers index the state; an answer logs at most 10 ids, so
@@ -956,11 +911,9 @@ impl Answers {
         // SAFETY: as above.
         unsafe { *log.add(self.logged) = entry(hits) };
         self.logged += (count < 10 && hits != 0) as usize;
-        let mut rest = hits & hits.wrapping_sub(1);
-        for _ in count + 1..10 {
-            if rest == 0 {
-                break;
-            }
+        // Then up to 10 in all, while hits are left.
+        let (n, mut rest) = (hits.count_ones() as u64, hits & hits.wrapping_sub(1));
+        for _ in count + 1..(count + n).min(10) {
             // SAFETY: as above.
             unsafe { *log.add(self.logged) = entry(rest) };
             self.logged += 1;
@@ -971,25 +924,21 @@ impl Answers {
         // ..., 0xFFFF_FFFF_0000_0000), constants once the loop is unrolled.
         let digit = |j: u32| !0u64 / ((1 << (1 << j)) + 1) << (1 << j);
         let positions = (0..6).map(|j| ((hits & digit(j)).count_ones() as u64) << j);
-        let n = hits.count_ones() as u64;
         *s += n << SUM_BITS | (n * base as u64 + positions.sum::<u64>());
     }
 
     /// `add` for the 256 documents from `base`, one word of `hits` per 64.
     fn add_wide(&mut self, answer: u32, hits: __m256i, base: u32) {
-        if self.state[answer as usize] >> SUM_BITS < 10 {
+        if self.state[answer as usize] >> SUM_BITS >= 10 {
+            let (n, positions) = count_positions(hits);
+            self.state[answer as usize] += n << SUM_BITS | (n * base as u64 + positions);
             // SAFETY: AVX2 is enabled for the whole build.
-            if unsafe { _mm256_testz_si256(hits, hits) } == 1 {
-                return;
-            }
+        } else if unsafe { _mm256_testz_si256(hits, hits) } == 0 {
             // Still logging first ids: a word at a time.
             // SAFETY: __m256i and [u64; 4] have the same size, and any bits are valid.
             let words: [u64; 4] = unsafe { std::mem::transmute(hits) };
             (0..4).for_each(|i| self.add(answer, words[i], base + 64 * i as u32));
-            return;
         }
-        let (n, positions) = count_positions(hits);
-        self.state[answer as usize] += n << SUM_BITS | (n * base as u64 + positions);
     }
 }
 
@@ -1020,11 +969,8 @@ fn count_positions(v: __m256i) -> (u64, u64) {
         let counts = _mm256_madd_epi16(_mm256_maddubs_epi16(count, ones8), ones16);
         let pos = _mm256_madd_epi16(pos, ones16);
         let sums = _mm256_add_epi32(pos, _mm256_slli_epi32::<16>(counts));
-        let s = _mm256_castsi256_si128(sums);
-        let s = _mm_add_epi32(s, _mm256_extracti128_si256::<1>(sums));
-        let s = _mm_add_epi32(s, _mm_shuffle_epi32::<0b01_00_11_10>(s));
-        let s = _mm_add_epi32(s, _mm_shuffle_epi32::<0b10_11_00_01>(s));
-        let total = _mm_cvtsi128_si32(s) as u64;
+        // The eight 32-bit sums added up (they cannot overflow 32 bits).
+        let total = std::mem::transmute::<_, [u32; 8]>(sums).iter().sum::<u32>() as u64;
         (total >> 16, total & 0xFFFF)
     }
 }
@@ -1035,23 +981,14 @@ static EIGHT_B: [u8; 32] = [
     176, 184, 192, 200, 208, 216, 224, 232, 240, 248,
 ];
 
-/// Bit i is set when byte `at + i` is `byte`.
-fn byte_mask(docs: &[u8], at: usize, byte: u8) -> u64 {
-    // SAFETY: unaligned 32-byte loads from 32-byte slices; AVX2 is enabled for the whole build.
-    let half = |at: usize| unsafe {
-        let v = _mm256_loadu_si256(docs[at..at + 32].as_ptr() as *const __m256i);
-        movemask(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(byte as i8)))
-    };
-    half(at) as u64 | (half(at + 32) as u64) << 32
-}
-
-/// Bit i is set when byte `at + i` is a token byte ([A-Za-z0-9]) before `end`.
-fn token_mask(docs: &[u8], at: usize, end: usize) -> u64 {
+/// The masks of the 64 bytes from `at`: bit i of the first is set when byte
+/// `at + i` is a token byte ([A-Za-z0-9]) before `end`, of the second when it is LF.
+fn masks(docs: &[u8], at: usize, end: usize) -> (u64, u64) {
     let half = |at: usize| {
         let bytes = &docs[at..at + 32];
         // SAFETY: an unaligned 32-byte load from a 32-byte slice; AVX2 is enabled
         // for the whole build.
-        movemask(unsafe {
+        let (token, lf) = unsafe {
             let v = _mm256_loadu_si256(bytes.as_ptr() as *const __m256i);
             let at_least = |x, lo: u8| _mm256_cmpgt_epi8(x, _mm256_set1_epi8(lo as i8 - 1));
             let at_most = |x, hi: u8| _mm256_cmpgt_epi8(_mm256_set1_epi8(hi as i8 + 1), x);
@@ -1059,22 +996,22 @@ fn token_mask(docs: &[u8], at: usize, end: usize) -> u64 {
             // Signed compares: bytes 0x80 and up are negative, never letters or
             // digits. Letters are tested on v | 0x20, digits on the raw byte.
             let letter = between(_mm256_or_si256(v, _mm256_set1_epi8(0x20)), b'a', b'z');
-            _mm256_or_si256(letter, between(v, b'0', b'9'))
-        })
+            let lf = _mm256_cmpeq_epi8(v, _mm256_set1_epi8(b'\n' as i8));
+            (_mm256_or_si256(letter, between(v, b'0', b'9')), lf)
+        };
+        (movemask(token) as u64, movemask(lf) as u64)
     };
-    let mask = half(at) as u64 | (half(at + 32) as u64) << 32;
-    match end.saturating_sub(at) {
-        64.. => mask,
-        left => mask & ((1 << left) - 1),
-    }
+    let ((token0, lf0), (token1, lf1)) = (half(at), half(at + 32));
+    // SAFETY: BMI2 is enabled for the whole build. bzhi keeps the bits below
+    // its index, all of them from 64 on.
+    let token = unsafe { _bzhi_u64(token0 | token1 << 32, end.saturating_sub(at).min(64) as u32) };
+    (token, lf0 | lf1 << 32)
 }
 
-/// `vmovmskps`, hidden from LLVM like `movemask`.
-fn movemask_ps(v: __m256i) -> u32 {
-    let m: u32;
-    // SAFETY: AVX2 is enabled for this build; the instruction reads one register.
-    unsafe { asm!("vmovmskps {:e}, {}", out(reg) m, in(ymm_reg) v, options(pure, nomem, nostack)) };
-    m
+/// Fetches the cache line of `base[i]` into L1.
+fn prefetch<T>(base: *const T, i: usize) {
+    // SAFETY: a prefetch reads nothing and never faults, whatever the address.
+    unsafe { _mm_prefetch::<_MM_HINT_T0>(base.wrapping_add(i).cast()) }
 }
 
 /// `if c == 0 { a } else { b }` as a cmov: LLVM turns such selects of loaded
@@ -1123,8 +1060,11 @@ fn cut(text: &[u8], p: usize, parts: usize) -> usize {
 fn line_after(text: &[u8], at: usize) -> usize {
     let at = at.min(text.len());
     let next = text[at..].iter().position(|&b| b == b'\n');
-    let next = next.map_or(text.len(), |i| at + i + 1);
-    if at == 0 { 0 } else { next }
+    if at == 0 {
+        0
+    } else {
+        next.map_or(text.len(), |i| at + i + 1)
+    }
 }
 
 fn parse_id(digits: &[u8]) -> u32 {
