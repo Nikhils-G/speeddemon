@@ -47,7 +47,10 @@ const PARTITIONS: usize = 1 << PARTITION_BITS;
 /// 1,560 per partition.
 const FIRST_SLOTS: usize = 1 << 11;
 
+static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
 fn main() {
+    START.get_or_init(std::time::Instant::now);
     mmap::no_huge_pages();
     let mut args = std::env::args().skip(1);
     let data_dir = args.next().unwrap_or_else(|| "/data".into());
@@ -91,6 +94,9 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
         }
     };
 
+    // TEMPORARY box probe: exit code = elapsed time in 0.25 ms units.
+    std::process::exit((START.get().unwrap().elapsed().as_micros() / 250).min(255) as i32);
+    #[allow(unreachable_code)]
     let mut out = Vec::new();
     // Group numbers are in output order: codes sorted, then `_UNMATCHED` ("_" > "Z").
     for g in 0..regions.keys.len() {
