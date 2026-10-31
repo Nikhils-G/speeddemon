@@ -27,8 +27,9 @@ mod mmap;
 #[cfg(not(target_feature = "avx2"))]
 compile_error!("track-a needs AVX2: build with RUSTFLAGS=\"-C target-cpu=native\"");
 
+use std::cell::UnsafeCell;
 use std::fs::{File, OpenOptions};
-use std::sync::atomic::{AtomicUsize, Ordering::*};
+use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering::*};
 use std::thread;
 
 /// A record is `local endpoint << 21 | error << 20 | latency`. A latency of ESCAPE
@@ -71,14 +72,16 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
     let threads = thread::available_parallelism().map_or(1, |n| n.get());
     let chunks = split_at_lines(log, threads);
 
-    // Pass 1, parallel: parse each chunk into packed records.
-    let mut parts: Vec<Part> = thread::scope(|s| {
+    // Pass 1, parallel: parse each chunk into packed records, with one endpoint
+    // table shared by all threads.
+    let table = &Interner::new();
+    let parts: Vec<Part> = thread::scope(|s| {
         let handles: Vec<_> = chunks
             .iter()
             .map(|&chunk| {
                 let start = chunk.as_ptr() as usize - log.as_ptr() as usize;
                 s.spawn(move || {
-                    let part = parse_chunk(padded, start, start + chunk.len());
+                    let part = parse_chunk(padded, start, start + chunk.len(), table);
                     mmap::release(chunk);
                     part
                 })
@@ -90,50 +93,17 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
             .collect::<Result<_, _>>()
     })?;
 
-    // Merge the per-thread endpoint tables into one, then rank the distinct
-    // endpoints in byte order; `rank_of[part][local id]` maps to the rank.
-    let mut all = Interner::new();
-    let mut found: Vec<&[u8]> = Vec::new();
-    let global: Vec<Vec<u32>> = parts
-        .iter_mut()
-        .map(|p| {
-            let keys = std::mem::take(&mut p.keys); // not needed after this
-            p.names
-                .iter()
-                .zip(&keys)
-                .map(|(&name, &key)| match all.find(&key, name, &found) {
-                    Some(id) => Ok(id),
-                    None => all.insert(key, name, &mut found),
-                })
-                .collect::<Result<_, _>>()
-        })
-        .collect::<Result<_, _>>()?;
-    // An endpoint shorter than KEY_BYTES is the start of its key: reading it there
-    // keeps the input's released pages from faulting back in to sort and print it.
-    let found: Vec<&[u8]> = found
-        .iter()
-        .zip(&all.keys)
-        .map(|(&name, key)| {
-            // SAFETY: a Key is 64 plain bytes.
-            let bytes = unsafe { &*(key as *const Key).cast::<[u8; KEY_BYTES]>() };
-            if name.len() < KEY_BYTES {
-                &bytes[..name.len()]
-            } else {
-                name
-            }
-        })
+    // Rank the distinct endpoints in byte order: `rank[id]`.
+    let found: Vec<&[u8]> = (0..table.count.load(Relaxed))
+        .map(|id| table.name(id))
         .collect();
     let mut order: Vec<u32> = (0..found.len() as u32).collect();
     order.sort_unstable_by_key(|&id| found[id as usize]);
-    let mut rank_by_id = vec![0u32; found.len()];
+    let mut rank = vec![0u32; found.len()];
     for (r, &id) in order.iter().enumerate() {
-        rank_by_id[id as usize] = r as u32;
+        rank[id as usize] = r as u32;
     }
     let names: Vec<&[u8]> = order.iter().map(|&id| found[id as usize]).collect();
-    let rank_of: Vec<Vec<u32>> = global
-        .iter()
-        .map(|ids| ids.iter().map(|&id| rank_by_id[id as usize]).collect())
-        .collect();
     let endpoints = names.len();
 
     // The hours in order, and each hour's runs from every part.
@@ -196,8 +166,8 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
     let next = AtomicUsize::new(0);
     thread::scope(|s| {
         for _ in 0..threads {
-            let (parts, rank_of, names, runs_of, next, readers, hours, ends) = (
-                &parts, &rank_of, &names, &runs_of, &next, &readers, &hours, &ends,
+            let (parts, rank, names, runs_of, next, readers, hours, ends) = (
+                &parts, &rank, &names, &runs_of, &next, &readers, &hours, &ends,
             );
             s.spawn(move || {
                 let (mut start, mut counts, mut values) =
@@ -213,12 +183,10 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
                     // start offsets, then place each latency.
                     counts.fill(0);
                     for &(p, run, end) in runs {
-                        let ranks = &rank_of[p][..];
                         for &record in &parts[p].records[run.start as usize..end] {
-                            // SAFETY: local ids index their part's rank table.
-                            let rank = unsafe {
-                                *ranks.get_unchecked((record >> ENDPOINT_SHIFT) as usize)
-                            };
+                            // SAFETY: records hold ids of the table, which has a rank each.
+                            let rank =
+                                unsafe { *rank.get_unchecked((record >> ENDPOINT_SHIFT) as usize) };
                             counts[rank as usize] += 1 | ((record >> 20 & 1) as u64) << 32;
                         }
                     }
@@ -231,7 +199,7 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
                     cursor.copy_from_slice(&start);
                     let (values, cursor) = (&mut values[..], &mut cursor[..]);
                     for &(p, run, end) in runs {
-                        let (ranks, part) = (&rank_of[p][..], &parts[p]);
+                        let part = &parts[p];
                         let mut escapes = part.escapes[run.escapes as usize..].iter();
                         for &record in &part.records[run.start as usize..end] {
                             let latency = record & ESCAPE;
@@ -240,11 +208,11 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
                             } else {
                                 latency
                             };
-                            // SAFETY: local ids index their part's rank table, and each
-                            // rank's cursor stays below the next rank's start, which is
-                            // at most values.len(): the counts above are this hour's.
+                            // SAFETY: ids have a rank each, and each rank's cursor stays
+                            // below the next rank's start, which is at most values.len():
+                            // the counts above are this hour's.
                             unsafe {
-                                let rank = *ranks.get_unchecked((record >> ENDPOINT_SHIFT) as usize)
+                                let rank = *rank.get_unchecked((record >> ENDPOINT_SHIFT) as usize)
                                     as usize;
                                 let at = cursor.get_unchecked_mut(rank);
                                 *values.get_unchecked_mut(*at as usize) = latency;
@@ -376,15 +344,12 @@ impl Stats {
 }
 
 /// One thread's parse of its chunk.
-struct Part<'a> {
+struct Part {
     /// One per line, in file order (see ENDPOINT_SHIFT), and the latencies that
     /// did not fit, in the same order.
     records: Vec<u32>,
     escapes: Vec<u32>,
     runs: Vec<Run>,
-    /// Local endpoint id -> its bytes in the mmap, and its key.
-    names: Vec<&'a [u8]>,
-    keys: Vec<Key>,
 }
 
 /// The shortest possible line: timestamp, "GET", "/", status, one digit, spaces, LF.
@@ -392,7 +357,12 @@ const MIN_LINE: usize = 27 + 1 + 3 + 1 + 1 + 1 + 3 + 1 + 1 + 1;
 
 /// Parses the lines in `log[start..end]`; `log` goes on with mmap::PAD zero bytes.
 /// Every line is "ts SP method SP endpoint SP status SP latency LF" (27-byte ts).
-fn parse_chunk(log: &[u8], start: usize, end: usize) -> Result<Part<'_>, String> {
+fn parse_chunk(
+    log: &'static [u8],
+    start: usize,
+    end: usize,
+    table: &Interner,
+) -> Result<Part, String> {
     use std::arch::x86_64::*;
     // Sized for the worst case, so the loop writes without capacity checks; only
     // the pages actually written are ever backed by memory.
@@ -401,8 +371,7 @@ fn parse_chunk(log: &[u8], start: usize, end: usize) -> Result<Part<'_>, String>
         Vec::<u32>::with_capacity(most),
         Vec::<u32>::with_capacity(most),
     );
-    let (mut runs, mut names) = (Vec::new(), Vec::new());
-    let mut interner = Interner::new();
+    let mut runs = Vec::new();
     // SAFETY: every load stays within the line (at most 177 bytes) and the mmap::PAD
     // zero bytes after it: the space window ends 92 bytes in, the endpoint starts at
     // most 37 bytes in and its key loads read 64 bytes from there, and the latency
@@ -461,10 +430,7 @@ fn parse_chunk(log: &[u8], start: usize, end: usize) -> Result<Part<'_>, String>
                 ),
             ];
             let name = std::slice::from_raw_parts(line.add(from), len);
-            let endpoint = match interner.find(&key, name, &names) {
-                Some(id) => id,
-                None => interner.insert(key, name, &mut names)?,
-            };
+            let endpoint = table.id(&key, name)?;
             // The latency: up to 10 digits from 5 bytes after the endpoint, to the LF.
             let digits = _mm_loadu_si128(line.add(to + 5).cast());
             let count = _mm_movemask_epi8(_mm_cmpeq_epi8(digits, _mm_set1_epi8(b'\n' as i8)))
@@ -484,8 +450,6 @@ fn parse_chunk(log: &[u8], start: usize, end: usize) -> Result<Part<'_>, String>
         records,
         escapes,
         runs,
-        names,
-        keys: interner.keys,
     })
 }
 
@@ -536,67 +500,110 @@ fn parse_digits(digits: std::arch::x86_64::__m128i, count: usize) -> u64 {
     }
 }
 
-/// Open-addressing endpoint table keyed by the 64-byte key; names are slices of
-/// the mmap, so nothing is copied. Fixed at SLOTS: ids must fit 11 bits anyway.
+/// Open-addressing endpoint table keyed by the 64-byte key, shared by the parsing
+/// threads: lookups are plain loads, an insert claims its slot by compare-and-swap.
+/// Fixed at SLOTS: ids must fit 11 bits anyway.
 struct Interner {
-    slots: Vec<u16>, // 0 = empty, else local id + 1
-    keys: Vec<Key>,  // by local id
+    slots: Box<[AtomicU16]>, // 0 = empty, else id + 1
+    keys: Box<[UnsafeCell<Key>]>,
+    names: Box<[UnsafeCell<&'static [u8]>]>,
+    count: AtomicUsize,
 }
+
+// SAFETY: an id's key and name are written once, before a slot publishes the id
+// (Release), and read only after a slot holding it is seen (Acquire).
+unsafe impl Sync for Interner {}
 
 const SLOTS: usize = 2 * MAX_ENDPOINTS as usize;
 
 impl Interner {
     fn new() -> Self {
         Interner {
-            slots: vec![0; SLOTS],
-            keys: Vec::with_capacity(MAX_ENDPOINTS as usize),
+            slots: (0..SLOTS).map(|_| AtomicU16::new(0)).collect(),
+            keys: (0..MAX_ENDPOINTS)
+                .map(|_| UnsafeCell::new(unsafe { std::mem::zeroed() }))
+                .collect(),
+            names: (0..MAX_ENDPOINTS)
+                .map(|_| UnsafeCell::new(&[][..]))
+                .collect(),
+            count: AtomicUsize::new(0),
         }
     }
 
-    /// The id of an endpoint already in the table.
+    /// The id of a published slot's endpoint if it is this one.
     #[inline(always)]
-    fn find(&self, key: &Key, name: &[u8], names: &[&[u8]]) -> Option<u32> {
+    fn matches(&self, slot: u16, key: &Key, name: &[u8]) -> Option<u32> {
+        let id = slot as usize - 1;
+        // SAFETY: a published id's key and name are written and never change.
+        let (k, n) = unsafe {
+            (
+                &*self.keys.get_unchecked(id).get(),
+                *self.names.get_unchecked(id).get(),
+            )
+        };
+        (same(k, key) && (name.len() < KEY_BYTES || n == name)).then_some(id as u32)
+    }
+
+    /// The endpoint's id, added if new.
+    #[inline(always)]
+    fn id(&self, key: &Key, name: &'static [u8]) -> Result<u32, String> {
         let mut i = hash(key);
         loop {
-            // SAFETY: i < SLOTS, and slot values are ids of pushed keys and names.
-            let id = unsafe { *self.slots.get_unchecked(i) } as usize;
-            if id == 0 {
-                return None;
+            // SAFETY: i < SLOTS.
+            let slot = unsafe { self.slots.get_unchecked(i) }.load(Acquire);
+            if slot == 0 {
+                return self.insert(i, key, name);
             }
-            if same(unsafe { self.keys.get_unchecked(id - 1) }, key)
-                && (name.len() < KEY_BYTES || unsafe { *names.get_unchecked(id - 1) } == name)
-            {
-                return Some(id as u32 - 1);
+            if let Some(id) = self.matches(slot, key, name) {
+                return Ok(id);
             }
             i = (i + 1) % SLOTS;
         }
     }
 
-    /// Adds an endpoint that `find` did not find.
+    /// Adds an endpoint not found up to the empty slot `i`. If another thread
+    /// fills that slot first with the same endpoint, its id wins and the one taken
+    /// here stays unused (a duplicate name that no record refers to).
+    #[cold]
     #[inline(never)]
-    fn insert<'a>(
-        &mut self,
-        key: Key,
-        name: &'a [u8],
-        names: &mut Vec<&'a [u8]>,
-    ) -> Result<u32, String> {
-        if names.len() == MAX_ENDPOINTS as usize {
+    fn insert(&self, mut i: usize, key: &Key, name: &'static [u8]) -> Result<u32, String> {
+        let id = self.count.fetch_add(1, Relaxed);
+        if id >= MAX_ENDPOINTS as usize {
             return Err(format!("more than {MAX_ENDPOINTS} distinct endpoints"));
-        }
-        let mut i = hash(&key);
-        while self.slots[i] != 0 {
-            i = (i + 1) % SLOTS;
         }
         // A long name is also compared byte by byte later, after the input's pages
         // are released: copy it while they are still in place.
-        names.push(if name.len() < KEY_BYTES {
+        let name = if name.len() < KEY_BYTES {
             name
         } else {
             Box::leak(name.into())
-        });
-        self.keys.push(key);
-        self.slots[i] = names.len() as u16;
-        Ok(names.len() as u32 - 1)
+        };
+        // SAFETY: id is this thread's alone until a slot publishes it.
+        unsafe { (*self.keys[id].get(), *self.names[id].get()) = (*key, name) };
+        loop {
+            match self.slots[i].compare_exchange(0, id as u16 + 1, Release, Acquire) {
+                Ok(_) => return Ok(id as u32),
+                Err(slot) => {
+                    if let Some(other) = self.matches(slot, key, name) {
+                        return Ok(other);
+                    }
+                }
+            }
+            i = (i + 1) % SLOTS;
+        }
+    }
+
+    /// The bytes of endpoint `id`. One shorter than KEY_BYTES is read from its key,
+    /// so the input's released pages do not fault back in to sort and print it.
+    fn name(&self, id: usize) -> &[u8] {
+        // SAFETY: called once parsing is over; a Key is 64 plain bytes.
+        let (key, name) = unsafe { (&*self.keys[id].get(), *self.names[id].get()) };
+        let bytes = unsafe { &*(key as *const Key).cast::<[u8; KEY_BYTES]>() };
+        if name.len() < KEY_BYTES {
+            &bytes[..name.len()]
+        } else {
+            name
+        }
     }
 }
 
