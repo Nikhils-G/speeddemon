@@ -14,38 +14,34 @@
 //!    turns the quote bits into an "inside quotes" mask. What is left are exactly
 //!    the field separators, and counting quote bits gives each text field's
 //!    unescaped length (each `""` is one byte) without looking at its bytes.
-//! 4. Distinct names per country: a name's identity is its raw inner bytes (inside
-//!    quotes, `""` maps one to one to the unescaped value, and an unquoted value
-//!    cannot contain `"`), reduced to a 56-bit hash; with the spec's 100,000 names
-//!    the chance that two share one is about 7e-8. Parsing only files a (hash,
-//!    country) pair under one of 64 partitions picked by the hash. Between parsing
-//!    rounds, each thread takes whole partitions and marks pairs in that
-//!    partition's own small name table and bit rows, which stay in its L1/L2 cache.
-//!    No two threads ever write the same memory, so there are no atomics or cache
-//!    lines bouncing between cores, and the rounds keep the pair buffers small.
+//! 4. Distinct names per country use one table shared by all threads, lock-free.
+//!    A name's identity is its raw inner bytes (inside quotes, `""` maps one to
+//!    one to the unescaped value, and an unquoted value cannot contain `"`),
+//!    reduced to a 64-bit hash: with the spec's 100,000 names the chance that two
+//!    share one is about 3e-10. Each name gets a dense id and a row of one bit per
+//!    country; the thread whose `fetch_or` sets a bit counts that (country, name)
+//!    pair, so there is no merge step. Records go through in batches of 16 with
+//!    their table entries prefetched, so the cache misses overlap.
 
 mod mmap;
 
-use std::cell::UnsafeCell;
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::fs::FileExt;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering::*};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
 use std::thread;
 
 const RECORDS_HEADER: &[u8] = b"id,name,note,region_id,amount";
 const REGIONS_HEADER: &[u8] = b"region_id,country\n";
 const BOM: &[u8] = b"\xEF\xBB\xBF";
 const UNMATCHED: &[u8] = b"_UNMATCHED";
-/// The file is parsed in this many rounds of one run per thread, so the pair
-/// buffers only ever hold one round's pairs (about 3 MB in all).
-const ROUNDS: usize = 8;
-/// Names are split by their top hash bits into this many partitions.
-const PARTITION_BITS: u32 = 6;
-const PARTITIONS: usize = 1 << PARTITION_BITS;
-/// Name-table slots per partition for the first attempt: the spec's 100,000 names
-/// are about 1,560 per partition.
-const FIRST_SLOTS: usize = 1 << 11;
+/// The file is cut into this many runs per thread, handed out one at a time, so
+/// threads that run slower (a busy sibling hyperthread) do less of the work.
+const RUNS_PER_THREAD: usize = 8;
+/// Name-table slots for the first attempt: 2.6x the spec's 100,000-name pool.
+const FIRST_SLOTS: usize = 1 << 18;
+/// Records are handled in batches of this many, so that their cache misses overlap.
+const BATCH: usize = 16;
 /// Bytes per read of records.csv.
 const READ: usize = 1 << 17;
 
@@ -75,7 +71,7 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
 
     // The header is the first record; everything after it is data.
     let body_start = skip_header(records)?;
-    let units = threads * ROUNDS;
+    let units = threads * RUNS_PER_THREAD;
     let (mut starts, mut guessed) = (guessed_starts(records, body_start, units), true);
     let mut slots = FIRST_SLOTS;
     let parts = loop {
@@ -125,8 +121,8 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
         .map_err(|e| format!("write {output_path}: {e}"))
 }
 
-/// Parses and aggregates every run, one round of `threads` runs at a time, and
-/// returns each thread's totals.
+/// Parses and aggregates every run, threads taking the next run as they finish
+/// one, and returns each thread's totals.
 fn aggregate(
     file: &File,
     len: usize,
@@ -135,206 +131,167 @@ fn aggregate(
     regions: &Regions,
     slots: usize,
 ) -> Result<Vec<Vec<Totals>>, ParseError> {
-    let groups = regions.keys.len();
-    let words = groups.div_ceil(64);
-    let partitions: Vec<Turns<Partition>> = (0..PARTITIONS)
-        .map(|_| Turns::new(Partition::new(slots, words)))
-        .collect();
-    // Pairs per thread per partition in one run, with room to spare (records are
-    // about 60 bytes), so the buffers are allocated once.
-    let capacity = len / (starts.len() * 60 * PARTITIONS) * 5 / 4 + 16;
-    // (Not `vec![...; PARTITIONS]`: cloning a Vec does not keep its capacity.)
-    let buffers = || {
-        (0..PARTITIONS)
-            .map(|_| Vec::with_capacity(capacity))
-            .collect()
-    };
-    let pairs: Vec<Turns<Vec<Vec<u64>>>> = (0..threads).map(|_| Turns::new(buffers())).collect();
-    let next_partition: Vec<AtomicUsize> = (0..ROUNDS).map(|_| AtomicUsize::new(0)).collect();
-    let barrier = SpinBarrier::new(threads);
-    let results: Vec<Result<Vec<Totals>, ParseError>> = thread::scope(|s| {
+    let names = Names::new(slots, regions.keys.len());
+    let next = AtomicUsize::new(0);
+    thread::scope(|s| {
         let handles: Vec<_> = (0..threads)
-            .map(|w| {
-                let (partitions, pairs, next_partition, barrier) =
-                    (&partitions, &pairs, &next_partition, &barrier);
-                s.spawn(move || {
-                    let mut totals = vec![Totals::default(); groups];
+            .map(|_| {
+                let (names, next) = (&names, &next);
+                s.spawn(move || -> Result<Vec<Totals>, ParseError> {
+                    let mut totals = vec![Totals::default(); regions.keys.len()];
                     let mut buffer = vec![0; READ];
-                    let mut error = None;
-                    for round in 0..ROUNDS {
-                        let run = round * threads + w;
-                        if error.is_none() {
-                            // SAFETY: while parsing, each thread touches only its own buffers.
-                            let mine = unsafe { pairs[w].get() };
-                            mine.iter_mut().for_each(Vec::clear);
-                            match parse_run(
-                                file,
-                                len,
-                                starts[run],
-                                starts[run + 1],
-                                &mut buffer,
-                                regions,
-                                &mut totals,
-                                mine,
-                            ) {
-                                Ok(end) if end == starts[run + 1] => {}
-                                Ok(_) => error = Some(ParseError::Misaligned),
-                                Err(e) => error = Some(e),
-                            }
+                    loop {
+                        let run = next.fetch_add(1, Relaxed);
+                        if run + 1 >= starts.len() {
+                            return Ok(totals);
                         }
-                        barrier.wait();
-                        loop {
-                            let p = next_partition[round].fetch_add(1, Relaxed);
-                            if p >= PARTITIONS || error.is_some() {
-                                break;
-                            }
-                            // SAFETY: the counter gives partition p to this thread alone
-                            // for this round, and every buffer's writer is past the barrier.
-                            let partition = unsafe { partitions[p].get() };
-                            for buffers in pairs {
-                                for &pair in &unsafe { buffers.read() }[p] {
-                                    match partition.add(pair, words) {
-                                        Ok(true) => {
-                                            totals[(pair & 0xFF) as usize].names_distinct += 1
-                                        }
-                                        Ok(false) => {}
-                                        Err(e) => error = Some(e),
-                                    }
-                                }
-                            }
+                        let (start, end) = (starts[run], starts[run + 1]);
+                        let parsed = parse_run(
+                            file,
+                            len,
+                            start,
+                            end,
+                            &mut buffer,
+                            regions,
+                            names,
+                            &mut totals,
+                        );
+                        if parsed? != end {
+                            return Err(ParseError::Misaligned);
                         }
-                        barrier.wait();
                     }
-                    error.map_or(Ok(totals), Err)
                 })
             })
             .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-    // A bad cut can also make the table overflow, so the cut errors come first.
-    let mut parts = Vec::new();
-    let mut full = false;
-    for result in results {
-        match result {
-            Ok(totals) => parts.push(totals),
-            Err(ParseError::NamesFull) => full = true,
-            Err(e) => return Err(e),
+        // A bad cut can also make the table overflow, so the cut errors come first.
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let full = results
+            .iter()
+            .any(|r| matches!(r, Err(ParseError::NamesFull)));
+        let mut parts = Vec::new();
+        for result in results {
+            match result {
+                Ok(totals) => parts.push(totals),
+                Err(ParseError::NamesFull) => {}
+                Err(e) => return Err(e),
+            }
         }
-    }
-    if full {
-        Err(ParseError::NamesFull)
-    } else {
-        Ok(parts)
-    }
-}
-
-/// A barrier whose waiters spin instead of sleeping. Each round's phases last a
-/// millisecond or two, and waking a dozen sleeping threads takes a good part of
-/// that (std's Barrier: about 1 ms more per run). `spin_loop` lets a waiting
-/// hyperthread hand its core to its sibling.
-struct SpinBarrier {
-    threads: usize,
-    arrived: AtomicUsize,
-    generation: AtomicUsize,
-}
-
-impl SpinBarrier {
-    fn new(threads: usize) -> Self {
-        let (arrived, generation) = (AtomicUsize::new(0), AtomicUsize::new(0));
-        SpinBarrier {
-            threads,
-            arrived,
-            generation,
-        }
-    }
-
-    fn wait(&self) {
-        let generation = self.generation.load(Acquire);
-        if self.arrived.fetch_add(1, AcqRel) + 1 == self.threads {
-            self.arrived.store(0, Relaxed);
-            self.generation.fetch_add(1, Release);
+        if full {
+            Err(ParseError::NamesFull)
         } else {
-            // Spin, then yield, in case another process wants this core.
-            let mut spins = 0u32;
-            while self.generation.load(Acquire) == generation {
-                spins += 1;
-                if spins < 1 << 16 {
-                    std::hint::spin_loop();
-                } else {
-                    thread::yield_now();
-                }
-            }
+            Ok(parts)
         }
-    }
+    })
 }
 
-/// A value that threads take turns on. The barriers between phases order every
-/// access; within a phase, each use states why it is the only writer.
-struct Turns<T>(UnsafeCell<T>);
-
-// SAFETY: see the type's comment; T itself is only moved between threads.
-unsafe impl<T: Send> Sync for Turns<T> {}
-
-impl<T> Turns<T> {
-    fn new(value: T) -> Self {
-        Turns(UnsafeCell::new(value))
-    }
-
-    /// SAFETY: no other thread may access the value during this phase.
-    #[allow(clippy::mut_from_ref)]
-    unsafe fn get(&self) -> &mut T {
-        unsafe { &mut *self.0.get() }
-    }
-
-    /// SAFETY: no thread may write the value during this phase.
-    unsafe fn read(&self) -> &T {
-        unsafe { &*self.0.get() }
-    }
+/// Lock-free name table shared by all threads: 64-bit name hash -> dense id, plus
+/// one bit per (name id, group).
+struct Names {
+    /// Slot i is `table[2i]` (the hash, 0 = empty) and `table[2i + 1]` (id + 1 once
+    /// published, FULL if the table ran out): both in one cache line.
+    table: &'static [AtomicU64],
+    next_id: AtomicU32,
+    max_ids: u32,
+    seen: &'static [AtomicU64], // `words` per name id
+    words: usize,
 }
 
-/// One partition's names: an open-addressing table of name hashes, and one row of
-/// bits per slot, a bit per group.
-struct Partition {
-    keys: Vec<u64>, // 0 = empty, else the name hash with its low byte set to 0xFF
-    seen: Vec<u64>, // `words` per slot
-    used: usize,
-}
+const FULL: u64 = u64::MAX;
 
-impl Partition {
-    fn new(slots: usize, words: usize) -> Self {
-        Partition {
-            keys: vec![0; slots],
-            seen: vec![0; slots * words],
-            used: 0,
+impl Names {
+    fn new(slots: usize, groups: usize) -> Self {
+        let words = groups.div_ceil(64);
+        let max_ids = slots / 2;
+        Names {
+            table: zeroed_atomics(slots * 2),
+            next_id: AtomicU32::new(0),
+            max_ids: max_ids as u32,
+            seen: zeroed_atomics(max_ids * words),
+            words,
         }
     }
 
-    /// Marks a (name hash, group) pair: true the first time it is seen.
-    fn add(&mut self, pair: u64, words: usize) -> Result<bool, ParseError> {
-        let (key, group) = (pair | 0xFF, (pair & 0xFF) as usize);
-        let mask = self.keys.len() - 1;
-        // The top hash bits picked the partition; the bits above the group pick the slot.
-        let mut i = (pair >> 8) as usize & mask;
+    /// The dense id of the name with this hash, inserting it if it is new.
+    fn home(&self, hash: u64) -> usize {
+        (hash >> 32) as usize & (self.table.len() / 2 - 1)
+    }
+
+    fn id(&self, hash: u64) -> Result<usize, ParseError> {
+        let hash = hash.max(1);
+        let mask = self.table.len() / 2 - 1;
+        let mut i = self.home(hash);
         loop {
-            match self.keys[i] {
-                k if k == key => break,
-                0 => {
-                    if self.used * 8 >= self.keys.len() * 7 {
-                        return Err(ParseError::NamesFull);
+            let current = self.table[2 * i].load(Acquire);
+            if current == 0 {
+                match self.table[2 * i].compare_exchange(0, hash, AcqRel, Acquire) {
+                    Ok(_) => {
+                        let id = self.next_id.fetch_add(1, Relaxed);
+                        let full = id >= self.max_ids;
+                        self.table[2 * i + 1]
+                            .store(if full { FULL } else { id as u64 + 1 }, Release);
+                        return if full {
+                            Err(ParseError::NamesFull)
+                        } else {
+                            Ok(id as usize)
+                        };
                     }
-                    self.used += 1;
-                    self.keys[i] = key;
-                    break;
+                    Err(other) if other == hash => return self.published(i),
+                    Err(_) => {}
                 }
-                _ => i = (i + 1) & mask,
+            } else if current == hash {
+                return self.published(i);
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    /// Waits the few nanoseconds until the inserting thread publishes slot i's id.
+    fn published(&self, i: usize) -> Result<usize, ParseError> {
+        loop {
+            match self.table[2 * i + 1].load(Acquire) {
+                0 => std::hint::spin_loop(),
+                FULL => return Err(ParseError::NamesFull),
+                id => return Ok(id as usize - 1),
             }
         }
-        let word = &mut self.seen[i * words + group / 64];
-        let bit = 1 << (group % 64);
-        let new = *word & bit == 0;
-        *word |= bit;
-        Ok(new)
     }
+
+    fn prefetch_slot(&self, hash: u64) {
+        prefetch(&self.table[2 * self.home(hash.max(1))]);
+    }
+
+    fn prefetch_row(&self, id: usize, group: usize) {
+        prefetch(&self.seen[id * self.words + group / 64]);
+    }
+
+    /// Marks (name, group); true for exactly one caller per pair, the first.
+    fn first_in_group(&self, id: usize, group: usize) -> bool {
+        let word = &self.seen[id * self.words + group / 64];
+        let bit = 1 << (group % 64);
+        word.load(Relaxed) & bit == 0 && word.fetch_or(bit, Relaxed) & bit == 0
+    }
+}
+
+/// A zero-initialised atomic array. calloc'd memory: the kernel hands out zero
+/// pages lazily, so rows that are never touched cost no memory.
+fn zeroed_atomics<A>(len: usize) -> &'static [A] {
+    assert!(size_of::<A>() == 8 || size_of::<A>() == 4);
+    let words: &'static mut [u64] = Vec::leak(vec![0u64; (len * size_of::<A>()).div_ceil(8)]);
+    // SAFETY: AtomicU64 and AtomicU32 have the same size and alignment as u64 and
+    // u32, all-zero bytes are a valid value for both, and u64 storage is aligned
+    // enough for either. The leaked memory lives until exit.
+    unsafe { std::slice::from_raw_parts(words.as_ptr() as *const A, len) }
+}
+
+fn prefetch<T>(item: &T) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: prefetching is only a hint and never faults.
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(
+            item as *const T as *const i8,
+            std::arch::x86_64::_MM_HINT_T0,
+        )
+    };
 }
 
 /// The join table: region id -> group index. Groups are the country codes in
@@ -385,6 +342,12 @@ impl Regions {
         })?;
         keys.push(UNMATCHED.to_vec());
         Ok(Regions { group_of, keys })
+    }
+
+    fn prefetch(&self, region_id: u64) {
+        if let Some(entry) = self.group_of.get(region_id as usize) {
+            prefetch(entry);
+        }
     }
 
     fn group(&self, region_id: u64) -> usize {
@@ -502,7 +465,7 @@ impl Totals {
 }
 
 enum ParseError {
-    /// A partition's name table passed 7/8 full; retry with bigger ones.
+    /// The name table passed half full; retry with a bigger one.
     NamesFull,
     /// A run did not end where the next one starts (only possible for a guessed cut).
     Misaligned,
@@ -574,8 +537,8 @@ fn guessed_starts(text: &[u8], from: usize, parts: usize) -> Vec<usize> {
     starts
 }
 
-/// Reads `[start, end)` of records.csv through `buffer`, parses its records into
-/// `totals`, and files each record's (name hash, group) pair under its partition.
+/// Reads `[start, end)` of records.csv through `buffer` and parses its records
+/// into `totals` and `names`.
 /// Returns where parsing stopped, which is `end` when both are record starts.
 /// Reading instead of mapping skips a page fault per 16 pages and, at exit, the
 /// kernel unmapping 50,000 page-cache pages one by one (9 ms on the test server).
@@ -588,15 +551,15 @@ fn parse_run(
     end: usize,
     buffer: &mut [u8],
     regions: &Regions,
+    names: &Names,
     totals: &mut [Totals],
-    pairs: &mut [Vec<u64>],
 ) -> Result<usize, ParseError> {
     let mut at = start;
     while at < end {
         let piece = &mut buffer[..READ.min(end - at)];
         file.read_exact_at(piece, at as u64)
             .map_err(|e| ParseError::Bad(format!("read records.csv: {e}")))?;
-        match parse_records(piece, at, at + piece.len() == len, regions, totals, pairs)? {
+        match parse_records(piece, at, at + piece.len() == len, regions, names, totals)? {
             // No whole record in the piece: one crosses `end` (a wrong guessed
             // cut), or is longer than the buffer.
             0 => return Err(ParseError::Misaligned),
@@ -614,12 +577,18 @@ fn parse_records(
     base: usize,
     last: bool,
     regions: &Regions,
+    names: &Names,
     totals: &mut [Totals],
-    pairs: &mut [Vec<u64>],
 ) -> Result<usize, ParseError> {
     let bad =
         |at: usize, what: &str| ParseError::Bad(format!("records.csv byte {}: {what}", base + at));
     let mut scan = Scanner::new(text, 0);
+    // Each record needs three random reads: its region's group, its name's slot,
+    // then the (name, group) bit. Done one record at a time, each is a stall. So
+    // a batch is parsed with the first two prefetched, then resolved with the bits
+    // prefetched, then the bits are set: the misses overlap.
+    let mut batch = [Parsed::default(); BATCH];
+    let mut n = 0;
     let mut i = 0;
     while i < text.len() {
         let id_start = if text[i..].starts_with(BOM) {
@@ -650,20 +619,67 @@ fn parse_records(
             .ok_or_else(|| bad(note_end + 1, "bad region_id"))?;
         let cents = amount(text, region_end + 1, amount_end)
             .ok_or_else(|| bad(region_end + 1, "bad amount"))?;
-        let group = regions.group(region_id);
-        let total = &mut totals[group];
-        total.count += 1;
-        total.id_sum += id;
-        total.amount_sum += cents;
-        total.amount_min = total.amount_min.min(cents);
-        total.amount_max = total.amount_max.max(cents);
-        total.name_bytes += name_bytes;
-        total.note_bytes += note_bytes;
         let hash = hash(text, name.0, name.1);
-        pairs[(hash >> (64 - PARTITION_BITS)) as usize].push(hash & !0xFF | group as u64);
+        names.prefetch_slot(hash);
+        regions.prefetch(region_id);
+        batch[n] = Parsed {
+            id,
+            region_id,
+            cents,
+            name_bytes,
+            note_bytes,
+            hash,
+            group: 0,
+            name: 0,
+        };
+        n += 1;
+        if n == BATCH {
+            add(&mut batch, regions, names, totals)?;
+            n = 0;
+        }
         i = amount_end + 1;
     }
+    add(&mut batch[..n], regions, names, totals)?;
     Ok(i.min(text.len()))
+}
+
+/// A parsed record waiting for its table lookups.
+#[derive(Clone, Copy, Default)]
+struct Parsed {
+    id: u64,
+    region_id: u64,
+    cents: i64,
+    name_bytes: u64,
+    note_bytes: u64,
+    hash: u64,
+    group: usize,
+    name: usize,
+}
+
+/// Adds a batch of parsed records to the totals and marks their (name, group) pairs.
+fn add(
+    batch: &mut [Parsed],
+    regions: &Regions,
+    names: &Names,
+    totals: &mut [Totals],
+) -> Result<(), ParseError> {
+    for r in batch.iter_mut() {
+        r.group = regions.group(r.region_id);
+        let total = &mut totals[r.group];
+        total.count += 1;
+        total.id_sum += r.id;
+        total.amount_sum += r.cents;
+        total.amount_min = total.amount_min.min(r.cents);
+        total.amount_max = total.amount_max.max(r.cents);
+        total.name_bytes += r.name_bytes;
+        total.note_bytes += r.note_bytes;
+        r.name = names.id(r.hash)?;
+        names.prefetch_row(r.name, r.group);
+    }
+    for r in batch.iter() {
+        totals[r.group].names_distinct += names.first_in_group(r.name, r.group) as u64;
+    }
+    Ok(())
 }
 
 /// Walks the field separators of a run of records (every `,` and LF outside
