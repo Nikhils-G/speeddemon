@@ -33,6 +33,7 @@ const UNMATCHED: &[u8] = b"_UNMATCHED";
 const FIRST_SLOTS: usize = 1 << 18;
 
 fn main() {
+    mmap::no_huge_pages();
     let mut args = std::env::args().skip(1);
     let data_dir = args.next().unwrap_or_else(|| "/data".into());
     let out_dir = args.next().unwrap_or_else(|| "/out".into());
