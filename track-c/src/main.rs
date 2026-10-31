@@ -297,15 +297,15 @@ impl Names {
     }
 }
 
-/// A zero-initialised atomic array. calloc'd memory: the kernel hands out zero
-/// pages lazily, so rows that are never touched cost no memory.
+/// A zero-initialised atomic array, populated up front (see `mmap::zeroed`).
 fn zeroed_atomics<A>(len: usize) -> &'static [A] {
-    assert!(size_of::<A>() == 8 || size_of::<A>() == 4);
-    let words: &'static mut [u64] = Vec::leak(vec![0u64; (len * size_of::<A>()).div_ceil(8)]);
-    // SAFETY: AtomicU64 and AtomicU32 have the same size and alignment as u64 and
-    // u32, all-zero bytes are a valid value for both, and u64 storage is aligned
-    // enough for either. The leaked memory lives until exit.
-    unsafe { std::slice::from_raw_parts(words.as_ptr() as *const A, len) }
+    let ptr = mmap::zeroed(len * size_of::<A>()).unwrap_or_else(|e| {
+        eprintln!("track-c: mmap: {e}");
+        std::process::exit(1);
+    });
+    // SAFETY: the mapping is page-aligned, zeroed, at least `len` atomics long, and
+    // all-zero bytes are a valid value for an integer atomic.
+    unsafe { std::slice::from_raw_parts(ptr as *const A, len) }
 }
 
 /// Returns the offset of the first data record, after the BOM and header.
