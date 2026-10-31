@@ -6,7 +6,7 @@ COPY . .
 # on it, and the final build is laid out by the recorded profile. Build time is not
 # scored. target-cpu=native makes the board build this track on the scoring box.
 RUN python3 b_index.py --seed 7 --scale sample --out /tmp/train > /dev/null \
- && RUSTFLAGS="-C target-cpu=native -C target-feature=+crt-static -C profile-generate=/tmp/pgo" cargo build --release --offline \
+ && RUSTFLAGS="-C target-cpu=native -C target-feature=+crt-static -C profile-generate=/tmp/pgo -C llvm-args=-instrprof-atomic-counter-update-all" cargo build --release --offline \
  && mkdir /tmp/out && target/release/solution /tmp/train /tmp/out \
  && llvm-profdata merge -o /tmp/pgo.profdata /tmp/pgo \
  && RUSTFLAGS="-C target-cpu=native -C target-feature=+crt-static -C profile-use=/tmp/pgo.profdata" cargo build --release --offline
