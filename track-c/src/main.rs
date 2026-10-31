@@ -30,6 +30,7 @@ use std::cell::UnsafeCell;
 use std::fs::File;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering::*};
+use std::sync::{Condvar, Mutex};
 use std::thread;
 
 const RECORDS_HEADER: &[u8] = b"id,name,note,region_id,amount";
@@ -219,23 +220,28 @@ fn aggregate(
     }
 }
 
-/// A barrier whose waiters spin instead of sleeping. Each round's phases last a
-/// millisecond or two, and waking a dozen sleeping threads takes a good part of
-/// that (std's Barrier: about 1 ms more per run). `spin_loop` lets a waiting
-/// hyperthread hand its core to its sibling.
+/// A barrier whose waiters spin for a while before sleeping. Each round's phases
+/// last a millisecond or two, and waking a dozen sleeping threads takes a good
+/// part of that (std's Barrier: about 1 ms more per run). The spin is bounded,
+/// then waiters block, so a thread that lost its core is never starved by them.
 struct SpinBarrier {
     threads: usize,
     arrived: AtomicUsize,
     generation: AtomicUsize,
+    lock: Mutex<()>,
+    wake: Condvar,
 }
 
 impl SpinBarrier {
     fn new(threads: usize) -> Self {
         let (arrived, generation) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let (lock, wake) = (Mutex::new(()), Condvar::new());
         SpinBarrier {
             threads,
             arrived,
             generation,
+            lock,
+            wake,
         }
     }
 
@@ -243,18 +249,21 @@ impl SpinBarrier {
         let generation = self.generation.load(Acquire);
         if self.arrived.fetch_add(1, AcqRel) + 1 == self.threads {
             self.arrived.store(0, Relaxed);
+            // Under the lock, so a waiter cannot check and then miss the wake-up.
+            let _guard = self.lock.lock().unwrap();
             self.generation.fetch_add(1, Release);
-        } else {
-            // Spin, then yield, in case another process wants this core.
-            let mut spins = 0u32;
-            while self.generation.load(Acquire) == generation {
-                spins += 1;
-                if spins < 1 << 16 {
-                    std::hint::spin_loop();
-                } else {
-                    thread::yield_now();
-                }
+            self.wake.notify_all();
+            return;
+        }
+        for _ in 0..1 << 14 {
+            if self.generation.load(Acquire) != generation {
+                return;
             }
+            std::hint::spin_loop();
+        }
+        let mut guard = self.lock.lock().unwrap();
+        while self.generation.load(Acquire) == generation {
+            guard = self.wake.wait(guard).unwrap();
         }
     }
 }
