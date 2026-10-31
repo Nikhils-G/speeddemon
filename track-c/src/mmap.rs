@@ -1,4 +1,5 @@
-//! Read-only mmap through libc, declared by hand so the crate has no dependencies.
+//! Read-only mmap and a few memory settings through libc, declared by hand so the
+//! crate has no dependencies.
 
 use std::fs::File;
 use std::io;
@@ -16,6 +17,17 @@ unsafe extern "C" {
     ) -> *mut c_void;
     fn prctl(option: c_int, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> c_int;
     fn madvise(addr: *mut c_void, len: usize, advice: c_int) -> c_int;
+    fn mallopt(param: c_int, value: c_int) -> c_int;
+}
+
+/// Makes malloc grow each heap 32 MB at a time. A worker thread's first
+/// allocations get their own heap, which otherwise grows a few pages per
+/// mprotect, and each mprotect stalls every other thread's page faults (800 of
+/// them per run). Reserved but untouched pages cost no memory.
+pub fn big_heap_steps() {
+    const M_TOP_PAD: c_int = -2;
+    // SAFETY: a plain libc call; failure only keeps the default.
+    unsafe { mallopt(M_TOP_PAD, 32 << 20) };
 }
 
 /// Drops this process's page-table entries for the whole pages inside `slice`, a
