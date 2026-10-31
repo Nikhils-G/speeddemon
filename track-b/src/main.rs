@@ -447,6 +447,7 @@ struct Entry {
     answer: u32,
     /// Bit k: term k is a cover term that comes earlier in the cover. When it is
     /// present in the block, that term's entry evaluates the query instead.
+    /// The `always` entries have no cover: for them, the number of terms.
     earlier: u32,
 }
 
@@ -527,7 +528,7 @@ impl Plan {
             let mut entry = Entry { terms: [pad as u32; MAX_BOOL_TERMS], answer, earlier: 0 };
             entry.terms[..words.len()].copy_from_slice(words);
             if is_always {
-                always.push(entry);
+                always.push(Entry { earlier: len, ..entry });
                 continue;
             }
             let (cover, n) = cover(words, cost);
@@ -543,6 +544,8 @@ impl Plan {
         for (t, a, e) in par(parts, lines) {
             (by_trigger.extend(t), by_anchor.extend(a), always.extend(e));
         }
+        // By length and operators, so that `end_super` predicts its branches.
+        always.sort_unstable_by_key(|e| (e.earlier, e.terms.map(|word| word >> 30)));
         let (group, entries) = csr(by_trigger, nb + 1);
         let (anchor, anchored) = csr(by_anchor, df.len());
         Plan { group, entries, always, rows, anchor, anchored, terms, rank }
@@ -840,12 +843,13 @@ impl<'a> Scan<'a> {
         for e in &plan.always {
             // SAFETY: aligned 32-byte loads of rows; AVX2 is enabled for the whole build.
             let hits = unsafe {
-                e.terms.iter().fold(_mm256_setzero_si256(), |r, &word| {
+                e.terms[..e.earlier as usize].iter().fold(_mm256_setzero_si256(), |r, &word| {
                     let x = _mm256_load_si256(wide[(word & TERM) as usize].0.as_ptr() as *const __m256i);
-                    // The op bits spread over whole masks: bit 30 (NOT, OR), bit 31 (OR).
-                    let op = _mm256_set1_epi32(word as i32);
-                    let (not, or) = (_mm256_srai_epi32::<31>(_mm256_slli_epi32::<1>(op)), _mm256_srai_epi32::<31>(op));
-                    _mm256_or_si256(_mm256_and_si256(r, _mm256_xor_si256(x, not)), _mm256_and_si256(x, or))
+                    match word >> 30 {
+                        AND => _mm256_and_si256(r, x),
+                        NOT => _mm256_andnot_si256(x, r),
+                        _ => _mm256_or_si256(r, x),
+                    }
                 })
             };
             self.answers.add_wide(e.answer, hits, base);
