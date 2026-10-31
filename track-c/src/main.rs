@@ -16,51 +16,57 @@
 //!    one byte) without looking at its bytes. The common record takes one such
 //!    window of 64 bytes at its start, one 32-byte compare for the region's comma
 //!    and the amount's dot, and one AVX2 pass that converts its three numbers; every
-//!    check is a predictable branch to the general parser, which handles any other
-//!    record (and gives the error message).
+//!    check is a predictable branch to a byte-by-byte parser of spec 2.1, which
+//!    handles any other record (and rejects invalid ones).
 //! 4. Distinct names per country: a name's identity is its raw inner bytes (inside
 //!    quotes, `""` maps one to one to the unescaped value, and an unquoted value
 //!    cannot contain `"`), reduced to a 56-bit hash; with the spec's 100,000 names
 //!    the chance that two share one is about 7e-8. Parsing only files a (hash,
-//!    country) pair under one of 64 partitions picked by the hash. Between parsing
+//!    group) pair under one of 64 partitions picked by the hash. Between parsing
 //!    rounds, each thread takes whole partitions and marks pairs in that
-//!    partition's own small name table and bit rows, which stay in its L1/L2 cache.
-//!    No two threads ever write the same memory, so there are no atomics or cache
-//!    lines bouncing between cores, and the rounds keep the pair buffers small.
+//!    partition's own small table of names with a bit per group, which stays in its
+//!    cache. No two threads ever write the same memory, so there are no atomics or
+//!    cache lines bouncing between cores, and the rounds keep the pair buffers small.
 
 mod mmap;
 
 #[cfg(not(all(target_feature = "avx2", target_feature = "pclmulqdq")))]
 compile_error!("track-c needs AVX2 and PCLMULQDQ: build with RUSTFLAGS=\"-C target-cpu=native\"");
 
-use std::cell::UnsafeCell;
+use std::fmt::Write as _;
 use std::fs::File;
-use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering::*};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Mutex, RwLock};
 use std::thread;
 
 const RECORDS_HEADER: &[u8] = b"id,name,note,region_id,amount";
 const REGIONS_HEADER: &[u8] = b"region_id,country\n";
 const BOM: &[u8] = b"\xEF\xBB\xBF";
-/// Subtracts '0' from each of 8 digit bytes.
-const ZEROS: u64 = 0x3030_3030_3030_3030;
-const UNMATCHED: &[u8] = b"_UNMATCHED";
 /// The file is parsed in this many rounds of one run per thread, so the pair
 /// buffers only ever hold one round's pairs (about 3 MB in all).
 const ROUNDS: usize = 8;
 /// Names are split by their top hash bits into this many partitions.
 const PARTITION_BITS: u32 = 6;
 const PARTITIONS: usize = 1 << PARTITION_BITS;
-/// Group indices are bytes: country codes from 0, `_UNMATCHED` the last one, so
-/// that tables indexed by a group need no bounds checks.
+/// Group indices are bytes, so that tables indexed by a group need no bounds
+/// checks: countries in the order they are first seen, `_UNMATCHED` the last one.
 const GROUPS: usize = 256;
 const UNMATCHED_GROUP: usize = GROUPS - 1;
 /// Words of group bits per name.
 const WORDS: usize = GROUPS / 64;
 /// Names per partition for the first attempt: the spec's 100,000 names are about
-/// 1,560 per partition.
+/// 1,570 per partition.
 const FIRST_SLOTS: usize = 1 << 11;
+/// regions.csv is entered in this many parts.
+const REGION_CHUNKS: usize = 64;
+/// Country codes are `[A-Z]{3}` (spec 2.3), so each has an index below 26^3.
+const CODES: usize = 26 * 26 * 26;
+
+/// A group's columns: count, id_sum, amount_sum, amount_min, amount_max,
+/// names_distinct, name_bytes, note_bytes (amounts in cents).
+type Totals = [i64; 8];
+const EMPTY: Totals = [0, 0, 0, i64::MAX, i64::MIN, 0, 0, 0];
+const NAMES_DISTINCT: usize = 5;
 
 fn main() {
     mmap::no_huge_pages();
@@ -68,241 +74,252 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let data_dir = args.next().unwrap_or_else(|| "/data".into());
     let out_dir = args.next().unwrap_or_else(|| "/out".into());
-    if let Err(message) = run(&data_dir, &out_dir) {
-        eprintln!("track-c: {message}");
-        std::process::exit(1);
-    }
+    let Err(message) = run(&data_dir, &out_dir);
+    exit_with(Err(message))
 }
 
-fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
+fn exit_with(result: Result<(), String>) -> ! {
+    if let Err(message) = &result {
+        eprintln!("track-c: {message}");
+    }
+    // Exit without dropping the tables, one free at a time.
+    std::process::exit(result.is_err() as i32)
+}
+
+/// Returns only on failure: on success the thread that writes the output exits
+/// the process.
+fn run(data_dir: &str, out_dir: &str) -> Result<std::convert::Infallible, String> {
     let open = |name: &str| -> Result<&'static [u8], String> {
         let path = format!("{data_dir}/{name}");
         let file = File::open(&path).map_err(|e| format!("open {path}: {e}"))?;
         mmap::map(&file).map_err(|e| format!("mmap {path}: {e}"))
     };
-    let threads = thread::available_parallelism().map_or(1, |n| n.get());
-    let regions = open("regions.csv")?;
-    let region_lines = regions
+    let lines = open("regions.csv")?
         .strip_prefix(REGIONS_HEADER)
         .ok_or("unexpected regions.csv header")?;
-    let region_chunks = split_at_lines(region_lines, threads);
     let records = open("records.csv")?;
-
-    // The header is the first record; everything after it is data.
-    let body_start = skip_header(records)?;
+    let body_start = skip_header(records).ok_or("unexpected records.csv header")?;
+    let threads = thread::available_parallelism().map_or(1, |n| n.get());
     let (mut guessed, mut slots) = (true, FIRST_SLOTS);
-    let (parts, keys) = loop {
-        match aggregate(records, body_start, guessed, threads, &region_chunks, slots) {
-            Ok(done) => break done,
-            Err(ParseError::NamesFull) => slots *= 2,
+    loop {
+        match aggregate(records, body_start, guessed, threads, lines, slots, out_dir) {
+            ParseError::NamesFull => slots *= 2,
             // A wrong guessed cut shows up as a misaligned run or as a parse error.
-            Err(ParseError::Misaligned | ParseError::Bad(_)) if guessed => {
-                // Fall back to one run over the whole file: exact under spec 2.1.
-                guessed = false;
-            }
-            Err(ParseError::Misaligned) => {
-                return Err("records.csv: a record crosses a run boundary".into());
-            }
-            Err(ParseError::Bad(message)) => return Err(message),
+            // Fall back to one run over the whole file: exact under spec 2.1.
+            ParseError::Misaligned | ParseError::Bad(_) if guessed => guessed = false,
+            ParseError::Misaligned => return Err("a record crosses a run boundary".into()),
+            ParseError::Bad(message) => return Err(message),
         }
-    };
+    }
+}
 
-    let mut out = Vec::new();
-    // Group numbers are in output order: codes sorted, then `_UNMATCHED` ("_" > "Z").
-    for g in 0..keys.len() {
-        let index = if g + 1 == keys.len() {
-            UNMATCHED_GROUP
-        } else {
-            g
-        };
-        let mut total = Totals::default();
-        for part in &parts {
-            total.merge(&part[index]);
+/// Writes the output from each thread's totals and each country code's group + 1
+/// (0: not in regions.csv).
+fn write_output(
+    out_dir: &str,
+    parts: &[[Totals; GROUPS]],
+    codes: &[AtomicU8],
+) -> Result<(), String> {
+    // Keys sorted bytewise: the codes, then `_UNMATCHED` ("_" > "Z").
+    let mut keys: Vec<(String, usize)> = (0..CODES)
+        .filter(|&code| codes[code].load(Relaxed) != 0)
+        .map(|code| {
+            let letters = [code / 676, code / 26 % 26, code % 26].map(|c| (b'A' + c as u8) as char);
+            (
+                letters.iter().collect(),
+                codes[code].load(Relaxed) as usize - 1,
+            )
+        })
+        .collect();
+    keys.push(("_UNMATCHED".into(), UNMATCHED_GROUP));
+    let mut out = String::new();
+    for (key, group) in keys {
+        let mut t = EMPTY;
+        for part in parts {
+            for (k, v) in part[group].iter().enumerate() {
+                t[k] = match k {
+                    3 => t[k].min(*v),
+                    4 => t[k].max(*v),
+                    _ => t[k] + v,
+                };
+            }
         }
-        if total.count == 0 {
-            continue;
+        let [count, ids, sum, min, max, names, name_bytes, note_bytes] = t;
+        if count > 0 {
+            let (sum, min, max) = (money(sum), money(min), money(max));
+            _ = writeln!(
+                out,
+                "{key} {count} {ids} {sum} {min} {max} {names} {name_bytes} {note_bytes}"
+            );
         }
-        let t = total;
-        let (sum, min, max) = (
-            money(t.amount_sum),
-            money(t.amount_min),
-            money(t.amount_max),
-        );
-        let key = String::from_utf8_lossy(&keys[g]);
-        let (count, ids, names) = (t.count, t.id_sum, t.names_distinct);
-        let line = format!(
-            "{key} {count} {ids} {sum} {min} {max} {names} {} {}\n",
-            t.name_bytes, t.note_bytes
-        );
-        out.extend_from_slice(line.as_bytes());
     }
     let output_path = format!("{out_dir}/aggregates.txt");
-    File::create(&output_path)
-        .and_then(|mut f| f.write_all(&out))
-        .map_err(|e| format!("write {output_path}: {e}"))?;
-    // Done: exit without dropping the tables, one free at a time.
-    std::process::exit(0)
+    std::fs::write(&output_path, out).map_err(|e| format!("write {output_path}: {e}"))
 }
 
 /// Builds the join table from regions.csv, then parses and aggregates every run,
-/// one round of `threads` runs at a time, and returns each thread's totals and
-/// the groups' keys. One set of threads does all of it.
+/// one round of `threads` runs at a time, and writes the output. One set of
+/// threads does all of it, this one included. Returns only if this attempt failed.
 fn aggregate(
     text: &[u8],
     body_start: usize,
     guessed: bool,
     threads: usize,
-    region_chunks: &[&[u8]],
+    lines: &[u8],
     slots: usize,
-) -> Result<(Vec<Box<[Totals; GROUPS]>>, Vec<Vec<u8>>), ParseError> {
-    let seen: Vec<AtomicBool> = (0..CODES).map(|_| AtomicBool::new(false)).collect();
-    let ids = AtomicUsize::new(0); // the largest region id + 1
-    let table: Turns<Option<Result<(Regions, Vec<u8>), String>>> = Turns::new(None);
+    out_dir: &str,
+) -> ParseError {
+    // regions.csv lists its ids in ascending order (spec 2.3), so the last line
+    // has the largest. One entry more, for every id above it.
+    let last_line = lines[..lines.len().saturating_sub(1)]
+        .rsplit(|&b| b == b'\n')
+        .next()
+        .unwrap_or_default();
+    let ids = digits(last_line, &mut 0).0 as usize + 2;
+    let regions = Regions {
+        // SAFETY: zero is a valid AtomicU8. Zeroed by calloc, so the pages fault
+        // in on the threads that fill them.
+        group_of: unsafe { Box::new_zeroed_slice(ids.min(1 << 30)).assume_init() },
+        codes: (0..CODES).map(|_| AtomicU8::new(0)).collect(),
+        numbered: Mutex::new(0),
+    };
+    // regions.csv is entered in chunks that threads claim as they start, so the
+    // ones that start first do more of it.
+    let (next_chunk, chunks_done) = (AtomicUsize::new(0), AtomicUsize::new(0));
     // Each table is made by the first thread to take it, so their pages fault in
     // in parallel rather than all on this thread.
-    let partitions: Vec<Turns<Option<Partition>>> =
-        (0..PARTITIONS).map(|_| Turns::new(None)).collect();
+    let partitions: Vec<Mutex<Option<Partition>>> =
+        (0..PARTITIONS).map(|_| Mutex::new(None)).collect();
     // Pairs per thread per partition in one run, with room to spare (records are
     // about 60 bytes), so the buffers are allocated once, by their own thread.
     let units = threads * ROUNDS;
     let capacity = text.len() / (units * 60 * PARTITIONS) * 5 / 4 + 16;
-    let pairs: Vec<Turns<Vec<Vec<u64>>>> = (0..threads).map(|_| Turns::new(Vec::new())).collect();
+    let pairs: Vec<RwLock<Box<[Vec<u64>; PARTITIONS]>>> = (0..threads)
+        .map(|_| RwLock::new(Box::new(std::array::from_fn(|_| Vec::new()))))
+        .collect();
     let next_partition: Vec<AtomicUsize> = (0..ROUNDS).map(|_| AtomicUsize::new(0)).collect();
     let barrier = SpinBarrier::new(threads);
-    let results: Vec<Result<Box<[Totals; GROUPS]>, ParseError>> = thread::scope(|s| {
-        let handles: Vec<_> = (0..threads)
-            .map(|w| {
-                let (partitions, pairs, next_partition, barrier) =
-                    (&partitions, &pairs, &next_partition, &barrier);
-                let (seen, ids, table) = (&seen, &ids, &table);
-                s.spawn(move || {
-                    let mut totals: Box<[Totals; GROUPS]> =
-                        vec![Totals::default(); GROUPS].try_into().ok().unwrap();
-                    let mut error = None;
-                    // SAFETY: before the first barrier, only this thread touches its buffers.
-                    // (Not `vec![...; PARTITIONS]`: cloning a Vec does not keep its capacity.)
-                    *unsafe { pairs[w].get() } = (0..PARTITIONS)
-                        .map(|_| Vec::with_capacity(capacity))
-                        .collect();
-                    // regions.csv, in two passes over this thread's lines: the first finds
-                    // the countries, which numbers the groups; the second fills the table.
-                    let lines = region_chunks.get(w).copied().unwrap_or_default();
-                    // (A load first: storing every time would bounce the lines between cores.)
-                    let mark = |_, code: usize| {
-                        _ = seen[code].load(Relaxed) || seen[code].swap(true, Relaxed)
-                    };
-                    match scan_regions(lines, mark) {
-                        Ok(n) => _ = ids.fetch_max(n, Relaxed),
-                        Err(e) => error = Some(ParseError::Bad(e)),
+    let finished: Vec<Mutex<Option<[Totals; GROUPS]>>> =
+        (0..threads).map(|_| Mutex::new(None)).collect();
+    let failed = AtomicBool::new(false);
+    let worker = |w: usize| {
+        let mut totals = [EMPTY; GROUPS];
+        // Allocated here: buffer lengths next to another thread's would share
+        // cache lines with it (+1 ms).
+        *pairs[w].write().unwrap() =
+            Box::new(std::array::from_fn(|_| Vec::with_capacity(capacity)));
+        let mut error = None;
+        loop {
+            let chunk = next_chunk.fetch_add(1, Relaxed);
+            if chunk >= REGION_CHUNKS {
+                break;
+            }
+            if let Err(e) = regions.fill(lines, chunk, REGION_CHUNKS) {
+                error = Some(ParseError::Bad(e));
+            }
+            chunks_done.fetch_add(1, Release);
+        }
+        spin_until(|| chunks_done.load(Acquire) == REGION_CHUNKS);
+        for round in 0..ROUNDS {
+            let run = round * threads + w;
+            if error.is_none() {
+                let mut mine = pairs[w].write().unwrap();
+                mine.iter_mut().for_each(Vec::clear);
+                // Each thread finds its own cuts, so their pages fault in in parallel.
+                let start = run_start(text, body_start, run, units, guessed);
+                let end = run_start(text, body_start, run + 1, units, guessed);
+                match parse_run(text, start, end, &regions.group_of, &mut totals, &mut mine) {
+                    // Drop the run's pages now, in parallel, instead of the kernel
+                    // unmapping all 50,000 at exit on one core.
+                    Ok(last) if last == end => mmap::release(&text[start..end]),
+                    Ok(_) => error = Some(ParseError::Misaligned),
+                    Err(e) => error = Some(e),
+                }
+            }
+            barrier.wait();
+            loop {
+                let p = next_partition[round].fetch_add(1, Relaxed);
+                if p >= PARTITIONS || error.is_some() {
+                    break;
+                }
+                // The counter gives partition p to this thread alone this round.
+                let mut partition = partitions[p].lock().unwrap();
+                let partition = partition.get_or_insert_with(|| Partition::new(slots));
+                for buffers in &pairs {
+                    if let Err(e) = partition.add(&buffers.read().unwrap()[p], &mut totals) {
+                        error = Some(e);
                     }
-                    barrier.wait();
-                    if w == 0 {
-                        // SAFETY: between these two barriers only this thread touches it.
-                        *unsafe { table.get() } = Some(Regions::number(seen, ids.load(Relaxed)));
-                    }
-                    barrier.wait();
-                    // SAFETY: from here on the table is only read (its atomics stored to).
-                    let regions = match unsafe { table.read() } {
-                        Some(Ok((regions, codes))) if error.is_none() => {
-                            let fill = |id: usize, code: usize| {
-                                regions.group_of[id].store(codes[code], Relaxed)
-                            };
-                            if let Err(e) = scan_regions(lines, fill) {
-                                error = Some(ParseError::Bad(e));
-                            }
-                            Some(regions)
-                        }
-                        Some(Err(e)) => {
-                            error = Some(ParseError::Bad(e.clone()));
-                            None
-                        }
-                        _ => None,
-                    };
-                    barrier.wait();
-                    for round in 0..ROUNDS {
-                        let run = round * threads + w;
-                        if let (None, Some(regions)) = (&error, regions) {
-                            // SAFETY: while parsing, each thread touches only its own buffers.
-                            let mine = unsafe { pairs[w].get() };
-                            mine.iter_mut().for_each(Vec::clear);
-                            // Each thread finds its own cuts, so their pages fault in in parallel.
-                            let start = run_start(text, body_start, run, units, guessed);
-                            let end = run_start(text, body_start, run + 1, units, guessed);
-                            let mine = mine.as_mut_slice().try_into().unwrap();
-                            match parse_run(text, start, end, regions, &mut totals, mine) {
-                                // Drop the run's pages now, in parallel, instead of
-                                // the kernel unmapping all 50,000 at exit on one core.
-                                Ok(last) if last == end => mmap::release(&text[start..end]),
-                                Ok(_) => error = Some(ParseError::Misaligned),
-                                Err(e) => error = Some(e),
-                            }
-                        }
-                        barrier.wait();
-                        loop {
-                            let p = next_partition[round].fetch_add(1, Relaxed);
-                            if p >= PARTITIONS || error.is_some() {
-                                break;
-                            }
-                            // SAFETY: the counter gives partition p to this thread alone
-                            // for this round, and every buffer's writer is past the barrier.
-                            let partition = unsafe { partitions[p].get() }
-                                .get_or_insert_with(|| Partition::new(slots));
-                            for buffers in pairs {
-                                let mine = &unsafe { buffers.read() }[p];
-                                if let Err(e) = partition.add(mine, &mut totals) {
-                                    error = Some(e);
-                                }
-                            }
-                        }
-                        barrier.wait();
-                    }
-                    error.map_or(Ok(totals), Err)
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
+                }
+            }
+            if round + 1 == ROUNDS {
+                match error {
+                    None => *finished[w].lock().unwrap() = Some(totals),
+                    Some(_) => failed.store(true, Relaxed),
+                }
+            }
+            barrier.wait();
+        }
+        // The first thread writes the output and exits, without waiting for the
+        // others to exit and without dropping anything.
+        if w == 0 && !failed.load(Relaxed) {
+            let parts: Vec<_> = finished
+                .iter()
+                .map(|t| t.lock().unwrap().unwrap())
+                .collect();
+            exit_with(write_output(out_dir, &parts, &regions.codes));
+        }
+        error
+    };
+    let errors: Vec<_> = thread::scope(|s| {
+        let worker = &worker;
+        let handles: Vec<_> = (1..threads).map(|w| s.spawn(move || worker(w))).collect();
+        let first = worker(0);
+        std::iter::once(first)
+            .chain(handles.into_iter().map(|h| h.join().unwrap()))
+            .collect()
     });
     // A bad cut can also make the table overflow, so the cut errors come first.
-    let mut parts = Vec::new();
-    let mut full = false;
-    for result in results {
-        match result {
-            Ok(totals) => parts.push(totals),
-            Err(ParseError::NamesFull) => full = true,
-            Err(e) => return Err(e),
+    let mut full = None;
+    for error in errors.into_iter().flatten() {
+        match error {
+            ParseError::NamesFull => full = Some(error),
+            e => return e,
         }
     }
-    if full {
-        return Err(ParseError::NamesFull);
-    }
-    match table.0.into_inner() {
-        Some(Ok((regions, _))) => Ok((parts, regions.keys)),
-        _ => Err(ParseError::Bad("regions.csv: no table".into())),
+    full.unwrap_or(ParseError::Bad("no thread failed".into()))
+}
+
+/// Spins for a while, then yields the core between checks, until `done()`. The
+/// phases between checks last a millisecond or two, and waking a dozen sleeping
+/// threads takes a good part of that (std's Barrier: about 1 ms more per run).
+/// Yielding after the spin keeps a thread that lost its core from being starved.
+fn spin_until(done: impl Fn() -> bool) {
+    for spin in 0u32.. {
+        if done() {
+            return;
+        }
+        if spin < 1 << 14 {
+            std::hint::spin_loop();
+        } else {
+            thread::yield_now();
+        }
     }
 }
 
-/// A barrier whose waiters spin for a while before sleeping. Each round's phases
-/// last a millisecond or two, and waking a dozen sleeping threads takes a good
-/// part of that (std's Barrier: about 1 ms more per run). The spin is bounded,
-/// then waiters block, so a thread that lost its core is never starved by them.
+/// A barrier that waits with `spin_until`.
 struct SpinBarrier {
     threads: usize,
     arrived: AtomicUsize,
     generation: AtomicUsize,
-    lock: Mutex<()>,
-    wake: Condvar,
 }
 
 impl SpinBarrier {
     fn new(threads: usize) -> Self {
         let (arrived, generation) = (AtomicUsize::new(0), AtomicUsize::new(0));
-        let (lock, wake) = (Mutex::new(()), Condvar::new());
         SpinBarrier {
             threads,
             arrived,
             generation,
-            lock,
-            wake,
         }
     }
 
@@ -310,52 +327,18 @@ impl SpinBarrier {
         let generation = self.generation.load(Acquire);
         if self.arrived.fetch_add(1, AcqRel) + 1 == self.threads {
             self.arrived.store(0, Relaxed);
-            // Under the lock, so a waiter cannot check and then miss the wake-up.
-            let _guard = self.lock.lock().unwrap();
             self.generation.fetch_add(1, Release);
-            self.wake.notify_all();
-            return;
+        } else {
+            spin_until(|| self.generation.load(Acquire) != generation);
         }
-        for _ in 0..1 << 14 {
-            if self.generation.load(Acquire) != generation {
-                return;
-            }
-            std::hint::spin_loop();
-        }
-        let mut guard = self.lock.lock().unwrap();
-        while self.generation.load(Acquire) == generation {
-            guard = self.wake.wait(guard).unwrap();
-        }
-    }
-}
-
-/// A value that threads take turns on. The barriers between phases order every
-/// access; within a phase, each use states why it is the only writer.
-struct Turns<T>(UnsafeCell<T>);
-
-// SAFETY: see the type's comment; T itself is only moved between threads.
-unsafe impl<T: Send> Sync for Turns<T> {}
-
-impl<T> Turns<T> {
-    fn new(value: T) -> Self {
-        Turns(UnsafeCell::new(value))
-    }
-
-    /// SAFETY: no other thread may access the value during this phase.
-    #[allow(clippy::mut_from_ref)]
-    unsafe fn get(&self) -> &mut T {
-        unsafe { &mut *self.0.get() }
-    }
-
-    /// SAFETY: no thread may write the value during this phase.
-    unsafe fn read(&self) -> &T {
-        unsafe { &*self.0.get() }
     }
 }
 
 /// One partition's names: an open-addressing table of name hashes in buckets of
-/// 4, kept at most half full so that a lookup is nearly always one bucket, with a dense id per
-/// name, and one row of bits per id, a bit per group.
+/// 4, kept at most half full so that a lookup is nearly always one bucket, with a
+/// dense id per name, and one row of bits per id, a bit per group. (Rows by slot
+/// instead, in a 7/8 full table: 23% less memory, but 13% of lookups leave their
+/// first bucket, +0.8M branch misses.)
 struct Partition {
     keys: Vec<u64>, // 0 = empty, else the name hash with its low byte set to 0xFF
     ids: Vec<u16>,  // by slot
@@ -421,7 +404,7 @@ impl Partition {
                 let word =
                     seen.get_unchecked_mut(*ids.get_unchecked(slot) as usize * WORDS + group / 64);
                 let bit = 1 << (group % 64);
-                totals[group].names_distinct += (*word & bit == 0) as u64;
+                totals[group][NAMES_DISTINCT] += (*word & bit == 0) as i64;
                 *word |= bit;
             }
         }
@@ -429,196 +412,81 @@ impl Partition {
     }
 }
 
-/// The join table: region id -> group index. Groups are the country codes in
-/// sorted order, then `_UNMATCHED` as the last one.
+/// The join table: region id -> group.
 struct Regions {
     /// Dense by region id: group + 1, or 0 for ids the table does not contain.
-    group_of: Vec<AtomicU8>,
-    /// Group index -> output key.
-    keys: Vec<Vec<u8>>,
+    group_of: Box<[AtomicU8]>,
+    /// By country code index: its group + 1, or 0 while not seen.
+    codes: Vec<AtomicU8>,
+    /// Held while a code gets the next group number.
+    numbered: Mutex<u8>,
 }
-
-/// Country codes are `[A-Z]{3}` (spec 2.3), so each has an index below 26^3.
-const CODES: usize = 26 * 26 * 26;
 
 impl Regions {
-    /// Numbers the groups from the codes seen in the first pass (codes sorted, then
-    /// `_UNMATCHED`), with an empty table for region ids below `ids`. Also returns
-    /// what the second pass stores for each code: its group + 1.
-    fn number(seen: &[AtomicBool], ids: usize) -> Result<(Self, Vec<u8>), String> {
-        let mut codes = vec![0; CODES];
-        let mut keys = Vec::new();
-        for code in (0..CODES).filter(|&c| seen[c].load(Relaxed)) {
-            if keys.len() + 2 > u8::MAX as usize {
-                return Err("regions.csv: too many countries".into());
+    /// Enters the `region_id,CCC` LF lines that start in the `k`th of `parts`
+    /// equal parts of `lines`.
+    fn fill(&self, lines: &[u8], k: usize, parts: usize) -> Result<(), String> {
+        let cut = |k: usize| match lines.len() * k / parts {
+            0 => 0,
+            p => {
+                p + lines[p - 1..]
+                    .iter()
+                    .position(|&b| b == b'\n')
+                    .unwrap_or(lines.len() - p)
             }
-            codes[code] = keys.len() as u8 + 1;
-            keys.push(
-                [code / 676, code / 26 % 26, code % 26]
-                    .map(|letter| b'A' + letter as u8)
-                    .to_vec(),
-            );
-        }
-        keys.push(UNMATCHED.to_vec());
-        // Zeroed by calloc, so the pages fault in on the threads that fill them.
-        // One more entry than the largest id, for every id above it.
-        let mut zeros = std::mem::ManuallyDrop::new(vec![0u8; ids + 1]);
-        // SAFETY: AtomicU8 has the size, alignment and bit validity of u8.
-        let group_of = unsafe {
-            Vec::from_raw_parts(
-                zeros.as_mut_ptr().cast::<AtomicU8>(),
-                zeros.len(),
-                zeros.capacity(),
-            )
         };
-        Ok((Regions { group_of, keys }, codes))
-    }
-
-    /// The group of a region id: its stored value minus 1, so 0 (not in the
-    /// table) wraps to UNMATCHED_GROUP.
-    #[inline(always)]
-    fn group(&self, region_id: u64) -> u8 {
-        let k = (region_id as usize).min(self.group_of.len() - 1);
-        // SAFETY: k is below the length (which is at least 1).
-        unsafe { self.group_of.get_unchecked(k) }
-            .load(Relaxed)
-            .wrapping_sub(1)
-    }
-}
-
-/// Calls `visit(region_id, country code index)` for every `region_id "," [A-Z]{3}
-/// LF` line of `chunk`; returns the largest region id + 1 (0 for none).
-fn scan_regions(chunk: &[u8], visit: impl Fn(usize, usize)) -> Result<usize, String> {
-    let (mut i, mut ids) = (0, 0);
-    while i < chunk.len() {
-        if let Some((id, code, len)) = region_line(&chunk[i..]) {
-            visit(id, code);
-            ids = ids.max(id + 1);
-            i += len;
-            continue;
+        for line in lines[cut(k)..cut(k + 1)].split_inclusive(|&b| b == b'\n') {
+            let bad = || format!("regions.csv: bad line {}", String::from_utf8_lossy(line));
+            let [id @ .., b',', a, b, c, b'\n'] = line else {
+                return Err(bad());
+            };
+            let (region, n) = digits(id, &mut 0);
+            let slot = self
+                .group_of
+                .get(region as usize)
+                .filter(|_| n == id.len() && n > 0);
+            let code = [a, b, c].iter().all(|c| c.is_ascii_uppercase());
+            let (Some(slot), true) = (slot, code) else {
+                return Err(bad());
+            };
+            let code = &self.codes[[a, b, c]
+                .iter()
+                .fold(0, |acc, &&c| acc * 26 + (c - b'A') as usize)];
+            if code.load(Relaxed) == 0 {
+                let mut numbered = self.numbered.lock().unwrap();
+                if code.load(Relaxed) == 0 {
+                    *numbered = numbered
+                        .checked_add(1)
+                        .ok_or("regions.csv: too many countries")?;
+                    code.store(*numbered, Relaxed);
+                }
+            }
+            slot.store(code.load(Relaxed), Relaxed);
         }
-        let comma = i + chunk[i..]
-            .iter()
-            .position(|&b| b == b',')
-            .ok_or("regions.csv: a line without a comma")?;
-        let id = parse_digits(&chunk[i..comma]).ok_or("regions.csv: bad region_id")? as usize;
-        let code = chunk
-            .get(comma + 1..comma + 4)
-            .filter(|c| c.iter().all(u8::is_ascii_uppercase));
-        let code = code
-            .filter(|_| chunk.get(comma + 4) == Some(&b'\n'))
-            .ok_or("regions.csv: bad country")?;
-        visit(
-            id,
-            code.iter()
-                .fold(0, |acc, &b| acc * 26 + (b - b'A') as usize),
-        );
-        ids = ids.max(id + 1);
-        i = comma + 5;
-    }
-    Ok(ids)
-}
-
-/// The common `region_id "," [A-Z]{3} LF` line, with at most 7 digits, from two
-/// loads: the region id, the code's index and the line's length.
-#[inline(always)]
-fn region_line(line: &[u8]) -> Option<(usize, usize, usize)> {
-    let bytes = line.first_chunk::<16>()?;
-    let word = u64::from_le_bytes(bytes[..8].try_into().unwrap());
-    let x = word ^ 0x2C2C_2C2C_2C2C_2C2C; // the first comma is the first zero byte
-    let k = ((x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080).trailing_zeros()
-        / 8) as usize;
-    let digits = (word ^ ZEROS) << (8 * (8 - k) & 63);
-    let bad = (digits.wrapping_add(0x7676_7676_7676_7676) | digits) & 0x8080_8080_8080_8080;
-    let code = &bytes[k + 1..k + 4];
-    let ok = (1..8).contains(&k) && bad == 0 && bytes[k + 4] == b'\n';
-    (ok && code.iter().all(u8::is_ascii_uppercase)).then(|| {
-        let index = code
-            .iter()
-            .fold(0, |acc, &b| acc * 26 + (b - b'A') as usize);
-        (eight_digits(digits) as usize, index, k + 5)
-    })
-}
-
-/// Splits `data` into about `parts` slices, each ending just after a newline.
-fn split_at_lines(data: &[u8], parts: usize) -> Vec<&[u8]> {
-    let mut chunks = Vec::with_capacity(parts);
-    let mut start = 0;
-    for p in 1..=parts {
-        let mut end = (data.len() * p / parts).max(start);
-        while end < data.len() && (end == 0 || data[end - 1] != b'\n') {
-            end += 1;
-        }
-        if end > start {
-            chunks.push(&data[start..end]);
-        }
-        start = end;
-    }
-    chunks
-}
-
-#[derive(Clone)]
-struct Totals {
-    count: u64,
-    id_sum: u64,
-    amount_sum: i64,
-    amount_min: i64,
-    amount_max: i64,
-    names_distinct: u64,
-    name_bytes: u64,
-    note_bytes: u64,
-}
-
-impl Default for Totals {
-    fn default() -> Self {
-        Totals {
-            count: 0,
-            id_sum: 0,
-            amount_sum: 0,
-            amount_min: i64::MAX,
-            amount_max: i64::MIN,
-            names_distinct: 0,
-            name_bytes: 0,
-            note_bytes: 0,
-        }
-    }
-}
-
-impl Totals {
-    fn merge(&mut self, other: &Totals) {
-        self.count += other.count;
-        self.id_sum += other.id_sum;
-        self.amount_sum += other.amount_sum;
-        self.amount_min = self.amount_min.min(other.amount_min);
-        self.amount_max = self.amount_max.max(other.amount_max);
-        self.names_distinct += other.names_distinct;
-        self.name_bytes += other.name_bytes;
-        self.note_bytes += other.note_bytes;
+        Ok(())
     }
 }
 
 enum ParseError {
-    /// A partition's name table passed 7/8 full; retry with bigger ones.
+    /// A partition's name table passed half full; retry with bigger ones.
     NamesFull,
     /// A run did not end where the next one starts (only possible for a guessed cut).
     Misaligned,
     Bad(String),
 }
 
-/// Returns the offset of the first data record, after the BOM and header.
-fn skip_header(text: &[u8]) -> Result<usize, String> {
-    let start = if text.starts_with(BOM) { BOM.len() } else { 0 };
-    let rest = &text[start..];
-    let end = rest
-        .strip_prefix(RECORDS_HEADER)
-        .ok_or("unexpected records.csv header")?;
-    let terminator = match end {
-        [b'\r', b'\n', ..] => 2,
-        [b'\n', ..] => 1,
-        [] => 0,
-        _ => return Err("unexpected records.csv header".into()),
+/// The offset of the first data record, after the BOM and header.
+fn skip_header(text: &[u8]) -> Option<usize> {
+    let rest = text
+        .strip_prefix(BOM)
+        .unwrap_or(text)
+        .strip_prefix(RECORDS_HEADER)?;
+    let body = match rest {
+        [b'\r', b'\n', body @ ..] | [b'\n', body @ ..] => body,
+        [] => rest,
+        _ => return None,
     };
-    Ok(start + RECORDS_HEADER.len() + terminator)
+    Some(text.len() - body.len())
 }
 
 /// Where run `k` of the `parts` runs of `text[from..]` starts (`parts`: the end):
@@ -643,12 +511,14 @@ fn run_start(text: &[u8], from: usize, k: usize, parts: usize, guessed: bool) ->
 
 /// Parses the records in `text[start..end]` into `totals`, and files each
 /// record's (name hash, group) pair under its partition. Returns where the last
-/// record ended, which is `end` when `start` and `end` are record starts.
+/// record ended, which is `end` when `start` and `end` are record starts. (It
+/// takes the table, not `&Regions`, whose Mutex would make every record reload
+/// the table's address.)
 fn parse_run(
     text: &[u8],
     start: usize,
     end: usize,
-    regions: &Regions,
+    group_of: &[AtomicU8],
     totals: &mut [Totals; GROUPS],
     pairs: &mut [Vec<u64>; PARTITIONS],
 ) -> Result<usize, ParseError> {
@@ -656,17 +526,23 @@ fn parse_run(
     while i < end {
         let r = match fast_record(text, i) {
             Some(r) => r,
-            None => slow_record(text, i)?,
+            None => slow_record(text, i)
+                .ok_or_else(|| ParseError::Bad(format!("records.csv: bad record at byte {i}")))?,
         };
-        let group = regions.group(r.region_id);
-        let total = &mut totals[group as usize];
-        total.count += 1;
-        total.id_sum += r.id;
-        total.amount_sum += r.cents;
-        total.amount_min = total.amount_min.min(r.cents);
-        total.amount_max = total.amount_max.max(r.cents);
-        total.name_bytes += r.name_bytes;
-        total.note_bytes += r.note_bytes;
+        // The stored group + 1, so 0 (not in the table) wraps to UNMATCHED_GROUP.
+        let k = (r.region_id as usize).min(group_of.len() - 1);
+        // SAFETY: k is below the length (which is at least 2).
+        let group = unsafe { group_of.get_unchecked(k) }
+            .load(Relaxed)
+            .wrapping_sub(1);
+        let t = &mut totals[group as usize];
+        t[0] += 1;
+        t[1] += r.id as i64;
+        t[2] += r.cents;
+        t[3] = t[3].min(r.cents);
+        t[4] = t[4].max(r.cents);
+        t[6] += r.name_bytes as i64;
+        t[7] += r.note_bytes as i64;
         pairs[(r.hash >> (64 - PARTITION_BITS)) as usize].push(r.hash & !0xFF | group as u64);
         i = r.next;
     }
@@ -783,111 +659,88 @@ fn fast_record(text: &[u8], i: usize) -> Option<Record> {
     })
 }
 
-/// Any record starting at `i`, parsed by the general separator scan. Kept out of
-/// line, so that it does not crowd the registers of the fast path's loop.
+/// Any record starting at `i`, parsed byte by byte as spec 2.1 defines it; None
+/// if it is invalid. Kept out of line, so that it does not crowd the registers of
+/// the fast path's loop.
 #[cold]
 #[inline(never)]
-fn slow_record(text: &[u8], i: usize) -> Result<Record, ParseError> {
-    let bad = |at: usize, what: &str| ParseError::Bad(format!("records.csv byte {at}: {what}"));
-    let mut scan = Scanner::new(text, i);
-    let id_start = if text[i..].starts_with(BOM) {
-        i + BOM.len()
+fn slow_record(text: &[u8], i: usize) -> Option<Record> {
+    let mut at = i + if text[i..].starts_with(BOM) {
+        BOM.len()
     } else {
-        i
+        0
     }; // not data
-    let (id_end, q0) = scan.next();
-    let (name_end, q1) = scan.next();
-    let (note_end, q2) = scan.next();
-    let (region_end, _) = scan.next();
-    let (amount_end, _) = scan.next();
-    let commas = [id_end, name_end, note_end, region_end]
-        .iter()
-        .all(|&e| text.get(e) == Some(&b','));
-    if !commas || amount_end < text.len() && text[amount_end] != b'\n' {
-        return Err(bad(i, "expected five fields and a record terminator"));
-    }
-    let id = digits(text, id_start, id_end).ok_or_else(|| bad(id_start, "bad id"))?;
-    let (name, name_bytes) = text_value(text, id_end + 1, name_end, q1 - q0)
-        .ok_or_else(|| bad(id_end + 1, "bad name"))?;
-    let (_, note_bytes) = text_value(text, name_end + 1, note_end, q2 - q1)
-        .ok_or_else(|| bad(name_end + 1, "bad note"))?;
-    let region_id =
-        digits(text, note_end + 1, region_end).ok_or_else(|| bad(note_end + 1, "bad region_id"))?;
-    let cents = amount(text, region_end + 1, amount_end)
-        .ok_or_else(|| bad(region_end + 1, "bad amount"))?;
-    Ok(Record {
+    let expect = |at: &mut usize, byte: u8| (text.get(*at) == Some(&byte)).then(|| *at += 1);
+    let (id, n) = digits(text, &mut at);
+    expect(&mut at, b',').filter(|_| n > 0)?;
+    let (name_start, name_end, name_bytes) = text_field(text, &mut at)?;
+    expect(&mut at, b',')?;
+    let (_, _, note_bytes) = text_field(text, &mut at)?;
+    expect(&mut at, b',')?;
+    let (region_id, n) = digits(text, &mut at);
+    expect(&mut at, b',').filter(|_| n > 0)?;
+    let negative = expect(&mut at, b'-').is_some();
+    let (whole, n) = digits(text, &mut at);
+    expect(&mut at, b'.').filter(|_| n > 0)?;
+    let (fraction, n) = digits(text, &mut at);
+    let next = match &text[at..] {
+        _ if n != 2 => return None,
+        [] => at,
+        [b'\n', ..] => at + 1,
+        [b'\r', b'\n', ..] => at + 2,
+        [b'\r'] => at + 1, // a CR at the very end, as before and as the reference reads it
+        _ => return None,
+    };
+    let cents = whole.wrapping_mul(100).wrapping_add(fraction) as i64;
+    Some(Record {
         id,
         region_id,
-        cents,
+        cents: if negative { -cents } else { cents },
         name_bytes,
         note_bytes,
-        hash: hash(text, name.0, name.1),
-        next: amount_end + 1,
+        hash: hash(text, name_start, name_end),
+        next,
     })
 }
 
-/// Walks the field separators of a run of records (every `,` and LF outside
-/// quotes) in order, 64 bytes at a time.
-struct Scanner<'a> {
-    text: &'a [u8],
-    block: usize,       // offset of the current block
-    separators: u64,    // its separators not returned yet
-    quotes: u64,        // its quote bits
-    quotes_before: u64, // quotes between the start of the run and the block
-    inside: u64,        // all ones if the block ended inside quotes
+/// The digits at `*at`, which it moves past: their value and their count.
+fn digits(text: &[u8], at: &mut usize) -> (u64, usize) {
+    let n = text[*at..]
+        .iter()
+        .take_while(|b| b.is_ascii_digit())
+        .count();
+    let digits = &text[*at..*at + n];
+    *at += n;
+    (
+        digits.iter().fold(0u64, |v, &b| {
+            v.wrapping_mul(10).wrapping_add((b - b'0') as u64)
+        }),
+        n,
+    )
 }
 
-impl<'a> Scanner<'a> {
-    /// Starts at `start`, which must be outside quotes: a record start.
-    fn new(text: &'a [u8], start: usize) -> Self {
-        let mut scanner = Scanner {
-            text,
-            block: start,
-            separators: 0,
-            quotes: 0,
-            quotes_before: 0,
-            inside: 0,
-        };
-        scanner.load(start);
-        scanner
+/// The name or note at `*at`, which it moves past: the range of its raw value
+/// (inside the quotes, if quoted) and its unescaped length.
+fn text_field(text: &[u8], at: &mut usize) -> Option<(usize, usize, u64)> {
+    let s = *at;
+    if text.get(s) != Some(&b'"') {
+        let rest = &text[s..];
+        let n = rest
+            .iter()
+            .position(|&b| matches!(b, b'"' | b',' | b'\r' | b'\n'));
+        *at += n.unwrap_or(rest.len());
+        return Some((s, *at, (*at - s) as u64));
     }
-
-    fn load(&mut self, at: usize) {
-        let rest = &self.text[at.min(self.text.len())..];
-        let (quotes, commas, lfs) = match rest.first_chunk::<64>() {
-            Some(block) => masks(block),
-            None => {
-                let mut padded = [0; 64];
-                padded[..rest.len()].copy_from_slice(rest);
-                masks(&padded)
-            }
-        };
-        let inside = prefix_xor(quotes) ^ self.inside;
-        self.inside = ((inside as i64) >> 63) as u64;
-        self.quotes_before += self.quotes.count_ones() as u64;
-        (self.block, self.quotes, self.separators) = (at, quotes, (commas | lfs) & !inside);
-    }
-
-    /// The offset of the next separator, and the number of quotes before it. Past
-    /// the last one: the length of the text (the final record may lack a terminator).
-    #[inline(always)]
-    fn next(&mut self) -> (usize, u64) {
-        while self.separators == 0 {
-            if self.block + 64 >= self.text.len() {
-                return (
-                    self.text.len(),
-                    self.quotes_before + self.quotes.count_ones() as u64,
-                );
-            }
-            self.load(self.block + 64);
+    let (mut e, mut escapes) = (s + 1, 0);
+    loop {
+        e += text.get(e..)?.iter().position(|&b| b == b'"')?;
+        if text.get(e + 1) != Some(&b'"') {
+            break;
         }
-        let k = self.separators.trailing_zeros();
-        self.separators &= self.separators - 1;
-        (
-            self.block + k as usize,
-            self.quotes_before + (self.quotes & ((1 << k) - 1)).count_ones() as u64,
-        )
+        (e, escapes) = (e + 2, escapes + 1);
     }
+    *at = e + 1;
+    Some((s + 1, e, (e - s - 1 - escapes) as u64))
 }
 
 /// Bitmaps of a 64-byte block: bit k is set if byte k is `"`, `,` or LF.
@@ -937,35 +790,6 @@ fn prefix_xor(bits: u64) -> u64 {
     }
 }
 
-/// A name or note field `text[s..e]` that holds `quotes` double quotes: the range of
-/// its raw value bytes, and its unescaped length. Inner quotes are not checked to
-/// pair up: the separator scan only proves that their count is even. An unpaired
-/// one (invalid, never generated) would be counted as half of a `""`.
-#[inline(always)]
-fn text_value(text: &[u8], s: usize, e: usize, quotes: u64) -> Option<((usize, usize), u64)> {
-    if quotes == 0 {
-        return Some(((s, e), (e - s) as u64));
-    }
-    let quoted = e - s >= 2 && text[s] == b'"' && text[e - 1] == b'"';
-    quoted.then(|| ((s + 1, e - 1), (e - s) as u64 - 1 - quotes / 2))
-}
-
-/// `1*DIGIT` in `text[s..e]`. Up to 8 digits: one load and SWAR arithmetic.
-#[inline(always)]
-fn digits(text: &[u8], s: usize, e: usize) -> Option<u64> {
-    let len = e.checked_sub(s)?;
-    if (1..=8).contains(&len) && e >= 8 {
-        // The 8 bytes ending at the field, minus '0', with the bytes before the
-        // field zeroed: they read as leading zeros.
-        let word = (u64::from_le_bytes(text[e - 8..e].try_into().unwrap()) ^ 0x3030_3030_3030_3030)
-            & u64::MAX << (8 * (8 - len));
-        // Every byte must now be 0..=9: adding 0x76 sets the top bit of any above 9.
-        return ((word.wrapping_add(0x7676_7676_7676_7676) | word) & 0x8080_8080_8080_8080 == 0)
-            .then(|| eight_digits(word));
-    }
-    parse_digits(text.get(s..e)?)
-}
-
 /// Three numbers at once, from the 8 bytes ending at each (the id, the region id,
 /// and the amount with its dot, which is squeezed out as in `amount`), and how
 /// many digits each has (at most 8). Returns the numbers, and whether every digit
@@ -1010,55 +834,6 @@ fn numbers(words: [u64; 3], lens: [usize; 3]) -> ([u64; 3], bool) {
     }
 }
 
-/// Eight digit values, most significant in the lowest byte, as a number.
-#[inline(always)]
-fn eight_digits(x: u64) -> u64 {
-    let x = (x * 10 + (x >> 8)) & 0x00FF_00FF_00FF_00FF;
-    let x = (x * 100 + (x >> 16)) & 0x0000_FFFF_0000_FFFF;
-    (x * 10000 + (x >> 32)) & 0xFFFF_FFFF
-}
-
-fn parse_digits(digits: &[u8]) -> Option<u64> {
-    if digits.is_empty() || digits.len() > 18 || !digits.iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-    Some(
-        digits
-            .iter()
-            .fold(0, |acc, &b| acc * 10 + (b - b'0') as u64),
-    )
-}
-
-/// `[ "-" ] 1*DIGIT "." 2DIGIT` in `text[s..e]`, before the CR of a CRLF: cents.
-#[inline(always)]
-fn amount(text: &[u8], s: usize, mut e: usize) -> Option<i64> {
-    if e > s && text[e - 1] == b'\r' {
-        e -= 1;
-    }
-    let negative = text.get(s) == Some(&b'-');
-    let start = s + negative as usize;
-    if e < start + 4 || text[e - 3] != b'.' {
-        return None;
-    }
-    let whole = e - 3 - start;
-    let cents = if (1..=5).contains(&whole) && e >= 8 {
-        // One SWAR conversion for the whole amount: the 8 bytes ending at the field,
-        // minus '0', with the dot (byte 5) squeezed out and the bytes before the
-        // field zeroed, read as digits (whole * 100 + cents).
-        let word = u64::from_le_bytes(text[e - 8..e].try_into().unwrap()) ^ 0x3030_3030_3030_3030;
-        let word = (word & 0x0000_00FF_FFFF_FFFF) << 8 | word & 0xFFFF_0000_0000_0000;
-        let word = word & u64::MAX << (8 * (6 - whole));
-        // Every byte must now be 0..=9 (see `digits`).
-        if (word.wrapping_add(0x7676_7676_7676_7676) | word) & 0x8080_8080_8080_8080 != 0 {
-            return None;
-        }
-        eight_digits(word) as i64
-    } else {
-        (digits(text, start, e - 3)? * 100 + digits(text, e - 2, e)?) as i64
-    };
-    Some(if negative { -cents } else { cents })
-}
-
 /// Cents as money: sign, integer part, two decimals ("-0.05", "0.00").
 fn money(cents: i64) -> String {
     let (sign, abs) = (if cents < 0 { "-" } else { "" }, cents.unsigned_abs());
@@ -1101,7 +876,6 @@ unsafe fn hash_words(text: &[u8], s: usize, e: usize) -> u64 {
     let last = load(e - 8) & ((rest > 8) as u64).wrapping_neg();
     mix(h ^ first ^ P1, last ^ P0 ^ len)
 }
-
 /// `hash` of a field at the very end of the file, from a padded copy so that
 /// its loads stay in bounds.
 #[cold]
