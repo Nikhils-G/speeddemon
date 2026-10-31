@@ -75,13 +75,16 @@ fn main() {
     // The endpoint ids in byte order of their names.
     let endpoints = table.count.load(Relaxed);
     let names: Vec<&[u8]> = (0..endpoints).map(|id| table.name(id)).collect();
+    // First by the first 16 bytes as one number (zero-padded: a prefix sorts first),
+    // so few comparisons need the bytes themselves.
+    let prefixes: Vec<u128> = names.iter().map(|name| number(name)).collect();
     let mut order: Vec<usize> = (0..endpoints).collect();
-    order.sort_unstable_by_key(|&id| names[id]);
+    order.sort_unstable_by_key(|&id| (prefixes[id], names[id]));
 
     // The hours in order, and each hour's runs from every part.
     let all_runs = parts.iter().flat_map(|p| &p.runs);
     let mut hours: Vec<Head> = all_runs.map(|r| r.head).collect();
-    hours.sort_unstable();
+    hours.sort_unstable_by_key(|head| number(head));
     hours.dedup();
     // Also how many hours still read each part's records: the hour that brings
     // its part's count to zero gives the rest of the records back. Runs of one
@@ -92,7 +95,8 @@ fn main() {
         for (k, run) in part.runs.iter().enumerate() {
             let next = part.runs.get(k + 1);
             let end = next.map_or(part.records.len(), |r| r.start as usize);
-            let runs = &mut runs_of[hours.binary_search(&run.head).unwrap()];
+            let hour = hours.binary_search_by_key(&number(&run.head), |h| number(h));
+            let runs = &mut runs_of[hour.unwrap()];
             if runs.last().is_none_or(|r| r.0 != p) {
                 readers[p].fetch_add(1, Relaxed);
             }
@@ -242,6 +246,14 @@ fn main() {
 
 /// The first 13 bytes of a timestamp, "YYYY-MM-DDTHH": one UTC hour.
 type Head = [u8; 13];
+
+/// Up to the first 16 bytes, zero-padded, as a number that sorts like them.
+fn number(bytes: &[u8]) -> u128 {
+    let mut padded = [0; 16];
+    let n = bytes.len().min(16);
+    padded[..n].copy_from_slice(&bytes[..n]);
+    u128::from_be_bytes(padded)
+}
 
 /// A run of consecutive lines of one part in one hour, from record `start` (and
 /// escape `escapes`) to the next run's start.
