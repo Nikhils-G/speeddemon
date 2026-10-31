@@ -20,8 +20,9 @@ unsafe extern "C" {
 
 /// Drops this process's page-table entries for the whole pages inside `slice`, a
 /// part of a read-only file mapping that is done with. At exit the kernel would
-/// otherwise unmap the 22,000 pages of the input one by one, on one core; this
-/// does the same work in each parsing thread, in parallel. Reading the bytes again is still correct: the page faults back in from the page cache.
+/// otherwise unmap the 22,450 pages of the input one by one, on one core; this
+/// does the same work in each parsing thread, in parallel. Reading the bytes
+/// again would still be correct: the page faults back in from the page cache.
 pub fn release(slice: &[u8]) {
     const PAGE: usize = 4096;
     const MADV_DONTNEED: c_int = 4;

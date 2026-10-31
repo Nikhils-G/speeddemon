@@ -3,12 +3,15 @@
 //!
 //! How it is fast:
 //! 1. Both files are mmap'd (pre-warmed page cache: no memory charge, no copy).
-//! 2. Every thread parses its own slice of the edge list. Out-degrees are counted
-//!    with atomic increments, then a prefix sum and a second atomic cursor scatter
-//!    the edges into one CSR array (offsets + packed (head, weight) pairs), so the
-//!    graph is built in parallel with no per-node allocation.
+//! 2. Every thread parses its own slice of the edge list into buckets by source
+//!    node (sequential appends), then threads take buckets and lay each one out
+//!    with a counting sort that stays in cache, into its own part of one CSR array
+//!    (offsets + packed (head, weight) pairs). See `build_graph`. Each parsing
+//!    thread then drops its slice of the mapping (`mmap::release`).
 //! 3. Nodes are renumbered so that a search's nodes sit close together in memory:
 //!    each thread grows a breadth-first region from its own seed (see `relabel`).
+//!    A reverse CSR (every edge stored at its head) is built from the renumbered
+//!    graph, in parallel, with an atomic cursor per node (see `reverse`).
 //! 4. Queries run in parallel, one bidirectional Dijkstra per query: a forward
 //!    search from s and a backward one from t over the reversed graph take strict
 //!    turns, and stop once their two frontiers prove that no shorter path is left.
@@ -16,6 +19,17 @@
 //!    radix heap and a paged distance table that stays in cache (see `Search`).
 //! 5. A source without out-edges or a target without in-edges is answered -1 at
 //!    once: the reference settles the whole graph to find that out.
+//! 6. The process exits right after writing the answers, without freeing anything.
+//!
+//! Every atomic uses `Relaxed`: each one only claims a node or hands out work or
+//! slots, and all results are read after `thread::scope` has joined the threads,
+//! which already orders every write before every later read.
+//!
+//! Exactness: distances are exact integers (u32, with the rare value that does
+//! not fit kept as u64 in a side map), and the bidirectional search stops by the
+//! standard rule (argued at `distance`), so every answer equals the reference's
+//! whatever the thread count or timing. Malformed input is not expected (the
+//! format is fixed by the spec); node ids and the edge count are still checked.
 
 mod mmap;
 
@@ -25,6 +39,9 @@ use std::io::Write;
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering::Relaxed};
 use std::thread;
 
+/// `relabel` marks each node with the index of the BFS region that claimed it,
+/// one byte per node; this value means no region has it yet, so at most 255
+/// regions (0..=254) can run.
 const UNCLAIMED: u8 = u8::MAX;
 
 fn main() {
@@ -107,6 +124,8 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
         }
     });
 
+    // Almost every answer is 1-5 digits plus a newline; 12 bytes each leaves
+    // room for the few 10-digit ones without regrowing.
     let mut out = Vec::with_capacity(queries.len() * 12);
     for answer in &answers {
         match answer.get() {
@@ -119,11 +138,14 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
     File::create(&output_path)
         .and_then(|mut f| f.write_all(&out))
         .map_err(|e| format!("write {output_path}: {e}"))?;
-    // Done: exit without freeing the graphs (about 120 MB), one free at a time.
+    // Done: exit without freeing the two graphs (about 95 MB) and the search
+    // pools one allocation at a time; the kernel reclaims them at exit anyway.
     std::process::exit(0)
 }
 
-/// A per-query result slot written by exactly one thread.
+/// A per-query result slot written by exactly one thread. It is atomic only so
+/// that the query threads can share the answer vector without `unsafe`; a
+/// `Relaxed` store or load compiles to a plain one.
 #[derive(Default)]
 struct AtomicI64Cell(std::sync::atomic::AtomicI64);
 
@@ -136,9 +158,11 @@ impl AtomicI64Cell {
     }
 }
 
-/// Source-node buckets for building the CSR: few enough that each parsing thread's
-/// 128 append cursors stay in cache, enough that one bucket's nodes (~14K) and
-/// their counts fit in L1/L2 while the bucket is laid out.
+/// Source-node buckets for building the CSR: at most 2^7 = 128, few enough that
+/// each parsing thread's append cursors stay in cache, enough that one bucket's
+/// nodes and their counters fit in L1/L2 while the bucket is laid out. Bucket b
+/// is the node range `b << shift ..`; for the full graph (n = 1,740,512, 21 bits)
+/// shift is 14, giving 107 buckets of 16,384 nodes and about 47,000 edges each.
 const BUCKET_BITS: u32 = 7;
 
 /// Builds the CSR without a random write per edge. Pass 1 parses every slice in
@@ -160,6 +184,8 @@ fn build_graph(text: &[u8], threads: usize) -> Result<Graph, String> {
             .into_iter()
             .map(|chunk| {
                 s.spawn(move || -> Result<Vec<Vec<(u32, u32, u32)>>, String> {
+                    // An edge line averages about 18 bytes (92 MB / 5M lines), so
+                    // this is each bucket's expected share plus slack.
                     let mut out =
                         vec![Vec::with_capacity(chunk.len() / 18 / buckets + 16); buckets];
                     let mut i = 0;
@@ -178,6 +204,8 @@ fn build_graph(text: &[u8], threads: usize) -> Result<Graph, String> {
                 })
             })
             .collect();
+        // join() only fails if the thread panicked, and panic = "abort" in
+        // Cargo.toml ends the process first, so the unwrap cannot fire.
         handles
             .into_iter()
             .map(|h| h.join().unwrap())
@@ -265,6 +293,9 @@ fn relabel(graph: Graph, threads: usize) -> (Graph, Vec<u32>) {
         while head < queue.len() {
             // The queue says which nodes come next: prefetch their offsets and edges
             // so the cache misses overlap instead of stalling one after another.
+            // Two distances because the edge address needs the offset: the offset
+            // of the node 16 ahead is fetched first, so by the time it is 8 ahead
+            // its offset is in cache and its edges can be fetched.
             if let Some(&ahead) = queue.get(head + 16) {
                 prefetch(graph.offsets.get(ahead as usize));
             }
@@ -286,6 +317,8 @@ fn relabel(graph: Graph, threads: usize) -> (Graph, Vec<u32>) {
             .map(|t| {
                 let (claim, grow) = (&claim, &grow);
                 s.spawn(move || {
+                    // Input ids are random, so evenly spaced ids are random
+                    // places in the network: one seed per region.
                     let seed = (n * t / regions) as u32;
                     let mut queue = Vec::new();
                     if n > 0 && claim(seed, t) {
@@ -301,6 +334,11 @@ fn relabel(graph: Graph, threads: usize) -> (Graph, Vec<u32>) {
             .flat_map(|h| h.join().unwrap())
             .collect()
     });
+    // The main body is strongly connected, so any region seeded in it covers it
+    // and every node it has an edge into. What is left (islands, nodes without
+    // in-edges, isolated nodes) is about 150 nodes at full scale, picked up by
+    // this serial scan over all n owner bytes. Only locality depends on this,
+    // never correctness: every node gets some new id.
     for root in 0..n as u32 {
         if claim(root, 0) {
             order.push(root);
@@ -403,6 +441,23 @@ fn reverse(graph: &Graph, threads: usize) -> Graph {
 /// labelled by both sides; it is exact once the two last-popped keys, each a lower
 /// bound for its side's unsettled nodes, add up to at least `best`, or once a side
 /// has run out of nodes.
+///
+/// Why that is exact. `best` is only ever the length of a real s-t path, so it
+/// is never below the true distance D. Take a shortest path P. Weights are
+/// non-negative and both heaps are monotone, so a settled node holds its exact
+/// distance and an unsettled one is at least `last` away from its side's start.
+/// By the time the loop ends, s is settled forward and t backward.
+/// (1) If some node of P is settled by neither side, D >= forward.last +
+///     backward.last, so the stop rule cannot fire while `best` > D.
+/// (2) Otherwise let y be the first node of P not settled forward (t if none)
+///     and x its predecessor: x is settled forward, y backward. Relaxing (x, y)
+///     left y a forward label <= d(s, x) + w(x, y). Whichever side set its final
+///     label of y later saw the other side's final label (t's backward label 0
+///     is set before any other), so it offered at most D to `best`.
+/// A side that runs out has settled everything it can reach, so P is case (2);
+/// if t cannot be reached, `best` stays `u64::MAX` and the answer is -1. Labels
+/// above 2^32 are kept exactly (see `Search`), and `saturating_add` keeps "not
+/// reached" (`u64::MAX`) from wrapping.
 fn distance(
     graph: &Graph,
     reverse: &Graph,
@@ -440,8 +495,13 @@ fn prefetch<T>(item: Option<&T>) {
     }
 }
 
+/// A raw pointer into one output array, shared by the threads that fill it.
 struct Shared<T>(*mut T);
-// SAFETY: only used for the disjoint writes in build_graph and relabel.
+// SAFETY: sharing the pointer is sound because every use writes a slot that no
+// other thread writes or reads during that `thread::scope`: bucket ranges in
+// `build_graph`, one slot per node in `relabel`, and slots handed out by an atomic
+// cursor in `reverse`. The array outlives the scope, and nothing reads it until
+// the scope has joined its threads.
 unsafe impl<T> Sync for Shared<T> {}
 
 /// One thread's reusable Dijkstra state.
@@ -453,7 +513,10 @@ struct Search {
     /// and a thread's pool is a few MB instead of 7. A distance that does not fit
     /// (a path through one of the weights near 2^32) is stored as BIG with its
     /// exact value in `big`.
-    page_of: Vec<u16>, // node >> PAGE_BITS -> pool page + 1, or 0
+    /// node >> PAGE_BITS -> pool page + 1, or 0. u16 halves this index (and so
+    /// its cache footprint): the full graph has 6,799 node pages, and u16 holds
+    /// up to 65,535, which is enough for graphs of up to 16.7M nodes.
+    page_of: Vec<u16>,
     pool: Vec<u32>,
     used: Vec<u32>, // the node pages in use by this search
     big: HashMap<u32, u64>,
@@ -512,11 +575,14 @@ impl Search {
             self.used.push(node >> PAGE_BITS);
             page = self.used.len() as u16;
             self.page_of[(node >> PAGE_BITS) as usize] = page;
+            // Grows the pool by one page the first time this many pages are in
+            // use; it stays within the reserved capacity, so it never moves.
             if self.pool.len() < self.used.len() * PAGE {
                 self.pool.resize(self.used.len() * PAGE, 0);
             }
         }
         let slot = &mut self.pool[(page as usize - 1) * PAGE + (node as usize & (PAGE - 1))];
+        // Stored as d + 1, which must stay below BIG to be told apart from it.
         if d + 1 < BIG as u64 {
             *slot = d as u32 + 1;
         } else {
@@ -573,8 +639,10 @@ impl Search {
 /// Each entry moves down at most 64 times in total, so push and pop are O(1)
 /// amortized, on short contiguous vectors instead of a 15-level binary heap.
 struct RadixHeap {
+    /// The last key popped (0 for a fresh heap): a lower bound for every entry.
     last: u64,
     len: usize,
+    /// Indexed by the bit length of `key ^ last`, 0..=64: 65 buckets.
     buckets: [Vec<(u64, u32)>; 65],
 }
 
@@ -609,6 +677,7 @@ impl RadixHeap {
             return None;
         }
         if self.buckets[0].is_empty() {
+            // len > 0, so some bucket is non-empty: both unwraps hold.
             let b = (1..65).find(|&b| !self.buckets[b].is_empty()).unwrap();
             let moving = std::mem::take(&mut self.buckets[b]);
             self.last = moving.iter().map(|&(key, _)| key).min().unwrap();
