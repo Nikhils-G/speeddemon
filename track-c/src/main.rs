@@ -133,7 +133,9 @@ fn aggregate(file: &File, len: usize, starts: &[usize], threads: usize, regions:
     // Pairs per thread per partition in one run, with room to spare (records are
     // about 60 bytes), so the buffers are allocated once.
     let capacity = len / (starts.len() * 60 * PARTITIONS) * 5 / 4 + 16;
-    let pairs: Vec<Turns<Vec<Vec<u64>>>> = (0..threads).map(|_| Turns::new(vec![Vec::with_capacity(capacity); PARTITIONS])).collect();
+    // (Not `vec![...; PARTITIONS]`: cloning a Vec does not keep its capacity.)
+    let buffers = || (0..PARTITIONS).map(|_| Vec::with_capacity(capacity)).collect();
+    let pairs: Vec<Turns<Vec<Vec<u64>>>> = (0..threads).map(|_| Turns::new(buffers())).collect();
     let next_partition: Vec<AtomicUsize> = (0..ROUNDS).map(|_| AtomicUsize::new(0)).collect();
     let barrier = Barrier::new(threads);
     let results: Vec<Result<Vec<Totals>, ParseError>> = thread::scope(|s| {
