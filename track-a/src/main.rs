@@ -98,7 +98,16 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
         .map(|id| table.name(id))
         .collect();
     let mut order: Vec<u32> = (0..found.len() as u32).collect();
-    order.sort_unstable_by_key(|&id| found[id as usize]);
+    // Compared eight bytes at a time first, then whole (only long names can tie).
+    let prefix = |name: &[u8]| {
+        let mut words = [0u64; 16];
+        for (word, bytes) in words.iter_mut().zip(name.chunks(8)) {
+            *word = bytes.iter().fold(0, |w, &b| w << 8 | b as u64) << (64 - 8 * bytes.len());
+        }
+        words
+    };
+    let prefixes: Vec<[u64; 16]> = found.iter().map(|name| prefix(name)).collect();
+    order.sort_unstable_by_key(|&id| &prefixes[id as usize]);
     let mut rank = vec![0u32; found.len()];
     for (r, &id) in order.iter().enumerate() {
         rank[id as usize] = r as u32;
@@ -154,29 +163,78 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
         .map_err(|e| format!("size {output_path}: {e}"))?;
     let file = mmap::map_mut(&output, bound).map_err(|e| format!("mmap {output_path}: {e}"))?;
     let file = file.as_mut_ptr() as usize; // shared by the threads, each hour its own bytes
-    // ends[h] is where hour h's output ends, once known (hours are taken in order).
+    // ends[h] is where hour h's output starts, once known: hours are taken in
+    // order, and ends are filled in from the hours' lengths up to `known`.
+    let unknown = || AtomicUsize::new(usize::MAX);
     let ends: Vec<AtomicUsize> = (0..=hours.len())
-        .map(|h| AtomicUsize::new(if h == 0 { 0 } else { usize::MAX }))
+        .map(|h| {
+            if h == 0 {
+                AtomicUsize::new(0)
+            } else {
+                unknown()
+            }
+        })
         .collect();
+    let lens: Vec<AtomicUsize> = hours.iter().map(|_| unknown()).collect();
+    let known = AtomicUsize::new(0);
 
     // Pass 2, parallel over hours: each thread takes the next hour, gathers its
     // records from every part, groups them by endpoint rank, computes each group's
-    // statistics and the hour's length, then writes the hour once the previous
-    // one's end is known.
+    // statistics and the hour's length, then writes each of its hours once the
+    // previous one's end is known, taking further hours meanwhile.
     let next = AtomicUsize::new(0);
     thread::scope(|s| {
         for _ in 0..threads {
             let (parts, rank, names, runs_of, next, readers, hours, ends) = (
                 &parts, &rank, &names, &runs_of, &next, &readers, &hours, &ends,
             );
+            let (lens, known) = (&lens, &known);
+            // Writes the pending hours whose start is known; with `wait`, all of them.
+            let flush = move |pending: &mut Vec<(usize, Vec<Stats>)>, wait: bool| {
+                while !pending.is_empty() {
+                    let mut h = known.load(Acquire);
+                    while let Some(len) = lens.get(h).map(|l| l.load(Acquire)) {
+                        if len == usize::MAX {
+                            break;
+                        }
+                        ends[h + 1].store(ends[h].load(Acquire) + len, Release);
+                        h += 1;
+                    }
+                    known.fetch_max(h, AcqRel);
+                    pending.retain(|(hour, groups)| {
+                        let at = ends[*hour].load(Acquire);
+                        if at == usize::MAX {
+                            return true;
+                        }
+                        let len = lens[*hour].load(Relaxed);
+                        // SAFETY: bytes at..at + len of the mapping are this hour's
+                        // alone, and at + len <= bound: every line is at most
+                        // `longest` bytes.
+                        let out = unsafe {
+                            std::slice::from_raw_parts_mut((file as *mut u8).add(at), len)
+                        };
+                        let mut written = 0;
+                        for stat in groups {
+                            written += stat.write(&hours[*hour], names, &mut out[written..]);
+                        }
+                        assert_eq!(written, len, "hour length");
+                        false
+                    });
+                    if !wait {
+                        break;
+                    }
+                    thread::yield_now();
+                }
+            };
             s.spawn(move || {
+                let mut pending = Vec::new();
                 let (mut start, mut counts, mut values) =
                     (vec![0u32; endpoints + 1], vec![0u64; endpoints], Vec::new());
                 let (mut cursor, mut groups) = (vec![0u32; endpoints + 1], Vec::new());
                 loop {
                     let hour = next.fetch_add(1, Relaxed);
                     let Some(runs) = runs_of.get(hour) else {
-                        break;
+                        break flush(&mut pending, true);
                     };
                     // Count per endpoint rank, errors in the high half of the same
                     // word (one increment per record), then turn the counts into
@@ -253,22 +311,9 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
                             groups.push(stat);
                         }
                     }
-                    let at = loop {
-                        match ends[hour].load(Acquire) {
-                            usize::MAX => thread::yield_now(),
-                            at => break at,
-                        }
-                    };
-                    ends[hour + 1].store(at + len, Release);
-                    // SAFETY: bytes at..at + len of the mapping are this hour's alone,
-                    // and at + len <= bound: every line is at most `longest` bytes.
-                    let out =
-                        unsafe { std::slice::from_raw_parts_mut((file as *mut u8).add(at), len) };
-                    let mut written = 0;
-                    for stat in &groups {
-                        written += stat.write(&hours[hour], names, &mut out[written..]);
-                    }
-                    assert_eq!(written, len, "hour length");
+                    lens[hour].store(len, Release);
+                    pending.push((hour, std::mem::take(&mut groups)));
+                    flush(&mut pending, false);
                 }
             });
         }
