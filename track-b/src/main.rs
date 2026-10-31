@@ -362,19 +362,16 @@ fn find(buckets: *const Bucket, mask: usize, mut b: usize, key: __m128i) -> u32 
 /// to `anchors`, prefetching each id's word of `w`. Returns the number of
 /// anchors. Its own function, so that the table stays in registers.
 #[inline(never)]
-fn find_all(pending: &[(__m128i, u64)], table: &Table, slots: (*mut u64, *mut u64, u64, usize), toks: *mut u32, anchors: *mut u32) -> usize {
-    let (w, present, bit, nb) = slots;
+fn find_all(pending: &[(__m128i, u64)], table: &Table, w: *const u64, nb: usize, toks: *mut u32, anchors: *mut u32) -> usize {
     let (buckets, shift, mask) = (table.buckets.as_ptr(), table.shift, table.buckets.len() - 1);
     let mut na = 0;
     for (i, &(key, h)) in pending.iter().enumerate() {
         // SAFETY: SSE4.1 is enabled for the whole build (it comes with AVX2).
         let info = if unsafe { _mm_testz_si128(key, key) } == 1 { h as u32 } else { find(buckets, mask, (h >> shift) as usize, key) };
-        let slot = ((info & MISS) as usize).min(nb);
-        // SAFETY: slot <= nb, inside `w` and `present`; writes to the callers'
-        // room for every pending token.
+        // SAFETY: a prefetch of a word of `w`, and writes to the callers' room
+        // for every pending token.
         unsafe {
-            *w.add(slot) |= bit;
-            *present.add(slot / 64) |= 1 << (slot % 64);
+            _mm_prefetch::<_MM_HINT_T0>(w.add(((info & MISS) as usize).min(nb)) as *const i8);
             anchors.add(na).write(i as u32);
             toks.add(i).write(info & MISS);
         }
@@ -670,8 +667,12 @@ struct Scan<'a> {
     /// Per BOOL term, bit i: document `block + i` contains it. Slot nb collects
     /// the tokens of no BOOL query; slot nb + 1 is all ones.
     w: Vec<u64>,
-    /// Bit t: slot t is set in this block.
-    present: Vec<u64>,
+    /// The slots set in this block (`touched[..n]`), to clear, and those of
+    /// them that trigger entries (`triggers[..m]`), to evaluate.
+    touched: Vec<u32>,
+    triggers: Vec<u32>,
+    n: usize,
+    m: usize,
     /// Bit t: slot t triggers entries.
     trigger: Vec<u64>,
     /// Row r < plan.rows: the words of BOOL term r in the 4 blocks of this
@@ -700,7 +701,10 @@ impl<'a> Scan<'a> {
             df,
             nb,
             w: (0..nb + 2).map(|slot| if slot == nb + 1 { !0 } else { 0 }).collect(),
-            present: vec![0; nb / 64 + 1],
+            touched: vec![0; nb + 2],
+            triggers: vec![0; nb + 2],
+            n: 0,
+            m: 0,
             trigger: plan.map_or(vec![0; nb / 64 + 1], |p| p.trigger.clone()),
             wide: (0..rows + 2).map(|row| Row([if row == rows + 1 { !0 } else { 0 }; 4])).collect(),
             pending: Vec::new(),
@@ -789,7 +793,8 @@ impl<'a> Scan<'a> {
     }
 
     /// Looks up the tokens of this document, whose bit is `bit`, and sets their
-    /// words. The buckets were fetched when the tokens were found.
+    /// words. The buckets were fetched when the tokens were found, and the
+    /// words are fetched while the tokens are probed.
     fn look_up(&mut self, bit: u64) {
         let nb = self.nb;
         // A document is looked up once, at its end.
@@ -797,11 +802,28 @@ impl<'a> Scan<'a> {
         let n = self.pending.len();
         self.toks.reserve(n);
         self.anchors.reserve(n);
-        let slots = (self.w.as_mut_ptr(), self.present.as_mut_ptr(), bit, nb);
-        let na = find_all(&self.pending, &self.vocab.table, slots, self.toks.as_mut_ptr(), self.anchors.as_mut_ptr());
+        let na = find_all(&self.pending, &self.vocab.table, self.w.as_ptr(), nb, self.toks.as_mut_ptr(), self.anchors.as_mut_ptr());
         // SAFETY: find_all wrote the first n and na entries.
         unsafe { (self.toks.set_len(n), self.anchors.set_len(na)) };
         self.pending.clear();
+        let (w, touched, mut n) = (self.w.as_mut_ptr(), self.touched.as_mut_ptr(), self.n);
+        let (triggers, mut m, trigger) = (self.triggers.as_mut_ptr(), self.m, self.trigger.as_ptr());
+        for &id in &self.toks {
+            // Branch-free: a slot seen for the first time in this block is
+            // kept in `touched`.
+            let slot = (id as usize).min(nb);
+            // SAFETY: slot <= nb < w.len(), slot / 64 < trigger.len(), and
+            // m <= n <= nb + 1 < touched.len(): n counts distinct slots.
+            unsafe {
+                let x = *w.add(slot);
+                *touched.add(n) = slot as u32;
+                *triggers.add(m) = slot as u32;
+                n += (x == 0) as usize;
+                m += (x == 0) as usize & (*trigger.add(slot / 64) >> (slot % 64)) as usize & 1;
+                *w.add(slot) = x | bit;
+            }
+        }
+        (self.n, self.m) = (n, m);
     }
 
     /// Ends the current document at the id token of the next one; returns its bit.
@@ -811,7 +833,7 @@ impl<'a> Scan<'a> {
             return Err("docs.txt: ids must be 0, 1, 2, ... in order".into());
         }
         self.end_doc();
-        if id % 64 == 0 {
+        if id % 64 == 0 && self.n > 0 {
             self.end_block(id - 64);
         }
         // At the first id of a slice after the first, this evaluates an empty
@@ -858,8 +880,7 @@ impl<'a> Scan<'a> {
     fn end_block(&mut self, base: u32) {
         let w = &mut self.w;
         if let Some(plan) = self.plan {
-            // The set slots that trigger entries, in order.
-            for t in (0..self.present.len()).flat_map(|k| bits(self.present[k] & self.trigger[k], k * 64)) {
+            for t in self.triggers[..self.m].iter().map(|&t| t as usize) {
                 for e in &plan.entries[plan.group[t] as usize..plan.group[t + 1] as usize] {
                     let bit = |b: u32| 0u64.wrapping_sub((b & 1) as u64);
                     let r = e.terms.iter().fold(0u64, |r, &word| {
@@ -874,13 +895,11 @@ impl<'a> Scan<'a> {
             }
         }
         let (rows, block) = (self.wide.len() - 2, (base / 64 % (SUPER / 64)) as usize);
-        for k in 0..self.present.len() {
-            for t in bits(self.present[k], k * 64) {
-                self.wide[t.min(rows)].0[block] = w[t];
-                w[t] = 0;
-            }
-            self.present[k] = 0;
+        for &t in &self.touched[..self.n] {
+            self.wide[(t as usize).min(rows)].0[block] = w[t as usize];
+            w[t as usize] = 0;
         }
+        (self.n, self.m) = (0, 0);
     }
 
     /// Evaluates the `always` queries on the superblock of 256 documents from
@@ -993,11 +1012,6 @@ fn count_positions(v: __m256i) -> (u64, u64) {
         let total = _mm_cvtsi128_si32(s) as u64;
         (total >> 16, total & 0xFFFF)
     }
-}
-
-/// base + i for each set bit i of `word`, in order.
-fn bits(mut word: u64, base: usize) -> impl Iterator<Item = usize> {
-    std::iter::from_fn(move || (word != 0).then(|| (base + word.trailing_zeros() as usize, word &= word - 1).0))
 }
 
 /// Bit i is set when byte `at + i` is `byte`.
