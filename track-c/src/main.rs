@@ -168,7 +168,10 @@ fn run(data_dir: &str, out_dir: &str) -> Result<std::convert::Infallible, String
             spin_until(|| chunks_done.load(Acquire) == REGION_CHUNKS);
             // Runs are claimed one at a time, so a thread slowed down parses fewer of
             // them, and no thread waits for another one until the end.
-            while let Some(run) = Some(next_run.fetch_add(1, Relaxed)).filter(|&r| r < runs) {
+            while let Some(claim) = Some(next_run.fetch_add(1, Relaxed)).filter(|&r| r < runs) {
+                // Claims go round the file's `threads` stripes, so that runs parsed at
+                // the same time are far apart and do not share page tables.
+                let run = claim % threads * RUNS_PER_THREAD + claim / threads;
                 // Each thread finds its own cuts, so their pages fault in in parallel.
                 let cut = |run| run_start(text, body_start, run, runs, guessed);
                 if error.is_ok() {
