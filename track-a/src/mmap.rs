@@ -18,19 +18,20 @@ unsafe extern "C" {
     fn madvise(addr: *mut c_void, len: usize, advice: c_int) -> c_int;
 }
 
-/// Drops this process's page-table entries for the whole pages inside `slice`, a
-/// part of a read-only file mapping that is done with. At exit the kernel would
-/// otherwise unmap the 58,000 pages of the input one by one, on one core (about
-/// 9 ms); this does the same work in each parsing thread, in parallel. Reading the
-/// bytes again is still correct: the page faults back in from the page cache.
+/// Drops this process's pages for the whole pages inside `slice`, which is done
+/// with. At exit the kernel would otherwise unmap the 58,000 pages of the input one
+/// by one, on one core (about 9 ms); this does the same work in each parsing thread,
+/// in parallel. Reading the input again is still correct: the page faults back in
+/// from the page cache. Anonymous memory (the records) is freed and would read as
+/// zeros, but it is never read again.
 pub fn release(slice: &[u8]) {
     const PAGE: usize = 4096;
     const MADV_DONTNEED: c_int = 4;
     let start = (slice.as_ptr() as usize).next_multiple_of(PAGE);
     let end = (slice.as_ptr() as usize + slice.len()) / PAGE * PAGE;
     if end > start {
-        // SAFETY: whole pages inside a private, read-only file mapping that is
-        // never written; dropping them loses nothing.
+        // SAFETY: whole pages of a private mapping whose contents are no longer
+        // needed (see above); no reference observes a change.
         unsafe { madvise(start as *mut c_void, end - start, MADV_DONTNEED) };
     }
 }
