@@ -26,6 +26,9 @@
 
 mod mmap;
 
+#[cfg(not(all(target_feature = "avx2", target_feature = "pclmulqdq")))]
+compile_error!("track-c needs AVX2 and PCLMULQDQ: build with RUSTFLAGS=\"-C target-cpu=native\"");
+
 use std::cell::UnsafeCell;
 use std::fs::File;
 use std::io::Write;
@@ -673,41 +676,27 @@ impl<'a> Scanner<'a> {
 /// `,` or LF (second).
 #[inline(always)]
 fn masks(block: &[u8; 64]) -> (u64, u64) {
-    #[cfg(target_feature = "avx2")]
-    {
-        use std::arch::x86_64::*;
-        // SAFETY: AVX2 is enabled for this build (the cfg), and the two unaligned
-        // 32-byte loads are inside the 64-byte array.
-        unsafe {
-            let (lo, hi) = (
-                _mm256_loadu_si256(block.as_ptr().cast()),
-                _mm256_loadu_si256(block.as_ptr().add(32).cast()),
-            );
-            let eq = |v, byte: u8| _mm256_cmpeq_epi8(v, _mm256_set1_epi8(byte as i8));
-            let separators = |v| _mm256_or_si256(eq(v, b','), eq(v, b'\n'));
-            let bits = |lo, hi| movemask(lo) as u64 | (movemask(hi) as u64) << 32;
-            (
-                bits(eq(lo, b'"'), eq(hi, b'"')),
-                bits(separators(lo), separators(hi)),
-            )
-        }
-    }
-    #[cfg(not(target_feature = "avx2"))]
-    {
-        let bits = |hit: fn(u8) -> bool| {
-            block
-                .iter()
-                .rev()
-                .fold(0u64, |acc, &b| acc << 1 | hit(b) as u64)
-        };
-        (bits(|b| b == b'"'), bits(|b| b == b',' || b == b'\n'))
+    use std::arch::x86_64::*;
+    // SAFETY: AVX2 is enabled for this build (see the compile_error), and the two unaligned
+    // 32-byte loads are inside the 64-byte array.
+    unsafe {
+        let (lo, hi) = (
+            _mm256_loadu_si256(block.as_ptr().cast()),
+            _mm256_loadu_si256(block.as_ptr().add(32).cast()),
+        );
+        let eq = |v, byte: u8| _mm256_cmpeq_epi8(v, _mm256_set1_epi8(byte as i8));
+        let separators = |v| _mm256_or_si256(eq(v, b','), eq(v, b'\n'));
+        let bits = |lo, hi| movemask(lo) as u64 | (movemask(hi) as u64) << 32;
+        (
+            bits(eq(lo, b'"'), eq(hi, b'"')),
+            bits(separators(lo), separators(hi)),
+        )
     }
 }
 
 /// `vpmovmskb`, kept opaque to the optimizer. LLVM rewrites the intrinsic as a
 /// vector of booleans, and on CPUs without AVX-512 (the scoring box) it then
 /// assembled our 64-bit masks one bit at a time: a quarter of the run time.
-#[cfg(target_feature = "avx2")]
 #[inline(always)]
 fn movemask(v: std::arch::x86_64::__m256i) -> u32 {
     let mask: u32;
@@ -722,24 +711,15 @@ fn movemask(v: std::arch::x86_64::__m256i) -> u32 {
 /// for each byte whether it is inside quotes (an opening quote counts as inside, a
 /// closing one as outside, and a `""` pair leaves the state unchanged).
 fn prefix_xor(bits: u64) -> u64 {
-    #[cfg(target_feature = "pclmulqdq")]
-    {
-        use std::arch::x86_64::*;
-        // A carry-less multiply by all ones XORs every lower bit into each bit.
-        // SAFETY: PCLMULQDQ is enabled for this build (the cfg).
-        unsafe {
-            _mm_cvtsi128_si64(_mm_clmulepi64_si128(
-                _mm_set_epi64x(0, bits as i64),
-                _mm_set1_epi8(-1),
-                0,
-            )) as u64
-        }
-    }
-    #[cfg(not(target_feature = "pclmulqdq"))]
-    {
-        [1, 2, 4, 8, 16, 32]
-            .iter()
-            .fold(bits, |x, &shift| x ^ x << shift)
+    use std::arch::x86_64::*;
+    // A carry-less multiply by all ones XORs every lower bit into each bit.
+    // SAFETY: PCLMULQDQ is enabled for this build (see the compile_error).
+    unsafe {
+        _mm_cvtsi128_si64(_mm_clmulepi64_si128(
+            _mm_set_epi64x(0, bits as i64),
+            _mm_set1_epi8(-1),
+            0,
+        )) as u64
     }
 }
 
