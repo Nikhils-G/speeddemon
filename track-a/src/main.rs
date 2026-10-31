@@ -27,11 +27,9 @@
 #[cfg(not(target_feature = "avx2"))]
 compile_error!("track-a needs AVX2: build with RUSTFLAGS=\"-C target-cpu=native\"");
 
-use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering::*};
-use std::{
-    arch::x86_64::*, fs::File, io::Error, os::fd::AsRawFd, ptr::null_mut, sync::OnceLock, thread,
-};
+use std::{arch::x86_64::*, cell::UnsafeCell, fs::File, io::Error, os::fd::AsRawFd, ptr::null_mut};
+use std::{sync::OnceLock, thread};
 
 /// A record is `endpoint id << 21 | error << 20 | latency`: 11 bits of endpoint id,
 /// bit 20 set for a 5xx status, and 20 bits of latency. A latency of ESCAPE or more
@@ -52,15 +50,14 @@ fn main() {
     unsafe { prctl(41, 1, 0, 0, 0) };
     let dir = |n, default: &str| std::env::args().nth(n).unwrap_or(default.into());
     let input = File::open(dir(1, "/data") + "/requests.log").expect("open the log");
-    let len = input.metadata().expect("stat the log").len() as usize;
     // Read and write: the output is mapped shared and written through memory.
     let mut options = File::options();
     options.read(true).write(true).create(true).truncate(true);
     let output = options.open(dir(2, "/out") + "/summary.txt");
     let output = output.expect("create the summary");
-    if len == 0 {
+    let len @ 1.. = input.metadata().expect("stat the log").len() as usize else {
         return; // the spec's empty input gives an empty summary
-    }
+    };
     // The log followed by PAD zero bytes: the whole range is reserved as zero
     // pages, then the file is mapped over its start (the rest of the file's last
     // page reads as zero). The dataset is mounted read-only, so the bytes cannot
@@ -72,9 +69,9 @@ fn main() {
 
     // Pass 1, parallel: each thread parses one slice of the log, cut at line ends,
     // into packed records, with one endpoint table shared by all threads. Cut p is
-    // the start of the line that holds byte len * p / threads - 1 (0 for p = 0, the
-    // end of the log for p = threads): cuts never decrease, so the slices hold every
-    // line once; two cuts in one line give an empty slice.
+    // just after the last LF before byte len * p / threads (0 if there is none; the
+    // last cut is the end of the log, which ends with an LF). Cuts never decrease,
+    // so the slices hold every line once; two cuts in one line give an empty slice.
     let threads = thread::available_parallelism().map_or(1, |n| n.get());
     let lf = |p| log[..len * p / threads].iter().rposition(|&b| b == b'\n');
     let cut = |p| lf(p).map_or(0, |i| i + 1);
@@ -82,10 +79,8 @@ fn main() {
     // Allocated zeroed, its pages are mapped as the parse first touches them.
     let table: &Interner = Box::leak(unsafe { Box::new_zeroed().assume_init() });
     let parts: Vec<Part> = thread::scope(|s| {
-        let spawn = |chunk| s.spawn(move || parse(chunk, table));
-        let handles: Vec<_> = (0..threads)
-            .map(|p| spawn(&log[cut(p)..cut(p + 1)]))
-            .collect();
+        let spawn = |p| s.spawn(move || parse(&log[cut(p)..cut(p + 1)], table));
+        let handles: Vec<_> = (0..threads).map(spawn).collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
@@ -285,11 +280,9 @@ fn write(head: &[u8; 16], name: &[u8], stat: Stats, out: &mut [u8]) -> usize {
 }
 
 /// "00", "01", ..., "99".
-static PAIRS: &[u8; 200] = b"0001020304050607080910111213141516171819\
-    2021222324252627282930313233343536373839\
-    4041424344454647484950515253545556575859\
-    6061626364656667686970717273747576777879\
-    8081828384858687888990919293949596979899";
+static PAIRS: &[u8; 200] = b"000102030405060708091011121314151617181920212223242526272829303132\
+    33343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778\
+    798081828384858687888990919293949596979899";
 
 /// One thread's parse of its slice: one record per line, in file order (see
 /// ENDPOINT_SHIFT); the latencies that did not fit, in the same order; and where
@@ -305,7 +298,7 @@ fn parse(chunk: &[u8], table: &Interner) -> Part {
     // the pages actually written are ever backed by memory. The shortest line is 40
     // bytes: timestamp, "GET", "/", status, one digit, four spaces and LF.
     let most = chunk.len() / 40 + 1;
-    let (mut records, mut escapes) = (Vec::with_capacity(most), Vec::with_capacity(most));
+    let [mut records, mut escapes] = [(); 2].map(|_| Vec::<u32>::with_capacity(most));
     let mut runs = Vec::new();
     // SAFETY: every load stays within the line (at most 177 bytes) and the PAD zero
     // bytes after the log: the space windows end at most 188 bytes in, the endpoint
@@ -315,8 +308,7 @@ fn parse(chunk: &[u8], table: &Interner) -> Part {
     // most `most` lines, and each line writes one record and one escape slot.
     unsafe {
         let space = _mm256_set1_epi8(b' ' as i8);
-        let (mut record, mut escape): (*mut u32, *mut u32) =
-            (records.as_mut_ptr(), escapes.as_mut_ptr());
+        let (mut record, mut escape) = (records.as_mut_ptr(), escapes.as_mut_ptr());
         let (mut line, stop) = (chunk.as_ptr(), chunk.as_ptr_range().end);
         // Lines from one shard arrive in time order, so most lines repeat the
         // previous line's hour. Its bytes "MM-DDTHH" decide: every timestamp lies in
@@ -383,7 +375,8 @@ static KEEP: [[u8; 64]; 2] = [[0xFF; 64], [0; 64]];
 /// An endpoint's identity: its bytes zero-padded to 64. No endpoint byte is zero,
 /// so for endpoints shorter than 64 bytes equal keys mean equal endpoints. A longer
 /// endpoint gets the key of its first 64 bytes, which another long one can share,
-/// so those (5% of lines) are compared byte by byte as well.
+/// so those (63 of the 1,842 endpoints, on 6.2% of lines) are compared byte by byte
+/// as well.
 type Key = [__m256i; 2];
 
 /// `vpmovmskb`, kept opaque to the optimizer: LLVM rewrites the intrinsic as a
@@ -508,6 +501,8 @@ fn percentiles(values: &mut [u32]) -> [u32; 3] {
     [p50, p95, *values[r95..].select_nth_unstable(r99 - r95).1]
 }
 
+// SAFETY: these are the C library's own prototypes on x86-64 Linux, where C's int
+// is i32 and long is i64; declared by hand so that the crate has no dependencies.
 unsafe extern "C" {
     fn mmap(at: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
     fn madvise(at: *mut u8, len: usize, advice: i32) -> i32;

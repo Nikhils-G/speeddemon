@@ -36,9 +36,12 @@ the same Track A code. A dash means the board value was not written down at the 
 | 23 | ab0b4c3 | Names and hours sorted by their first 16 bytes as one big-endian number, so slices are compared only on ties: a shorter serial step between the passes | run-ad6ddaf4d8e4 | 0.0197 | 19.87 | 504 | 83.7 |
 | 24 | 33cac7e (reverted in e6e4d9d) | Parse blocks taken from a shared counter, four per thread, so a slow thread holds up less | run-dee36d077800 | 0.0198 | — | 517 | — |
 | 25 | d8e2636 (reverted in 1c8d136) | The endpoint key built inline (rebuilt in the cold insert) so it never spills, the latency shuffle control from one table load: 4% fewer instructions on one thread, the same at 12 threads on the server | run-b68029ac7816 | 0.0199 | — | 514 | — |
+| 26 | f8ccd39 | The same engine in a third fewer lines, one file: the endpoint table allocated zeroed and probed by one function, every endpoint's bytes copied when it is added; all runs sorted by (hour, slice) and cut into hours instead of a per-hour list built by binary search; an hour's start summed from the published lengths instead of an incremental chain; the error rate kept with the statistics. Hot loops unchanged | run-b5ca2d290934 | 0.0197 | 21.0 | 335 | 84.8 |
+| 27 | (next push) | Each parse thread finds its own cuts; tighter imports and digit table. Same engine as step 26 | — | — | — | 327 | — |
 
-The current code is step 23 (1c8d136 is the revert of step 25). A later board run of the same code,
-run-f5b4c1d48cd4, scored 0.0235 s, 20.72 MB, 81.6 points: one of the outliers mentioned above.
+The current code is step 27. Before the line cut it was step 23 (1c8d136 is the revert of step 25);
+a later board run of that code, run-f5b4c1d48cd4, scored 0.0235 s, 20.72 MB, 81.6 points: one of the
+outliers mentioned above.
 
 ## What each step taught
 
@@ -88,6 +91,18 @@ run-f5b4c1d48cd4, scored 0.0235 s, 20.72 MB, 81.6 points: one of the outliers me
   the fixed chunks nor the instruction count limits the 12-thread parse on the box. That points at
   memory traffic and the input's page faults, which we have not measured on the box itself. Each
   was reverted for its extra lines (+13 and +10).
+- **Steps 26–27** cut 504 → 327 lines (about +1.4 points at the same T and M) with the parse loop,
+  the counting sort and the fused output kept as they were. Speed was checked against step 23 at
+  every stage, and that showed something about the measurement itself. The training run behind
+  the profile-guided build is multi-threaded, so every build has a slightly different profile and
+  places the hot loop at a different alignment. Three builds of the unchanged step-23 source spread
+  0.5 ms at 12 threads on the server (paired, interleaved runs). One build per version cannot tell a
+  0.3 ms change, so each stage was compared over three builds of each version. At step 27 the
+  medians were 17.44–17.74 ms for step 23 and 17.61–17.91 ms for step 27; single-thread
+  instructions went from 540M to 531M, and the memory peak (docker, `/out` on tmpfs, 15 runs each)
+  from 20.30 to 20.50 MB, inside its run-to-run spread. Three things measured on the way are in
+  the table below: the slower table layout, the slower write order, and the memory that the
+  per-slice release saves.
 
 ## Experiments that did not make it (measured, reverted)
 
@@ -106,11 +121,16 @@ run-f5b4c1d48cd4, scored 0.0235 s, 20.72 MB, 81.6 points: one of the outliers me
 | Three nested selections read at the end | wrong output: each selection reorders the previous rank's slot. Each value is now read right after its own selection |
 | Parse blocks from a shared counter, four per thread (step 24) | run-dee36d077800, 0.0198 s against 0.0197 s, +13 lines: reverted in e6e4d9d |
 | Fewer instructions per parsed line (step 25) | run-b68029ac7816, 0.0199 s against 0.0197 s, +10 lines: reverted in 1c8d136 |
+| Pass 2 in two phases: every thread computes its hours, waits at a barrier, then writes them | +2 ms on the server. The write phase alone took 2.7 ms, far more than its formatting work: twelve threads faulting in the shared output at once most likely serialise in the kernel. The writes stay interleaved with other hours' compute |
+| Endpoint table entries as one `OnceLock<(key, name)>` per id | parse +0.4 ms at 12 threads: the lock's state word sits on a second cache line, read on every lookup. Keys and names stay in separate arrays |
+| Each line written straight into the output from its known length, without a stack buffer | +14M instructions on one thread (552M → 566M): the length is then computed twice per line |
+| The first digit of every number written as a pair from the table, and the hour label copied as a slice of unknown length (a `memmove` call per line) | +15M instructions on one thread (540M → 555M); most counts, error counts and rates are one digit |
+| Only long runs released, not a slice's remaining records once no hour reads them | memory peak +0.7 MB (20.04 → 20.76 MB, 15 runs each) |
 
 ## Correctness checks run before every push
 
 sha256 of the seed-1 output (495ca096…, as in the spec) and of sample seed 1 (ca6311bb…); byte
-comparison with the reference output for sample seeds 2–4; generated `tiny` seeds 5–9 against
+comparison with the reference output for sample seeds 2–4; generated `tiny` seeds 5–9 and 11–15 against
 `reference/a_ingest.py`; a full-scale seed the board does not use (99) against the reference; an
 empty `requests.log`; the same output at 1, 3, 7, 12 and 16 threads (`taskset`), because the thread
 count changes the chunks, the runs and the order in which endpoint ids are handed out, and none of
