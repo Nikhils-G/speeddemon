@@ -75,38 +75,27 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
     let docs = open("docs.txt")?;
     let text = &docs[..docs.len() - mmap::PAD];
     let queries_txt = open("queries.txt")?;
-    let (queries, mut vocab) = parse_queries(queries_txt)?;
-    let doc_count = doc_count(text)?;
-    // Every per-thread sum of ids is below N^2 / 2, which must fit in SUM_BITS.
-    if doc_count > 1 << 20 {
-        return Err(format!("docs.txt: {doc_count} documents is more than this program supports (2^20)"));
-    }
-    let slices = slices(text, thread::available_parallelism().map_or(1, |n| n.get()))?;
+    let threads = thread::available_parallelism().map_or(1, |n| n.get());
+    let (queries, mut vocab) = parse_queries(queries_txt, threads)?;
+    let slices = slices(text, threads)?;
     let nb = vocab.bool_terms as usize;
 
     // Sample the start of every slice for each term's document frequency.
     let df: Vec<AtomicU32> = (0..vocab.count).map(|_| AtomicU32::new(0)).collect();
-    let sampled: u32 = thread::scope(|s| {
-        let handles: Vec<_> = (slices.iter())
-            .map(|&(start, end, first)| {
-                let (vocab, df) = (&vocab, &df);
-                let stop = line_end(text, start + SAMPLE_BYTES / slices.len()).min(end);
-                s.spawn(move || Scan::new(docs, vocab, None, df, nb, 0).run(start, stop, first).map(|scan| scan.doc + 1 - first))
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).sum::<Result<u32, String>>()
-    })?;
+    let sampled = par(slices.len(), |i| {
+        let (start, end, first) = slices[i];
+        let stop = line_end(text, start + SAMPLE_BYTES / slices.len()).min(end);
+        Scan::new(docs, &vocab, None, &df, nb, 0).run(start, stop, first).map(|scan| scan.doc + 1 - first)
+    });
+    let sampled = sampled.into_iter().sum::<Result<u32, String>>()?;
     let df: Vec<u32> = df.into_iter().map(AtomicU32::into_inner).collect();
     let lines = queries.lines.len();
-    let plan = Plan::new(queries, &df, sampled, nb);
+    let plan = Plan::new(queries, &df, sampled, nb, threads);
     vocab.finish(&plan);
 
-    let results: Vec<(Vec<u64>, Vec<u64>, u32)> = thread::scope(|s| {
-        let handles: Vec<_> = (slices.iter())
-            .map(|&(start, end, first)| {
-                let (vocab, plan) = (&vocab, &plan);
-                s.spawn(move || {
-                    let scan = Scan::new(docs, vocab, Some(plan), &[], nb, lines).run(start, end, first)?;
+    let results = par(slices.len(), |i| {
+                    let (start, end, first) = slices[i];
+                    let scan = Scan::new(docs, &vocab, Some(&plan), &[], nb, lines).run(start, end, first)?;
                     // Drop the slice's pages now, in parallel, instead of the kernel
                     // unmapping all 62,000 at exit on one core.
                     mmap::release(&docs[start..end]);
@@ -115,28 +104,31 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
                     log.truncate(logged);
                     log.sort_unstable();
                     Ok((state, log, scan.doc))
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect::<Result<_, String>>()
-    })?;
-    let next_firsts = slices.iter().skip(1).map(|s| s.2).chain([doc_count]);
+    });
+    let results: Vec<(Vec<u64>, Vec<u64>, u32)> = results.into_iter().collect::<Result<_, String>>()?;
+    let next_firsts = slices.iter().skip(1).map(|s| s.2);
     if slices.first().is_some_and(|s| s.2 != 0) || results.iter().zip(next_firsts).any(|(r, next)| r.2 + 1 != next) {
         return Err("docs.txt: ids must be 0, 1, 2, ... in order".into());
+    }
+    // Every per-thread sum of ids is below N^2 / 2, which must fit in SUM_BITS.
+    if results.last().is_some_and(|r| r.2 >= 1 << 20) {
+        return Err("docs.txt: more than 2^20 documents, more than this program supports".into());
     }
 
     // Format in parallel, one range of lines per thread.
     let parts = slices.len().max(1);
-    let chunks: Vec<Vec<u8>> = thread::scope(|s| {
-        let results = &results;
-        let handles: Vec<_> = (0..parts).map(|p| s.spawn(move || format_lines(results, lines * p / parts..lines * (p + 1) / parts))).collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
+    let chunks = par(parts, |p| format_lines(&results, lines * p / parts..lines * (p + 1) / parts));
     let path = format!("{out_dir}/results.txt");
     let mut file = File::create(&path).map_err(|e| format!("create {path}: {e}"))?;
     chunks.iter().try_for_each(|chunk| file.write_all(chunk)).map_err(|e| format!("write {path}: {e}"))?;
     // Done: exit without freeing the tables and logs, one free at a time.
     std::process::exit(0)
+}
+
+/// f(0), f(1), ... f(n - 1), each on its own thread.
+fn par<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    let f = &f;
+    thread::scope(|s| (0..n).map(|i| s.spawn(move || f(i))).collect::<Vec<_>>().into_iter().map(|h| h.join().unwrap()).collect())
 }
 
 /// The output for `lines`: per line, the threads' counts and sums added up, and
@@ -176,47 +168,90 @@ struct Queries {
     terms: Vec<u32>,
 }
 
-/// Reads all BOOL lines before the phrases, so the terms of BOOL queries get the
-/// ids 0..bool_terms and can index a dense per-thread array. `padded` is the
-/// file and mmap::PAD zero bytes.
-fn parse_queries(padded: &'static [u8]) -> Result<(Queries, Vocab), String> {
-    let text = &padded[..padded.len() - mmap::PAD];
-    let body = text.strip_suffix(b"\n").unwrap_or(text);
-    let lines: Vec<&[u8]> = if body.is_empty() { Vec::new() } else { body.split(|&b| b == b'\n').collect() };
+/// Whole lines of queries.txt, split: per line its kind and its terms' offset
+/// in `bools` or `phrases`. A term comes with its table key (zero for a long
+/// term) and, in a BOOL query, its op << 30.
+#[derive(Default)]
+struct Split {
+    lines: Vec<(u32, u32, bool)>,
+    bools: Vec<(&'static [u8], u64, u32, u32)>,
+    phrases: Vec<(&'static [u8], u64, u32, u32)>,
+}
+
+/// Splits `chunk`, whole lines of `padded`, the file and mmap::PAD zero bytes.
+fn split_lines(chunk: &'static [u8], padded: &'static [u8]) -> Result<Split, String> {
+    let mut out = Split::default();
     let bad = |line: &[u8]| format!("queries.txt: bad query {:?}", String::from_utf8_lossy(line));
-    let mut q = Queries { lines: vec![(0, 0, false); lines.len()], terms: Vec::new() };
-    let mut vocab = Vocab::new(lines.len());
-    for (i, &line) in lines.iter().enumerate() {
-        let Some(rest) = line.strip_prefix(b"BOOL ") else { continue };
-        let start = q.terms.len();
-        let mut words = rest.split(|&b| b == b' ');
-        let mut op = OR;
-        loop {
-            q.terms.push(vocab.intern(words.next().ok_or_else(|| bad(line))?, padded)? | op << 30);
-            let Some(word) = words.next() else { break };
-            op = match word {
-                b"AND" => AND,
-                b"OR" => OR,
-                b"NOT" => NOT,
-                _ => return Err(bad(line)),
-            };
+    let term = |term: &'static [u8], op: u32| {
+        if term.is_empty() || term.len() > MAX_TERM || !term.iter().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()) {
+            return Err(format!("queries.txt: bad term {:?}", String::from_utf8_lossy(term)));
         }
-        if q.terms.len() - start > MAX_BOOL_TERMS {
-            return Err(format!("queries.txt: more than {MAX_BOOL_TERMS} terms in {:?}", String::from_utf8_lossy(line)));
+        let (lo, hi) = if term.len() > KEY { (0, 0) } else { parts(key_at(padded, term.as_ptr() as usize - padded.as_ptr() as usize, term.len())) };
+        Ok((term, lo, hi, op))
+    };
+    let body = chunk.strip_suffix(b"\n").unwrap_or(chunk);
+    for line in body.split(|&b| b == b'\n').filter(|_| !chunk.is_empty()) {
+        if let Some(rest) = line.strip_prefix(b"BOOL ") {
+            let start = out.bools.len();
+            let mut words = rest.split(|&b| b == b' ');
+            let mut op = OR;
+            loop {
+                out.bools.push(term(words.next().ok_or_else(|| bad(line))?, op << 30)?);
+                let Some(word) = words.next() else { break };
+                op = match word {
+                    b"AND" => AND,
+                    b"OR" => OR,
+                    b"NOT" => NOT,
+                    _ => return Err(bad(line)),
+                };
+            }
+            if out.bools.len() - start > MAX_BOOL_TERMS {
+                return Err(format!("queries.txt: more than {MAX_BOOL_TERMS} terms in {:?}", String::from_utf8_lossy(line)));
+            }
+            out.lines.push((start as u32, (out.bools.len() - start) as u32, false));
+        } else {
+            let inner = line.strip_prefix(b"PHRASE \"").and_then(|r| r.strip_suffix(b"\"")).ok_or_else(|| bad(line))?;
+            let start = out.phrases.len();
+            for word in inner.split(|&b| b == b' ') {
+                out.phrases.push(term(word, 0)?);
+            }
+            out.lines.push((start as u32, (out.phrases.len() - start) as u32, true));
         }
-        q.lines[i] = (start as u32, (q.terms.len() - start) as u32, false);
     }
-    vocab.bool_terms = vocab.count;
-    for (i, &line) in lines.iter().enumerate() {
-        if line.starts_with(b"BOOL ") {
-            continue;
+    Ok(out)
+}
+
+/// Splits the lines in parallel, then gives the terms ids, all BOOL terms
+/// first, so the terms of BOOL queries get the ids 0..bool_terms and can index
+/// a dense per-thread array. `padded` is the file and mmap::PAD zero bytes.
+fn parse_queries(padded: &'static [u8], parts: usize) -> Result<(Queries, Vocab), String> {
+    let text = &padded[..padded.len() - mmap::PAD];
+    let cuts: Vec<usize> = (0..=parts).map(|p| if p == 0 { 0 } else { line_end(text, text.len() * p / parts) }).collect();
+    let splits = par(parts, |p| split_lines(&text[cuts[p]..cuts[p + 1]], padded)).into_iter().collect::<Result<Vec<_>, String>>()?;
+    let bool_terms: usize = splits.iter().map(|s| s.bools.len()).sum();
+    let mut q = Queries { lines: Vec::new(), terms: Vec::new() };
+    let (mut bool_at, mut phrase_at) = (0, bool_terms as u32);
+    for split in &splits {
+        let at = |&(start, len, phrase): &(u32, u32, bool)| (start + if phrase { phrase_at } else { bool_at }, len, phrase);
+        q.lines.extend(split.lines.iter().map(at));
+        (bool_at, phrase_at) = (bool_at + split.bools.len() as u32, phrase_at + split.phrases.len() as u32);
+    }
+    let mut vocab = Vocab::new(q.lines.len());
+    // Each term's bucket is fetched 16 terms in advance: the table is in L3.
+    let terms = || splits.iter().flat_map(|s| &s.bools).chain(splits.iter().flat_map(|s| &s.phrases));
+    let mut ahead = terms().skip(16);
+    for (k, &(term, lo, hi, op)) in terms().enumerate() {
+        if let Some(&(_, lo, hi, _)) = ahead.next() {
+            // SAFETY: a prefetch of a bucket of the table.
+            unsafe { _mm_prefetch::<_MM_HINT_T0>(vocab.table.buckets.as_ptr().add((hash(lo, hi) >> vocab.table.shift) as usize) as *const i8) };
         }
-        let inner = line.strip_prefix(b"PHRASE \"").and_then(|r| r.strip_suffix(b"\"")).ok_or_else(|| bad(line))?;
-        let start = q.terms.len();
-        for term in inner.split(|&b| b == b' ') {
-            q.terms.push(vocab.intern(term, padded)?);
+        if k == bool_terms {
+            vocab.bool_terms = vocab.count;
         }
-        q.lines[i] = (start as u32, (q.terms.len() - start) as u32, true);
+        q.terms.push(vocab.intern(term, lo, hi) | op);
+    }
+    if q.terms.len() == bool_terms {
+        vocab.bool_terms = vocab.count;
     }
     Ok((q, vocab))
 }
@@ -264,12 +299,11 @@ impl Table {
         (if_zero(hit, MISS as u64, info as u64) as u32, if_zero(hit, slots[3].lo, 0))
     }
 
-    /// The info of the key whose `hash` is h, or MISS. A full bucket continues
+    /// The info of the key whose home bucket is b, or MISS. A full bucket continues
     /// into the next one, as `insert` does.
-    fn get(&self, key: __m128i, h: u64) -> u32 {
+    fn get(&self, key: __m128i, mut b: usize) -> u32 {
         // SAFETY: AVX2 is enabled for the whole build.
         let wide = unsafe { _mm256_broadcastsi128_si256(key) };
-        let mut b = (h >> self.shift) as usize;
         loop {
             // Slots fill in order and are never removed: a free last slot ends the
             // probe. One branch, rarely taken: a miss in a full bucket.
@@ -356,17 +390,14 @@ impl Vocab {
         Vocab { table, long: HashMap::new(), count: 0, bool_terms: 0 }
     }
 
-    /// The id of `term`, a slice of `padded`.
-    fn intern(&mut self, term: &'static [u8], padded: &[u8]) -> Result<u32, String> {
-        if term.is_empty() || term.len() > MAX_TERM || !term.iter().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()) {
-            return Err(format!("queries.txt: bad term {:?}", String::from_utf8_lossy(term)));
-        }
+    /// The id of `term`, whose table key is (lo, hi).
+    fn intern(&mut self, term: &'static [u8], lo: u64, hi: u32) -> u32 {
         let id = if term.len() > KEY {
             *self.long.entry(term).or_insert(self.count)
         } else {
-            let key = key_at(padded, term.as_ptr() as usize - padded.as_ptr() as usize, term.len());
-            let (lo, hi) = parts(key);
-            match self.table.get(key, hash(lo, hi)) {
+            // SAFETY: SSE4.1 is enabled for the whole build (it comes with AVX2).
+            let key = unsafe { _mm_insert_epi32::<2>(_mm_cvtsi64_si128(lo as i64), hi as i32) };
+            match self.table.get(key, (hash(lo, hi) >> self.table.shift) as usize) {
                 MISS => {
                     if (self.table.len + 1) * 2 > self.table.buckets.len() * 5 {
                         let bigger = Table::new(65 - self.table.shift);
@@ -382,7 +413,7 @@ impl Vocab {
             }
         };
         self.count += (id == self.count) as u32;
-        Ok(id)
+        id
     }
 
     /// Renumbers the terms as the plan does and flags the anchors.
@@ -447,7 +478,9 @@ struct Plan {
 }
 
 impl Plan {
-    fn new(q: Queries, sample_df: &[u32], sampled: u32, nb: usize) -> Self {
+    /// The per-line work runs on `parts` threads, a range of lines each.
+    fn new(q: Queries, sample_df: &[u32], sampled: u32, nb: usize, parts: usize) -> Self {
+        let range = |p: usize| q.lines.len() * p / parts..q.lines.len() * (p + 1) / parts;
         // The expected share of 64-document blocks that contain t: the cost of
         // triggering on it.
         let cost = |t: u32| 1.0 - (1.0 - sample_df[t as usize] as f64 / sampled.max(1) as f64).powi(64);
@@ -457,7 +490,7 @@ impl Plan {
             let (cover, n) = if line.2 { return false } else { cover(line_terms(line), cost) };
             cover[..n].iter().map(|&t| cost(t)).sum::<f64>() > ALWAYS
         };
-        let always_lines: Vec<bool> = q.lines.iter().map(always_line).collect();
+        let always_lines = par(parts, |p| q.lines[range(p)].iter().map(always_line).collect::<Vec<_>>()).concat();
         let mut wide = vec![false; nb];
         for (line, _) in q.lines.iter().zip(&always_lines).filter(|l| *l.1) {
             line_terms(line).iter().for_each(|&word| wide[(word & TERM) as usize] = true);
@@ -478,8 +511,10 @@ impl Plan {
         terms.iter_mut().for_each(|word| *word = rank[(*word & TERM) as usize] | *word & !TERM);
         // The costs by new id, so `cover` finds the sets `always_line` found.
         let cost = |t: u32| cost(order[t as usize]);
-        let (mut by_trigger, mut by_anchor, mut always) = (Vec::new(), Vec::new(), Vec::new());
-        for (line, (&(start, len, phrase), &is_always)) in q.lines.iter().zip(&always_lines).enumerate() {
+        let lines = |p: usize| {
+          let (mut by_trigger, mut by_anchor, mut always) = (Vec::new(), Vec::new(), Vec::new());
+          for line in range(p) {
+            let ((start, len, phrase), is_always) = (q.lines[line], always_lines[line]);
             let words = &terms[start as usize..(start + len) as usize];
             let answer = line as u32; // the index of the line's answer in each thread's state
             if phrase {
@@ -501,6 +536,12 @@ impl Plan {
                 let earlier = (words.iter().enumerate()).filter(|(_, w)| cover[..i].contains(&(*w & TERM))).fold(0, |m, (k, _)| m | 1 << k);
                 by_trigger.push((c, Entry { earlier, ..entry }));
             }
+          }
+          (by_trigger, by_anchor, always)
+        };
+        let (mut by_trigger, mut by_anchor, mut always) = (Vec::new(), Vec::new(), Vec::new());
+        for (t, a, e) in par(parts, lines) {
+            (by_trigger.extend(t), by_anchor.extend(a), always.extend(e));
         }
         let (group, entries) = csr(by_trigger, nb + 1);
         let (anchor, anchored) = csr(by_anchor, df.len());
@@ -561,7 +602,7 @@ struct Scan<'a> {
     /// Row r < plan.rows: the words of BOOL term r in the 4 blocks of this
     /// superblock. Row `rows` takes the other terms; row `rows + 1` is all ones.
     wide: Vec<Row>,
-    /// This document's tokens to look up: their keys and hashes (or a zero key
+    /// This document's tokens to look up: their keys and home buckets (or a zero key
     /// and the info of a long token).
     pending: Vec<(__m128i, u64)>,
     /// This document's term ids, and the positions of anchors among them.
@@ -636,8 +677,9 @@ impl<'a> Scan<'a> {
                         let (lo, hi) = parts(key);
                         let h = hash(lo, hi);
                         // SAFETY: a prefetch of a bucket of the table.
-                        unsafe { _mm_prefetch::<_MM_HINT_T0>(buckets.add((h >> shift) as usize) as *const i8) };
-                        (key, h)
+                        let b = (h >> shift) as usize;
+                        unsafe { _mm_prefetch::<_MM_HINT_T0>(buckets.add(b) as *const i8) };
+                        (key, b as u64)
                     } else {
                         // SAFETY: AVX2 is enabled for the whole build.
                         (unsafe { _mm_setzero_si128() }, self.vocab.get_long(&docs[p..p + len]) as u64)
@@ -679,9 +721,9 @@ impl<'a> Scan<'a> {
         let (nb, table) = (self.nb, &self.vocab.table);
         self.toks.reserve(self.pending.len());
         let (toks, mut len) = (self.toks.as_mut_ptr(), self.toks.len());
-        for &(key, h) in &self.pending {
+        for &(key, b) in &self.pending {
             // SAFETY: SSE4.1 is enabled for the whole build (it comes with AVX2).
-            let info = if unsafe { _mm_testz_si128(key, key) } == 1 { h as u32 } else { table.get(key, h) };
+            let info = if unsafe { _mm_testz_si128(key, key) } == 1 { b as u32 } else { table.get(key, b as usize) };
             let id = info & MISS;
             // SAFETY: a prefetch of a word of `w`.
             unsafe { _mm_prefetch::<_MM_HINT_T0>(self.w.as_ptr().add((id as usize).min(nb)) as *const i8) };
@@ -982,14 +1024,6 @@ fn slices(text: &[u8], parts: usize) -> Result<Vec<(usize, usize, u32)>, String>
 fn line_end(text: &[u8], at: usize) -> usize {
     let at = at.min(text.len());
     text[at..].iter().position(|&b| b == b'\n').map_or(text.len(), |i| at + i + 1)
-}
-
-/// Ids are dense and ascending, so the count is the last line's id + 1.
-fn doc_count(text: &[u8]) -> Result<u32, String> {
-    let Some(body) = text.strip_suffix(b"\n") else { return Ok(0) };
-    let start = body.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
-    let tab = body[start..].iter().position(|&b| b == b'\t').ok_or("docs.txt: a line without a TAB")?;
-    Ok(parse_id(&body[start..start + tab])? + 1)
 }
 
 fn parse_id(digits: &[u8]) -> Result<u32, String> {
