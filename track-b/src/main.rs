@@ -35,8 +35,7 @@ const ANCHOR: u32 = 1 << 31;
 const MISS: u32 = ANCHOR - 1;
 /// Terms of up to KEY bytes live in the bucket table, keyed by their bytes.
 const KEY: usize = 12;
-/// The spec's grammar: a term is 1 to 32 bytes, a BOOL query has 1 to 6 terms.
-const MAX_TERM: usize = 32;
+/// The spec's grammar: a BOOL query has 1 to 6 terms.
 const MAX_BOOL_TERMS: usize = 6;
 /// A BOOL term word is `slot | op << 30`. The op codes make `end_block` branch-free.
 const TERM: u32 = (1 << 30) - 1;
@@ -163,38 +162,27 @@ type Queries = (Vec<(u32, u32, bool)>, Vec<u32>);
 /// table key (zero for a long term) and, in a BOOL query, its op << 30.
 fn split_lines(chunk: &'static [u8], padded: &'static [u8]) -> Split {
     let (mut lines, mut terms) = (Vec::new(), Vec::new());
+    // Every line is a query of the spec's grammar (2.3) and ends with LF.
     for line in chunk.split_inclusive(|&b| b == b'\n') {
-        let line = line.strip_suffix(b"\n").unwrap_or(line);
-        let bad = || -> ! { panic!("queries.txt: bad query {:?}", String::from_utf8_lossy(line)) };
-        // Panics unless ok.
-        let check = |ok: bool| ok || bad();
-        let start = terms.len();
-        let mut term = |term: &'static [u8], op: u32| {
-            let ok = term.iter().all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9'));
-            check(ok && (1..=MAX_TERM).contains(&term.len()));
-            let at = term.as_ptr() as usize - padded.as_ptr() as usize;
-            // Length 0 gives the zero key, which marks a long term.
-            let key = key_at(padded, at, if term.len() > KEY { 0 } else { term.len() });
-            terms.push((term, key, op << 30));
-        };
-        if let Some(rest) = line.strip_prefix(b"BOOL ") {
-            let mut words = rest.split(|&b| b == b' ');
-            let mut op = OR;
-            loop {
-                term(words.next().unwrap_or_else(|| bad()), op);
-                let Some(word) = words.next() else { break };
-                // An op's index here is its code; " " is never a word.
-                let ops: [&[u8]; 4] = [b"AND", b"NOT", b" ", b"OR"];
-                op = ops.iter().position(|&o| o == word).unwrap_or_else(|| bad()) as u32;
+        let (start, phrase) = (terms.len(), line[0] == b'P');
+        // The words after `BOOL ` or `PHRASE "`, before LF or `"` and LF.
+        let words = if phrase { &line[8..line.len() - 2] } else { &line[5..line.len() - 1] };
+        let mut op = if phrase { 0 } else { OR };
+        for (i, word) in words.split(|&b| b == b' ').enumerate() {
+            if phrase || i % 2 == 0 {
+                let at = word.as_ptr() as usize - padded.as_ptr() as usize;
+                // Length 0 gives the zero key, which marks a long term.
+                let key = key_at(padded, at, if word.len() > KEY { 0 } else { word.len() });
+                terms.push((word, key, op << 30));
+            } else {
+                op = match word[0] {
+                    b'A' => AND,
+                    b'N' => NOT,
+                    _ => OR,
+                };
             }
-        } else {
-            let inner = line.strip_prefix(b"PHRASE \"").unwrap_or_else(|| bad());
-            let inner = inner.strip_suffix(b"\"").unwrap_or_else(|| bad());
-            inner.split(|&b| b == b' ').for_each(|word| term(word, 0));
         }
-        let (len, phrase) = (terms.len() - start, !line.starts_with(b"BOOL "));
-        check(phrase || len <= MAX_BOOL_TERMS);
-        lines.push((start as u32, len as u32, phrase));
+        lines.push((start as u32, (terms.len() - start) as u32, phrase));
     }
     (lines, terms)
 }
@@ -373,7 +361,7 @@ impl Vocab {
     #[inline(never)]
     fn get_long(&self, token: &[u8]) -> u32 {
         // A token is at most 64 bytes (its length comes from a 64-bit mask); one
-        // longer than MAX_TERM is in no table.
+        // longer than 32 bytes is in no table.
         let lower = &mut [0u8; 64][..token.len()];
         lower.copy_from_slice(token);
         lower.make_ascii_lowercase();
