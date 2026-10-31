@@ -33,8 +33,9 @@ compile_error!("track-b needs AVX2: build with RUSTFLAGS=\"-C target-cpu=native\
 /// A token that no query uses gets MISS.
 const ANCHOR: u32 = 1 << 31;
 const MISS: u32 = ANCHOR - 1;
-/// Terms of up to KEY bytes live in the bucket tables, keyed by their bytes.
+/// Terms of up to KEY bytes live in the bucket table, keyed by their bytes.
 const KEY: usize = 12;
+/// The spec's grammar: a term is 1 to 32 bytes, a BOOL query has 1 to 6 terms.
 const MAX_TERM: usize = 32;
 const MAX_BOOL_TERMS: usize = 6;
 /// A BOOL term word is `slot | op << 30`. The op codes make `end_block` branch-free.
@@ -42,11 +43,12 @@ const TERM: u32 = (1 << 30) - 1;
 const AND: u32 = 0;
 const NOT: u32 = 1;
 const OR: u32 = 3;
-/// Corpus bytes sampled (spread over the slices) to estimate term frequencies.
+/// Corpus bytes sampled (spread over the slices) to estimate term frequencies:
+/// about 2,065 documents on seed 1.
 const SAMPLE_BYTES: usize = 2 << 20;
 /// A query whose cover terms are expected in more blocks than this (as a share,
 /// summed over the terms) is evaluated in every superblock: one evaluation then
-/// covers four blocks.
+/// covers four blocks. (0.125 and 0.5 were measured slower.)
 const ALWAYS: f64 = 0.25;
 /// Documents per superblock: four blocks of 64.
 const SUPER: u32 = 256;
@@ -87,19 +89,16 @@ fn main() {
         log.truncate(scan.answers.logged);
         // Back to line numbers; sorted, the log holds each line's first ids in
         // order.
-        for e in &mut log {
-            *e = (plan.line_of[(*e >> 32) as usize] as u64) << 32 | *e & u32::MAX as u64;
-        }
+        let line = |e: u64| (plan.line_of[(e >> 32) as usize] as u64) << 32 | e & u32::MAX as u64;
+        log.iter_mut().for_each(|e| *e = line(*e));
         log.sort_unstable();
         // The ids go on in the next slice. Every per-thread sum of ids is below
         // N^2 / 2, which must fit in SUM_BITS.
         let next = slices.get(i + 1).map_or(scan.doc + 1, |s| s.2);
         let ok = slices[0].2 == 0 && next == scan.doc + 1 && scan.doc < 1 << 20;
         assert!(ok, "docs.txt: ids must be 0, 1, 2, ... below 2^20");
-        let state = plan
-            .answer_of
-            .iter()
-            .map(|&a| scan.answers.state[a as usize]);
+        let state = &scan.answers.state;
+        let state = plan.answer_of.iter().map(|&a| state[a as usize]);
         (state.collect(), log)
     });
 
@@ -228,11 +227,7 @@ fn parse_queries(padded: &'static [u8], threads: usize) -> (Queries, Vocab) {
     let mut ahead = splits.iter().flat_map(|s| &s.1).skip(16);
     for (chunk_lines, chunk_terms) in &splits {
         let base = terms.len() as u32;
-        lines.extend(
-            chunk_lines
-                .iter()
-                .map(|&(s, n, phrase)| (base + s, n, phrase)),
-        );
+        lines.extend(chunk_lines.iter().map(|&(s, n, p)| (base + s, n, p)));
         for &(term, key, op) in chunk_terms {
             if let Some(&(_, key, _)) = ahead.next() {
                 // SAFETY: a prefetch of a bucket of the table (a 32-bit CRC, so
@@ -379,12 +374,9 @@ impl Vocab {
 
     /// Renumbers the terms as the plan does and flags the anchors.
     fn finish(&mut self, plan: &Plan) {
-        for slot in self.buckets.iter_mut().flat_map(|b| &mut b.0) {
-            if slot.lo != 0 {
-                slot.info = plan.info[slot.info as usize];
-            }
-        }
-        for info in self.long.values_mut() {
+        let slots = self.buckets.iter_mut().flat_map(|b| &mut b.0);
+        let infos = slots.filter(|s| s.lo != 0).map(|s| &mut s.info);
+        for info in infos.chain(self.long.values_mut()) {
             *info = plan.info[*info as usize];
         }
     }
@@ -470,12 +462,11 @@ impl Plan {
         };
         let always_part = |p| part(lines, p, parts).map(always_line).collect::<Vec<_>>();
         let always_lines = par(parts, always_part).concat();
-        // Per old id: 2 for a term of an `always` query, 1 for another BOOL term.
+        // Per old id: bit 0 for a BOOL term, bit 1 for a term of an `always` query.
         let mut kind = vec![0u8; sample_df.len()];
         for (&(start, len, _), &always) in q.lines.iter().zip(&always_lines).filter(|l| !l.0.2) {
             for &word in line_terms(start, len) {
-                let k = &mut kind[(word & TERM) as usize];
-                *k = (*k).max(1 + always as u8);
+                kind[(word & TERM) as usize] |= 1 | (always as u8) << 1;
             }
         }
         // Renumber the terms: BOOL terms first, those of the `always` lines
@@ -484,7 +475,7 @@ impl Plan {
         let all = 0..sample_df.len() as u32;
         let (mut order, phrase_only): (Vec<_>, Vec<_>) = all.partition(|&t| kind[t as usize] > 0);
         order.sort_unstable_by_key(|&t| Reverse((kind[t as usize], sample_df[t as usize])));
-        let (nb, rows) = (order.len(), kind.iter().filter(|&&k| k == 2).count());
+        let (nb, rows) = (order.len(), kind.iter().filter(|&&k| k == 3).count());
         order.extend(phrase_only);
         let mut rank = vec![0; order.len()];
         for (id, &old) in order.iter().enumerate() {
@@ -561,8 +552,8 @@ impl Plan {
         };
         always.iter_mut().for_each(|e| number(&mut e.answer));
         plan.entries.iter_mut().for_each(|e| number(&mut e.answer));
+        // Every line has an entry (a cover has at least one term) or is a phrase.
         plan.anchored.iter_mut().for_each(|a| number(&mut a.answer));
-        (0..lines as u32).for_each(|mut line| number(&mut line)); // none should be left
         let flag = |id: usize| (plan.anchor[id] != plan.anchor[id + 1]) as u32 * ANCHOR;
         plan.info = rank.iter().map(|&id| id | flag(id as usize)).collect();
         (plan.always, plan.terms) = (always, terms);
@@ -671,7 +662,8 @@ impl<'a> Scan<'a> {
             // from bit b on: `next << (64 - b)` in two steps, valid for b = 0.
             let (next1, mask0) = (next << 1, mask);
             let shifted = |b: u32| mask0 >> b | next1 << (63 - b);
-            // A chunk has at most 32 tokens.
+            // A chunk has at most 32 tokens: two tokens are at least one byte
+            // apart, so at most 32 of its 64 bytes start one.
             self.pending.reserve(32);
             loop {
                 // The tokens before the next id token, if any.
@@ -769,8 +761,9 @@ impl<'a> Scan<'a> {
         self.pending.clear();
         let (w, touched, mut n) = (self.w.as_mut_ptr(), self.touched.as_mut_ptr(), self.n);
         for &id in &self.toks {
-            // Branch-free: a slot seen for the first time in this block is
-            // kept in `touched`.
+            // Branch-free: the slot is always written at touched[n], and kept
+            // (n advances) only when it is seen for the first time in this
+            // block, its word still zero.
             let slot = (id as usize).min(nb);
             // SAFETY: slot <= nb < w.len(), and n <= nb + 1 < touched.len(): n
             // counts distinct slots, at most nb + 1.
@@ -1086,16 +1079,14 @@ fn movemask(v: __m256i) -> u32 {
 /// as containing no term, so they match nothing there.
 /// Returns (start, end, first id) per slice.
 fn slices(text: &[u8], parts: usize) -> Vec<(usize, usize, u32)> {
-    let mut starts: Vec<usize> = (0..parts).map(|p| cut(text, p, parts)).collect();
-    starts.dedup();
-    starts.retain(|&start| start < text.len());
-    let ends = starts.iter().skip(1).copied().chain([text.len()]);
+    // The cuts from 0 to text.len(), without repeats: slices are never empty.
+    let mut cuts: Vec<usize> = (0..=parts).map(|p| cut(text, p, parts)).collect();
+    cuts.dedup();
     let id = |at: usize| {
         let tab = text[at..].iter().position(|&b| b == b'\t');
         parse_id(&text[at..at + tab.expect("docs.txt: a line without a TAB")])
     };
-    let slice = |(&start, end): (&usize, usize)| (start, end, id(start));
-    starts.iter().zip(ends).map(slice).collect()
+    cuts.windows(2).map(|c| (c[0], c[1], id(c[0]))).collect()
 }
 
 /// The start of the p-th of `parts` ranges of whole lines of `text`.
