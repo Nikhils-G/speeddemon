@@ -38,6 +38,8 @@
 
 #[cfg(not(all(target_feature = "avx2", target_feature = "pclmulqdq")))]
 compile_error!("track-c needs AVX2 and PCLMULQDQ: build with RUSTFLAGS=\"-C target-cpu=native\"");
+#[cfg(not(target_feature = "aes"))]
+compile_error!("track-c needs AES (the name hash): build with RUSTFLAGS=\"-C target-cpu=native\"");
 
 use std::arch::x86_64::*;
 use std::os::fd::AsRawFd;
@@ -481,7 +483,7 @@ fn fast_record(text: &[u8], i: usize, fast_end: usize) -> Option<Record> {
     let name_quoted = (name_end > id_end + 2) as usize;
     let name_quotes = (quotes & !(u64::MAX << name_end)).count_ones() as usize;
     let name_bytes = name_end - id_end - 1 - name_quoted - name_quotes / 2;
-    // SAFETY: the name is inside the 64 bytes at `i`, which has 8 bytes before it.
+    // SAFETY: the name is inside the 64 bytes at `i`, which have 192 more after them.
     let (s, e) = (i + id_end + 1 + name_quoted, i + name_end - name_quoted);
     let hash = unsafe { hash_words(text, s, e) };
     let (note_end, quotes_to_note) = if out != 0 {
@@ -528,9 +530,9 @@ fn walk_record(text: &[u8], i: usize) -> Record {
     let next = at + (text[at - 1] == b'\r') as usize; // CRLF or LF
     // The name is hashed from a padded copy, so that the hash's loads stay in bounds
     // whatever the input. (This path is rare.)
-    let copy = [&[0; 8], &text[name.0..name.1], &[0; 8]].concat();
-    // SAFETY: the copy has 8 bytes on each side of the name.
-    let hash = unsafe { hash_words(&copy, 8, copy.len() - 8) };
+    let copy = [&text[name.0..name.1], &[0; 32]].concat();
+    // SAFETY: the copy has 32 bytes after the name.
+    let hash = unsafe { hash_words(&copy, 0, copy.len() - 32) };
     let bytes = name.2 << 32 | note.2;
     (value(id), value(region), cents, bytes, hash, next)
 }
@@ -623,34 +625,37 @@ fn numbers(words: [u64; 3], lens: [usize; 3]) -> [u64; 3] {
     }
 }
 
-/// A wyhash-style 64-bit hash of `text[s..e]`: each 8-byte word goes through a
-/// full 64x64->128 multiply, folded, so every input bit reaches every output bit.
-/// The last (up to) 16 bytes are two words without a branch on their length: the
-/// first masked to the field, the second ending at `e` (or 0 for 8 bytes or fewer).
+/// A 64-bit hash of `text[s..e]`, 32 bytes at a time: each block masked to the
+/// field (`KEEP`), without a branch on the length, goes through three AES rounds
+/// (two for its bytes 16..32, enough for every output byte to depend on every input
+/// byte), the length in the first. Names are nearly always one block. (The earlier
+/// 8-byte word loop's branch mispredicted on the 11% of names of 17-24 bytes.)
 ///
-/// SAFETY: `e - 8..e + 8` must be inside the text.
+/// SAFETY: `s..e + 32` must be inside the text (`s..s + 32` if the field is empty).
 #[inline(always)]
 unsafe fn hash_words(text: &[u8], s: usize, e: usize) -> u64 {
-    let (p0, p1) = (0xa076_1d64_78bd_642f, 0xe703_7ed1_a0b4_28db);
-    let mix = |a: u64, b: u64| {
-        let r = a as u128 * b as u128;
-        r as u64 ^ (r >> 64) as u64
-    };
-    // SAFETY: every load is inside `e - 8..e + 8` (see the function's contract).
-    let load = |at: usize| unsafe { text.as_ptr().add(at).cast::<u64>().read_unaligned() };
-    let len = (e - s) as u64;
-    let (mut h, mut at) = (p0 ^ len, s);
-    while e - at > 16 {
-        h = mix(h ^ load(at), p1);
-        at += 8;
+    // SAFETY: each block's 32 bytes start before `e` (or at `s`), and each mask is
+    // inside the 64 bytes of `KEEP`. AES and AVX2 are enabled (see the compile_error).
+    unsafe {
+        let key = _mm_set_epi64x(0x2076_1d64_78bd_642f, 0x6703_7ed1_a0b4_28db);
+        let (mut x, mut at) = (_mm_cvtsi64_si128((e - s) as i64), s);
+        // A loop with its test at the end (one block for an empty field too).
+        while {
+            let keep = KEEP.as_ptr().cast::<u8>().add(32 - (e - at).min(32));
+            let v = _mm256_loadu_si256(text.as_ptr().add(at).cast());
+            let v = _mm256_and_si256(v, _mm256_loadu_si256(keep.cast()));
+            let (lo, hi) = (_mm256_castsi256_si128(v), _mm256_extracti128_si256::<1>(v));
+            x = _mm_aesenc_si128(_mm_xor_si128(x, lo), hi);
+            x = _mm_aesenc_si128(_mm_aesenc_si128(x, key), key);
+            at += 32;
+            at < e
+        } {}
+        _mm_cvtsi128_si64(x) as u64
     }
-    let rest = e - at;
-    // SAFETY: BMI2 is enabled by target-cpu=native on the box (and comes with AVX2 on
-    // every Intel and AMD CPU that has it).
-    let first = unsafe { _bzhi_u64(load(at), 8 * rest as u32) };
-    let last = load(e - 8) & ((rest > 8) as u64).wrapping_neg();
-    mix(h ^ first ^ p1, last ^ p0 ^ len)
 }
+
+/// The 32 bytes at `32 - n` keep the first n bytes of 32 (little-endian words).
+static KEEP: [u64; 8] = [u64::MAX, u64::MAX, u64::MAX, u64::MAX, 0, 0, 0, 0];
 
 /// The digits at `*at`, which it moves past: their value.
 fn digits(text: &[u8], at: &mut usize) -> u64 {
