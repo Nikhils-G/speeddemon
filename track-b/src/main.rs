@@ -718,8 +718,8 @@ impl<'a> Scan<'a> {
 
     /// Looks up the tokens of this document, whose bit is `bit`, and sets their
     /// words. Each step runs over the whole document, so that the memory accesses
-    /// of one step overlap: the buckets were fetched when the tokens were
-    /// found, and the words are fetched while the tokens are probed.
+    /// of one step overlap: the buckets were fetched when the tokens were found.
+    /// (Fetching the words too cost more instructions than it saved.)
     fn look_up(&mut self, bit: u64) {
         let (nb, table) = (self.nb, &self.vocab.table);
         let (buckets, mask) = (table.buckets.as_ptr(), table.buckets.len() - 1);
@@ -729,8 +729,6 @@ impl<'a> Scan<'a> {
             // SAFETY: SSE4.1 is enabled for the whole build (it comes with AVX2).
             let info = if unsafe { _mm_testz_si128(key, key) } == 1 { b as u32 } else { find(buckets, mask, b as usize, key) };
             let id = info & MISS;
-            // SAFETY: a prefetch of a word of `w`.
-            unsafe { _mm_prefetch::<_MM_HINT_T0>(self.w.as_ptr().add((id as usize).min(nb)) as *const i8) };
             if info & ANCHOR != 0 {
                 self.anchors.push(len as u32);
             }
