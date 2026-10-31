@@ -41,9 +41,12 @@ use std::sync::{Mutex, RwLock};
 use std::thread;
 
 const BOM: &[u8] = b"\xEF\xBB\xBF";
-/// The file is parsed in this many rounds of one run per thread, so the pair
-/// buffers only ever hold one round's pairs (about 3 MB in all).
+/// The file is parsed in this many rounds, so the pair buffers only ever hold one
+/// round's pairs (about 3 MB in all).
 const ROUNDS: usize = 8;
+/// A round is cut into this many runs per thread, which threads claim as they go:
+/// a thread slowed down (another process on its core) parses fewer of them.
+const SPLIT: usize = 4;
 /// Names are split by their top hash bits into this many partitions per thread;
 /// each thread owns the same ones in every round, so their tables stay in its cache.
 const PARTITIONS_PER_THREAD: usize = 4;
@@ -115,13 +118,19 @@ fn run(data_dir: &str, out_dir: &str) -> Result<std::convert::Infallible, String
     let slots = ((names + 8 * names.isqrt()) * 8 / 5).next_power_of_two();
     // Pairs per thread per partition in one run, with room to spare (records are
     // about 60 bytes), so the buffers are allocated once, by their own thread.
-    let units = threads * ROUNDS;
-    let capacity = text.len() / (units * 60 * parts) * 5 / 4 + 16;
+    let capacity = text.len() / (threads * ROUNDS * 60 * parts) * 5 / 4 + 16;
+    let units = threads * ROUNDS * SPLIT;
     // A wrong guessed cut (impossible under spec 2.2) shows up as a misaligned run
     // or a bad record. Then the file is parsed again as one run: exact under 2.1.
     for guessed in [true, false] {
         let regions = Regions::new(ids);
         let (next_chunk, chunks_done) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        // Runs claimed in each round, and each partition's table with the number of
+        // rounds it has been brought up to.
+        let claimed: [AtomicUsize; ROUNDS] = Default::default();
+        let tables: Vec<_> = (0..parts)
+            .map(|_| Mutex::new((0, Partition::new(0))))
+            .collect();
         let pairs: Vec<RwLock<Vec<Vec<u64>>>> = (0..threads).map(|_| Default::default()).collect();
         // A barrier: each thread counts the times it waited, and waits until every
         // thread has arrived that many times.
@@ -139,7 +148,9 @@ fn run(data_dir: &str, out_dir: &str) -> Result<std::convert::Infallible, String
             // cache lines with it (+1 ms).
             *pairs[w].write().unwrap() = (0..parts).map(|_| Vec::with_capacity(capacity)).collect();
             // This thread's partitions, p = w + k * threads; made here, so they are in its cache.
-            let mut partitions = vec![Partition::new(slots); PARTITIONS_PER_THREAD];
+            for k in 0..PARTITIONS_PER_THREAD {
+                *tables[w + k * threads].lock().unwrap() = (0, Partition::new(slots));
+            }
             let (mut error, mut waits) = (Ok(()), 0);
             while let Some(chunk) =
                 Some(next_chunk.fetch_add(1, Relaxed)).filter(|&c| c < REGION_CHUNKS)
@@ -148,35 +159,51 @@ fn run(data_dir: &str, out_dir: &str) -> Result<std::convert::Infallible, String
                 chunks_done.fetch_add(1, Release);
             }
             spin_until(|| chunks_done.load(Acquire) == REGION_CHUNKS);
-            for round in 0..ROUNDS {
-                let run = round * threads + w;
-                if error.is_ok() {
-                    let mut mine = pairs[w].write().unwrap();
-                    mine.iter_mut().for_each(Vec::clear);
+            for (round, claimed) in claimed.iter().enumerate() {
+                let mut mine = pairs[w].write().unwrap();
+                mine.iter_mut().for_each(Vec::clear);
+                while let Some(unit) = Some(claimed.fetch_add(1, Relaxed))
+                    .filter(|&u| u < threads * SPLIT && error.is_ok())
+                {
                     // Each thread finds its own cuts, so their pages fault in in parallel.
+                    let run = round * threads * SPLIT + unit;
                     let start = run_start(text, body_start, run, units, guessed);
                     let end = run_start(text, body_start, run + 1, units, guessed);
                     let group_of = &regions.group_of;
-                    error = parse_run(text, start, end, group_of, &mut totals, &mut mine)
-                        // Drop the run's pages now, in parallel, instead of the kernel
-                        // unmapping all 50,000 at exit on one core.
-                        .map(|_| mmap::release(&text[start..end]));
+                    error = parse_run(text, start, end, group_of, &mut totals, &mut mine);
                 }
+                drop(mine);
                 barrier(&mut waits);
-                for (k, partition) in partitions.iter_mut().enumerate() {
-                    for buffers in &pairs {
-                        let mine = &buffers.read().unwrap()[w + k * threads];
-                        error = error.and_then(|_| partition.add(mine, &mut totals));
+                // Drop this thread's share of the round's pages now, in parallel, instead
+                // of the kernel unmapping all 50,000 at exit on one core.
+                let run = (round * threads + w) * SPLIT;
+                let start = run_start(text, body_start, run, units, guessed);
+                let end = run_start(text, body_start, run + SPLIT, units, guessed);
+                mmap::release(&text[start..end]);
+                // This thread's partitions first (their tables are in its cache), then
+                // any other one no thread has taken yet: a slow thread's are taken over.
+                for t in 0..threads {
+                    for k in 0..PARTITIONS_PER_THREAD {
+                        let p = (w + t) % threads + k * threads;
+                        if let Ok(mut table) = tables[p].try_lock()
+                            && table.0 == round
+                        {
+                            table.0 += 1;
+                            for buffers in &pairs {
+                                let mine = &buffers.read().unwrap()[p];
+                                error = error.and_then(|_| table.1.add(mine, &mut totals));
+                            }
+                        }
                     }
                 }
                 barrier(&mut waits);
             }
-            finished.lock().unwrap().push(error.map(|_| totals));
-            barrier(&mut waits);
-            // The first thread writes the output and exits, without waiting for the
-            // others to exit and without dropping anything.
-            if w == 0 {
-                let parts: Result<Vec<_>, _> = finished.lock().unwrap().drain(..).collect();
+            // The last thread to finish writes the output and exits, without waiting
+            // for the others to exit and without dropping anything.
+            let mut finished = finished.lock().unwrap();
+            finished.push(error.map(|_| totals));
+            if finished.len() == threads {
+                let parts: Result<Vec<_>, _> = finished.drain(..).collect();
                 if parts.is_ok() || !guessed {
                     exit_with(parts.and_then(|parts| write_output(out_dir, &parts, &regions)));
                 }
@@ -189,7 +216,7 @@ fn run(data_dir: &str, out_dir: &str) -> Result<std::convert::Infallible, String
             worker(0);
         });
     }
-    unreachable!("the first worker exits the process")
+    unreachable!("the last worker exits the process")
 }
 
 /// Writes each group's line, summing the threads' totals.
@@ -243,7 +270,6 @@ fn spin_until(done: impl Fn() -> bool) {
 /// id per name, and one row of bits per id, a bit per group. (Rows by slot instead,
 /// in a 7/8 full table: 23% less memory, but 13% of lookups leave their first
 /// bucket, +0.8M branch misses.)
-#[derive(Clone)]
 struct Partition {
     keys: Vec<u64>, // 0 = empty, else the name hash with its low byte set to 0xFF
     ids: Vec<u16>,  // by slot
