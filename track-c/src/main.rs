@@ -35,7 +35,7 @@ compile_error!("track-c needs AVX2 and PCLMULQDQ: build with RUSTFLAGS=\"-C targ
 
 use std::fmt::Write as _;
 use std::fs::File;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering::*};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering::*};
 use std::sync::{Mutex, RwLock};
 use std::thread;
 
@@ -63,9 +63,10 @@ const REGION_CHUNKS: usize = 64;
 const CODES: usize = 26 * 26 * 26;
 
 /// A group's columns: count, id_sum, amount_sum, amount_min, amount_max,
-/// names_distinct, name_bytes, note_bytes (amounts in cents).
-type Totals = [i64; 8];
-const EMPTY: Totals = [0, 0, 0, i64::MAX, i64::MIN, 0, 0, 0];
+/// names_distinct, and name_bytes << 32 | note_bytes (amounts in cents; every
+/// byte column is below 2^31, spec section 3).
+type Totals = [i64; 7];
+const EMPTY: Totals = [0, 0, 0, i64::MAX, i64::MIN, 0, 0];
 const NAMES_DISTINCT: usize = 5;
 
 fn main() {
@@ -100,9 +101,15 @@ fn run(data_dir: &str, out_dir: &str) -> Result<std::convert::Infallible, String
     let records = open("records.csv")?;
     let body_start = skip_header(records).ok_or("unexpected records.csv header")?;
     let threads = thread::available_parallelism().map_or(1, |n| n.get());
+    // regions.csv lists its ids in ascending order (spec 2.3), so the last line
+    // has the largest. One entry more, for every id above it.
+    let last_line = lines.trim_ascii_end().rsplit(|&b| b == b'\n').next();
+    let ids = (digits(last_line.unwrap_or_default(), &mut 0).0 as usize).min(1 << 30) + 2;
     let (mut guessed, mut slots) = (true, FIRST_SLOTS);
     loop {
-        match aggregate(records, body_start, guessed, threads, lines, slots, out_dir) {
+        match aggregate(
+            records, body_start, guessed, threads, lines, slots, ids, out_dir,
+        ) {
             ParseError::NamesFull => slots *= 2,
             // A wrong guessed cut shows up as a misaligned run or as a parse error.
             // Fall back to one run over the whole file: exact under spec 2.1.
@@ -125,10 +132,8 @@ fn write_output(
         .filter(|&code| codes[code].load(Relaxed) != 0)
         .map(|code| {
             let letters = [code / 676, code / 26 % 26, code % 26].map(|c| (b'A' + c as u8) as char);
-            (
-                letters.iter().collect(),
-                codes[code].load(Relaxed) as usize - 1,
-            )
+            let group = codes[code].load(Relaxed) as usize - 1;
+            (letters.iter().collect(), group)
         })
         .collect();
     keys.push(("_UNMATCHED".into(), UNMATCHED_GROUP));
@@ -144,9 +149,10 @@ fn write_output(
                 };
             }
         }
-        let [count, ids, sum, min, max, names, name_bytes, note_bytes] = t;
+        let [count, ids, sum, min, max, names, bytes] = t;
         if count > 0 {
             let (sum, min, max) = (money(sum), money(min), money(max));
+            let (name_bytes, note_bytes) = (bytes >> 32, bytes & 0xFFFF_FFFF);
             _ = writeln!(
                 out,
                 "{key} {count} {ids} {sum} {min} {max} {names} {name_bytes} {note_bytes}"
@@ -167,19 +173,13 @@ fn aggregate(
     threads: usize,
     lines: &[u8],
     slots: usize,
+    ids: usize,
     out_dir: &str,
 ) -> ParseError {
-    // regions.csv lists its ids in ascending order (spec 2.3), so the last line
-    // has the largest. One entry more, for every id above it.
-    let last_line = lines[..lines.len().saturating_sub(1)]
-        .rsplit(|&b| b == b'\n')
-        .next()
-        .unwrap_or_default();
-    let ids = digits(last_line, &mut 0).0 as usize + 2;
     let regions = Regions {
         // SAFETY: zero is a valid AtomicU8. Zeroed by calloc, so the pages fault
         // in on the threads that fill them.
-        group_of: unsafe { Box::new_zeroed_slice(ids.min(1 << 30)).assume_init() },
+        group_of: unsafe { Box::new_zeroed_slice(ids).assume_init() },
         codes: (0..CODES).map(|_| AtomicU8::new(0)).collect(),
         numbered: Mutex::new(0),
     };
@@ -198,11 +198,16 @@ fn aggregate(
         .map(|_| RwLock::new(Box::new(std::array::from_fn(|_| Vec::new()))))
         .collect();
     let next_partition: Vec<AtomicUsize> = (0..ROUNDS).map(|_| AtomicUsize::new(0)).collect();
-    let barrier = SpinBarrier::new(threads);
+    let (arrived, generation) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    let barrier = SpinBarrier {
+        threads,
+        arrived,
+        generation,
+    };
     let finished: Vec<Mutex<Option<[Totals; GROUPS]>>> =
         (0..threads).map(|_| Mutex::new(None)).collect();
-    let failed = AtomicBool::new(false);
-    let worker = |w: usize| {
+    let errors = Mutex::new(Vec::new());
+    let worker = &|w: usize| {
         let mut totals = [EMPTY; GROUPS];
         // Allocated here: buffer lengths next to another thread's would share
         // cache lines with it (+1 ms).
@@ -251,42 +256,34 @@ fn aggregate(
                     }
                 }
             }
-            if round + 1 == ROUNDS {
-                match error {
-                    None => *finished[w].lock().unwrap() = Some(totals),
-                    Some(_) => failed.store(true, Relaxed),
-                }
+            if round + 1 == ROUNDS && error.is_none() {
+                *finished[w].lock().unwrap() = Some(totals);
             }
             barrier.wait();
         }
         // The first thread writes the output and exits, without waiting for the
         // others to exit and without dropping anything.
-        if w == 0 && !failed.load(Relaxed) {
-            let parts: Vec<_> = finished
+        if w == 0
+            && let Some(parts) = finished
                 .iter()
-                .map(|t| t.lock().unwrap().unwrap())
-                .collect();
+                .map(|t| *t.lock().unwrap())
+                .collect::<Option<Vec<_>>>()
+        {
             exit_with(write_output(out_dir, &parts, &regions.codes));
         }
-        error
+        errors.lock().unwrap().extend(error);
     };
-    let errors: Vec<_> = thread::scope(|s| {
-        let worker = &worker;
-        let handles: Vec<_> = (1..threads).map(|w| s.spawn(move || worker(w))).collect();
-        let first = worker(0);
-        std::iter::once(first)
-            .chain(handles.into_iter().map(|h| h.join().unwrap()))
-            .collect()
+    thread::scope(|s| {
+        for w in 1..threads {
+            s.spawn(move || worker(w));
+        }
+        worker(0);
     });
     // A bad cut can also make the table overflow, so the cut errors come first.
-    let mut full = None;
-    for error in errors.into_iter().flatten() {
-        match error {
-            ParseError::NamesFull => full = Some(error),
-            e => return e,
-        }
-    }
-    full.unwrap_or(ParseError::Bad("no thread failed".into()))
+    let errors = errors.into_inner().unwrap().into_iter();
+    errors
+        .min_by_key(|e| matches!(e, ParseError::NamesFull))
+        .unwrap()
 }
 
 /// Spins for a while, then yields the core between checks, until `done()`. The
@@ -314,15 +311,6 @@ struct SpinBarrier {
 }
 
 impl SpinBarrier {
-    fn new(threads: usize) -> Self {
-        let (arrived, generation) = (AtomicUsize::new(0), AtomicUsize::new(0));
-        SpinBarrier {
-            threads,
-            arrived,
-            generation,
-        }
-    }
-
     fn wait(&self) {
         let generation = self.generation.load(Acquire);
         if self.arrived.fetch_add(1, AcqRel) + 1 == self.threads {
@@ -435,23 +423,19 @@ impl Regions {
                     .unwrap_or(lines.len() - p)
             }
         };
-        for line in lines[cut(k)..cut(k + 1)].split_inclusive(|&b| b == b'\n') {
-            let bad = || format!("regions.csv: bad line {}", String::from_utf8_lossy(line));
-            let [id @ .., b',', a, b, c, b'\n'] = line else {
-                return Err(bad());
+        let (mut at, end) = (cut(k), cut(k + 1));
+        while at < end {
+            let (region, n) = digits(lines, &mut at);
+            let slot = self.group_of.get(region as usize).filter(|_| n > 0);
+            let (Some(slot), Some(&[b',', a, b, c, b'\n'])) = (slot, lines.get(at..at + 5)) else {
+                return Err(format!("regions.csv: bad line at byte {at}"));
             };
-            let (region, n) = digits(id, &mut 0);
-            let slot = self
-                .group_of
-                .get(region as usize)
-                .filter(|_| n == id.len() && n > 0);
-            let code = [a, b, c].iter().all(|c| c.is_ascii_uppercase());
-            let (Some(slot), true) = (slot, code) else {
-                return Err(bad());
-            };
-            let code = &self.codes[[a, b, c]
-                .iter()
-                .fold(0, |acc, &&c| acc * 26 + (c - b'A') as usize)];
+            if ![a, b, c].iter().all(u8::is_ascii_uppercase) {
+                return Err(format!("regions.csv: bad country at byte {at}"));
+            }
+            at += 5;
+            let code = &self.codes
+                [(a - b'A') as usize * 676 + (b - b'A') as usize * 26 + (c - b'A') as usize];
             if code.load(Relaxed) == 0 {
                 let mut numbered = self.numbered.lock().unwrap();
                 if code.load(Relaxed) == 0 {
@@ -523,8 +507,16 @@ fn parse_run(
     pairs: &mut [Vec<u64>; PARTITIONS],
 ) -> Result<usize, ParseError> {
     let mut i = start;
+    // The header comes first, so a record start is at least 8 bytes in.
+    let fast_end = end.min(text.len().saturating_sub(256));
     while i < end {
-        let r = match fast_record(text, i) {
+        // SAFETY: the record starts at least 8 bytes in, and 256 before the end.
+        let fast = if i < fast_end {
+            unsafe { fast_record(text, i) }
+        } else {
+            None
+        };
+        let r = match fast {
             Some(r) => r,
             None => slow_record(text, i)
                 .ok_or_else(|| ParseError::Bad(format!("records.csv: bad record at byte {i}")))?,
@@ -539,10 +531,14 @@ fn parse_run(
         t[0] += 1;
         t[1] += r.id as i64;
         t[2] += r.cents;
-        t[3] = t[3].min(r.cents);
-        t[4] = t[4].max(r.cents);
-        t[6] += r.name_bytes as i64;
-        t[7] += r.note_bytes as i64;
+        // Branches, not cmov and a store: a new min or max is rare.
+        if r.cents < t[3] {
+            t[3] = r.cents;
+        }
+        if r.cents > t[4] {
+            t[4] = r.cents;
+        }
+        t[6] += r.bytes as i64;
         pairs[(r.hash >> (64 - PARTITION_BITS)) as usize].push(r.hash & !0xFF | group as u64);
         i = r.next;
     }
@@ -554,8 +550,7 @@ struct Record {
     id: u64,
     region_id: u64,
     cents: i64,
-    name_bytes: u64,
-    note_bytes: u64,
+    bytes: u64, // name_bytes << 32 | note_bytes
     hash: u64,
     next: usize,
 }
@@ -564,12 +559,10 @@ struct Record {
 /// with no unquoted text: its separators from the bitmaps of the 64 bytes at `i`
 /// (rarely 128) and of 32 bytes after the note, with every check folded into one
 /// flag. None sends the record to `slow_record`, which handles every case.
+///
+/// SAFETY: `i - 8..i + 256` must be inside the text.
 #[inline(always)]
-fn fast_record(text: &[u8], i: usize) -> Option<Record> {
-    // The header comes first, so a record start is at least 8 bytes in.
-    if i < 8 || text.len() - i < 256 {
-        return None;
-    }
+unsafe fn fast_record(text: &[u8], i: usize) -> Option<Record> {
     // SAFETY (for every access below): `i - 8..i + 256` is inside the text, and
     // every load ends by offset 198 (a comma at 128 or less, a bit index below 64
     // in the tail's masks, and a few bytes).
@@ -652,8 +645,9 @@ fn fast_record(text: &[u8], i: usize) -> Option<Record> {
         } else {
             cents as i64
         },
-        name_bytes: name_bytes as u64,
-        note_bytes: (note_end - name_end - 1 - note_quoted as usize - note_quotes / 2) as u64,
+        bytes: (name_bytes << 32
+            | (note_end - name_end - 1 - note_quoted as usize - note_quotes / 2))
+            as u64,
         hash,
         next: i + amount_end + 1 + crlf as usize,
     })
@@ -696,8 +690,7 @@ fn slow_record(text: &[u8], i: usize) -> Option<Record> {
         id,
         region_id,
         cents: if negative { -cents } else { cents },
-        name_bytes,
-        note_bytes,
+        bytes: name_bytes << 32 | note_bytes,
         hash: hash(text, name_start, name_end),
         next,
     })
@@ -705,18 +698,16 @@ fn slow_record(text: &[u8], i: usize) -> Option<Record> {
 
 /// The digits at `*at`, which it moves past: their value and their count.
 fn digits(text: &[u8], at: &mut usize) -> (u64, usize) {
-    let n = text[*at..]
-        .iter()
-        .take_while(|b| b.is_ascii_digit())
-        .count();
-    let digits = &text[*at..*at + n];
-    *at += n;
-    (
-        digits.iter().fold(0u64, |v, &b| {
-            v.wrapping_mul(10).wrapping_add((b - b'0') as u64)
-        }),
-        n,
-    )
+    let (start, mut value) = (*at, 0u64);
+    while let Some(d) = text
+        .get(*at)
+        .map(|b| b.wrapping_sub(b'0'))
+        .filter(|&d| d < 10)
+    {
+        value = value.wrapping_mul(10).wrapping_add(d as u64);
+        *at += 1;
+    }
+    (value, *at - start)
 }
 
 /// The name or note at `*at`, which it moves past: the range of its raw value
