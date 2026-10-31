@@ -87,7 +87,9 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
             Err(ParseError::Misaligned | ParseError::Bad(_)) if guessed => {
                 (starts, guessed) = (record_starts(records, body_start, units), false);
             }
-            Err(ParseError::Misaligned) => return Err(format!("records.csv: a record is longer than {READ} bytes")),
+            Err(ParseError::Misaligned) => {
+                return Err(format!("records.csv: a record is longer than {READ} bytes"));
+            }
             Err(ParseError::Bad(message)) => return Err(message),
         }
     };
@@ -126,22 +128,36 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
 
 /// Parses and aggregates every run, one round of `threads` runs at a time, and
 /// returns each thread's totals.
-fn aggregate(file: &File, len: usize, starts: &[usize], threads: usize, regions: &Regions, slots: usize) -> Result<Vec<Vec<Totals>>, ParseError> {
+fn aggregate(
+    file: &File,
+    len: usize,
+    starts: &[usize],
+    threads: usize,
+    regions: &Regions,
+    slots: usize,
+) -> Result<Vec<Vec<Totals>>, ParseError> {
     let groups = regions.keys.len();
     let words = groups.div_ceil(64);
-    let partitions: Vec<Turns<Partition>> = (0..PARTITIONS).map(|_| Turns::new(Partition::new(slots, words))).collect();
+    let partitions: Vec<Turns<Partition>> = (0..PARTITIONS)
+        .map(|_| Turns::new(Partition::new(slots, words)))
+        .collect();
     // Pairs per thread per partition in one run, with room to spare (records are
     // about 60 bytes), so the buffers are allocated once.
     let capacity = len / (starts.len() * 60 * PARTITIONS) * 5 / 4 + 16;
     // (Not `vec![...; PARTITIONS]`: cloning a Vec does not keep its capacity.)
-    let buffers = || (0..PARTITIONS).map(|_| Vec::with_capacity(capacity)).collect();
+    let buffers = || {
+        (0..PARTITIONS)
+            .map(|_| Vec::with_capacity(capacity))
+            .collect()
+    };
     let pairs: Vec<Turns<Vec<Vec<u64>>>> = (0..threads).map(|_| Turns::new(buffers())).collect();
     let next_partition: Vec<AtomicUsize> = (0..ROUNDS).map(|_| AtomicUsize::new(0)).collect();
     let barrier = Barrier::new(threads);
     let results: Vec<Result<Vec<Totals>, ParseError>> = thread::scope(|s| {
         let handles: Vec<_> = (0..threads)
             .map(|w| {
-                let (partitions, pairs, next_partition, barrier) = (&partitions, &pairs, &next_partition, &barrier);
+                let (partitions, pairs, next_partition, barrier) =
+                    (&partitions, &pairs, &next_partition, &barrier);
                 s.spawn(move || {
                     let mut totals = vec![Totals::default(); groups];
                     let mut buffer = vec![0; READ];
@@ -152,7 +168,16 @@ fn aggregate(file: &File, len: usize, starts: &[usize], threads: usize, regions:
                             // SAFETY: while parsing, each thread touches only its own buffers.
                             let mine = unsafe { pairs[w].get() };
                             mine.iter_mut().for_each(Vec::clear);
-                            match parse_run(file, len, starts[run], starts[run + 1], &mut buffer, regions, &mut totals, mine) {
+                            match parse_run(
+                                file,
+                                len,
+                                starts[run],
+                                starts[run + 1],
+                                &mut buffer,
+                                regions,
+                                &mut totals,
+                                mine,
+                            ) {
                                 Ok(end) if end == starts[run + 1] => {}
                                 Ok(_) => error = Some(ParseError::Misaligned),
                                 Err(e) => error = Some(e),
@@ -170,7 +195,9 @@ fn aggregate(file: &File, len: usize, starts: &[usize], threads: usize, regions:
                             for buffers in pairs {
                                 for &pair in &unsafe { buffers.read() }[p] {
                                     match partition.add(pair, words) {
-                                        Ok(true) => totals[(pair & 0xFF) as usize].names_distinct += 1,
+                                        Ok(true) => {
+                                            totals[(pair & 0xFF) as usize].names_distinct += 1
+                                        }
                                         Ok(false) => {}
                                         Err(e) => error = Some(e),
                                     }
@@ -195,7 +222,11 @@ fn aggregate(file: &File, len: usize, starts: &[usize], threads: usize, regions:
             Err(e) => return Err(e),
         }
     }
-    if full { Err(ParseError::NamesFull) } else { Ok(parts) }
+    if full {
+        Err(ParseError::NamesFull)
+    } else {
+        Ok(parts)
+    }
 }
 
 /// A value that threads take turns on. The barriers between phases order every
@@ -232,7 +263,11 @@ struct Partition {
 
 impl Partition {
     fn new(slots: usize, words: usize) -> Self {
-        Partition { keys: vec![0; slots], seen: vec![0; slots * words], used: 0 }
+        Partition {
+            keys: vec![0; slots],
+            seen: vec![0; slots * words],
+            used: 0,
+        }
     }
 
     /// Marks a (name hash, group) pair: true the first time it is seen.
@@ -280,7 +315,9 @@ impl Regions {
     /// Two parallel passes over the lines: one finds which countries occur, which
     /// numbers the groups; the other fills `group_of`.
     fn parse(text: &[u8], threads: usize) -> Result<Self, String> {
-        let body = text.strip_prefix(REGIONS_HEADER).ok_or("unexpected regions.csv header")?;
+        let body = text
+            .strip_prefix(REGIONS_HEADER)
+            .ok_or("unexpected regions.csv header")?;
         let chunks = split_at_lines(body, threads);
         let seen: Vec<AtomicBool> = (0..CODES).map(|_| AtomicBool::new(false)).collect();
         let max_id = each_region(&chunks, &|_, code| {
@@ -295,16 +332,28 @@ impl Regions {
                 return Err("regions.csv: too many countries".into());
             }
             group_of_code[code] = keys.len() as u8;
-            keys.push([code / 676, code / 26 % 26, code % 26].map(|letter| b'A' + letter as u8).to_vec());
+            keys.push(
+                [code / 676, code / 26 % 26, code % 26]
+                    .map(|letter| b'A' + letter as u8)
+                    .to_vec(),
+            );
         }
-        let group_of: Vec<AtomicU8> = (0..max_id.map_or(0, |id| id + 1)).map(|_| AtomicU8::new(NO_GROUP)).collect();
-        each_region(&chunks, &|id, code| group_of[id].store(group_of_code[code], Relaxed))?;
+        let group_of: Vec<AtomicU8> = (0..max_id.map_or(0, |id| id + 1))
+            .map(|_| AtomicU8::new(NO_GROUP))
+            .collect();
+        each_region(&chunks, &|id, code| {
+            group_of[id].store(group_of_code[code], Relaxed)
+        })?;
         keys.push(UNMATCHED.to_vec());
         Ok(Regions { group_of, keys })
     }
 
     fn group(&self, region_id: u64) -> usize {
-        match self.group_of.get(region_id as usize).map(|g| g.load(Relaxed)) {
+        match self
+            .group_of
+            .get(region_id as usize)
+            .map(|g| g.load(Relaxed))
+        {
             Some(g) if g != NO_GROUP => g as usize,
             _ => self.keys.len() - 1,
         }
@@ -313,7 +362,10 @@ impl Regions {
 
 /// Calls `visit(region_id, country code index)` for every `region_id "," [A-Z]{3}
 /// LF` line, one thread per chunk; returns the largest region id, if any.
-fn each_region(chunks: &[&[u8]], visit: &(dyn Fn(usize, usize) + Sync)) -> Result<Option<usize>, String> {
+fn each_region(
+    chunks: &[&[u8]],
+    visit: &(dyn Fn(usize, usize) + Sync),
+) -> Result<Option<usize>, String> {
     thread::scope(|s| {
         let handles: Vec<_> = chunks
             .iter()
@@ -321,11 +373,24 @@ fn each_region(chunks: &[&[u8]], visit: &(dyn Fn(usize, usize) + Sync)) -> Resul
                 s.spawn(move || -> Result<Option<usize>, String> {
                     let (mut i, mut max) = (0, None);
                     while i < chunk.len() {
-                        let comma = i + chunk[i..].iter().position(|&b| b == b',').ok_or("regions.csv: a line without a comma")?;
-                        let id = parse_digits(&chunk[i..comma]).ok_or("regions.csv: bad region_id")? as usize;
-                        let code = chunk.get(comma + 1..comma + 4).filter(|c| c.iter().all(u8::is_ascii_uppercase));
-                        let code = code.filter(|_| chunk.get(comma + 4) == Some(&b'\n')).ok_or("regions.csv: bad country")?;
-                        visit(id, code.iter().fold(0, |acc, &b| acc * 26 + (b - b'A') as usize));
+                        let comma = i + chunk[i..]
+                            .iter()
+                            .position(|&b| b == b',')
+                            .ok_or("regions.csv: a line without a comma")?;
+                        let id = parse_digits(&chunk[i..comma])
+                            .ok_or("regions.csv: bad region_id")?
+                            as usize;
+                        let code = chunk
+                            .get(comma + 1..comma + 4)
+                            .filter(|c| c.iter().all(u8::is_ascii_uppercase));
+                        let code = code
+                            .filter(|_| chunk.get(comma + 4) == Some(&b'\n'))
+                            .ok_or("regions.csv: bad country")?;
+                        visit(
+                            id,
+                            code.iter()
+                                .fold(0, |acc, &b| acc * 26 + (b - b'A') as usize),
+                        );
                         max = max.max(Some(id));
                         i = comma + 5;
                     }
@@ -333,7 +398,10 @@ fn each_region(chunks: &[&[u8]], visit: &(dyn Fn(usize, usize) + Sync)) -> Resul
                 })
             })
             .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).try_fold(None, |acc, max| Ok(acc.max(max?)))
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .try_fold(None, |acc, max| Ok(acc.max(max?)))
     })
 }
 
@@ -406,7 +474,9 @@ enum ParseError {
 fn skip_header(text: &[u8]) -> Result<usize, String> {
     let start = if text.starts_with(BOM) { BOM.len() } else { 0 };
     let rest = &text[start..];
-    let end = rest.strip_prefix(RECORDS_HEADER).ok_or("unexpected records.csv header")?;
+    let end = rest
+        .strip_prefix(RECORDS_HEADER)
+        .ok_or("unexpected records.csv header")?;
     let terminator = match end {
         [b'\r', b'\n', ..] => 2,
         [b'\n', ..] => 1,
@@ -419,12 +489,16 @@ fn skip_header(text: &[u8]) -> Result<usize, String> {
 /// Splits `text[from..]` into about `parts` runs of whole records and returns their
 /// start offsets, ending with `text.len()`.
 fn record_starts(text: &[u8], from: usize, parts: usize) -> Vec<usize> {
-    let bounds: Vec<usize> = (0..=parts).map(|p| from + (text.len() - from) * p / parts).collect();
+    let bounds: Vec<usize> = (0..=parts)
+        .map(|p| from + (text.len() - from) * p / parts)
+        .collect();
     // Pass 1, parallel: quote parity of each raw slice.
     let odd: Vec<bool> = thread::scope(|s| {
         let handles: Vec<_> = bounds
             .windows(2)
-            .map(|w| s.spawn(move || text[w[0]..w[1]].iter().filter(|&&b| b == b'"').count() % 2 == 1))
+            .map(|w| {
+                s.spawn(move || text[w[0]..w[1]].iter().filter(|&&b| b == b'"').count() % 2 == 1)
+            })
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
@@ -450,7 +524,9 @@ fn guessed_starts(text: &[u8], from: usize, parts: usize) -> Vec<usize> {
     let mut starts = vec![from];
     for p in 1..parts {
         let mut i = from + (text.len() - from) * p / parts;
-        while i + 1 < text.len() && !(text[i] == b'\n' && (text[i + 1].is_ascii_digit() || text[i + 1] == BOM[0])) {
+        while i + 1 < text.len()
+            && !(text[i] == b'\n' && (text[i + 1].is_ascii_digit() || text[i + 1] == BOM[0]))
+        {
             i += 1;
         }
         starts.push((i + 1).min(text.len()).max(*starts.last().unwrap()));
@@ -466,11 +542,21 @@ fn guessed_starts(text: &[u8], from: usize, parts: usize) -> Vec<usize> {
 /// kernel unmapping 50,000 page-cache pages one by one (9 ms on the test server).
 /// The page cache is not charged to this process; only the small buffer is.
 #[allow(clippy::too_many_arguments)]
-fn parse_run(file: &File, len: usize, start: usize, end: usize, buffer: &mut [u8], regions: &Regions, totals: &mut [Totals], pairs: &mut [Vec<u64>]) -> Result<usize, ParseError> {
+fn parse_run(
+    file: &File,
+    len: usize,
+    start: usize,
+    end: usize,
+    buffer: &mut [u8],
+    regions: &Regions,
+    totals: &mut [Totals],
+    pairs: &mut [Vec<u64>],
+) -> Result<usize, ParseError> {
     let mut at = start;
     while at < end {
         let piece = &mut buffer[..READ.min(end - at)];
-        file.read_exact_at(piece, at as u64).map_err(|e| ParseError::Bad(format!("read records.csv: {e}")))?;
+        file.read_exact_at(piece, at as u64)
+            .map_err(|e| ParseError::Bad(format!("read records.csv: {e}")))?;
         match parse_records(piece, at, at + piece.len() == len, regions, totals, pairs)? {
             // No whole record in the piece: one crosses `end` (a wrong guessed
             // cut), or is longer than the buffer.
@@ -484,12 +570,24 @@ fn parse_run(file: &File, len: usize, start: usize, end: usize, buffer: &mut [u8
 /// Parses the whole records at the start of `text`, which sits at byte `base` of
 /// the file, and returns their length. The last record may lack its terminator
 /// only if `text` ends at the end of the file (`last`).
-fn parse_records(text: &[u8], base: usize, last: bool, regions: &Regions, totals: &mut [Totals], pairs: &mut [Vec<u64>]) -> Result<usize, ParseError> {
-    let bad = |at: usize, what: &str| ParseError::Bad(format!("records.csv byte {}: {what}", base + at));
+fn parse_records(
+    text: &[u8],
+    base: usize,
+    last: bool,
+    regions: &Regions,
+    totals: &mut [Totals],
+    pairs: &mut [Vec<u64>],
+) -> Result<usize, ParseError> {
+    let bad =
+        |at: usize, what: &str| ParseError::Bad(format!("records.csv byte {}: {what}", base + at));
     let mut scan = Scanner::new(text, 0);
     let mut i = 0;
     while i < text.len() {
-        let id_start = if text[i..].starts_with(BOM) { i + BOM.len() } else { i }; // not data
+        let id_start = if text[i..].starts_with(BOM) {
+            i + BOM.len()
+        } else {
+            i
+        }; // not data
         let (id_end, q0) = scan.next();
         let (name_end, q1) = scan.next();
         let (note_end, q2) = scan.next();
@@ -498,15 +596,21 @@ fn parse_records(text: &[u8], base: usize, last: bool, regions: &Regions, totals
         if amount_end == text.len() && !last {
             break; // the record goes on past the end of `text`
         }
-        let commas = [id_end, name_end, note_end, region_end].iter().all(|&e| text.get(e) == Some(&b','));
+        let commas = [id_end, name_end, note_end, region_end]
+            .iter()
+            .all(|&e| text.get(e) == Some(&b','));
         if !commas || amount_end < text.len() && text[amount_end] != b'\n' {
             return Err(bad(i, "expected five fields and a record terminator"));
         }
         let id = digits(text, id_start, id_end).ok_or_else(|| bad(id_start, "bad id"))?;
-        let (name, name_bytes) = text_value(text, id_end + 1, name_end, q1 - q0).ok_or_else(|| bad(id_end + 1, "bad name"))?;
-        let (_, note_bytes) = text_value(text, name_end + 1, note_end, q2 - q1).ok_or_else(|| bad(name_end + 1, "bad note"))?;
-        let region_id = digits(text, note_end + 1, region_end).ok_or_else(|| bad(note_end + 1, "bad region_id"))?;
-        let cents = amount(text, region_end + 1, amount_end).ok_or_else(|| bad(region_end + 1, "bad amount"))?;
+        let (name, name_bytes) = text_value(text, id_end + 1, name_end, q1 - q0)
+            .ok_or_else(|| bad(id_end + 1, "bad name"))?;
+        let (_, note_bytes) = text_value(text, name_end + 1, note_end, q2 - q1)
+            .ok_or_else(|| bad(name_end + 1, "bad note"))?;
+        let region_id = digits(text, note_end + 1, region_end)
+            .ok_or_else(|| bad(note_end + 1, "bad region_id"))?;
+        let cents = amount(text, region_end + 1, amount_end)
+            .ok_or_else(|| bad(region_end + 1, "bad amount"))?;
         let group = regions.group(region_id);
         let total = &mut totals[group];
         total.count += 1;
@@ -527,17 +631,24 @@ fn parse_records(text: &[u8], base: usize, last: bool, regions: &Regions, totals
 /// quotes) in order, 64 bytes at a time.
 struct Scanner<'a> {
     text: &'a [u8],
-    block: usize,        // offset of the current block
-    separators: u64,     // its separators not returned yet
-    quotes: u64,         // its quote bits
-    quotes_before: u64,  // quotes between the start of the run and the block
-    inside: u64,         // all ones if the block ended inside quotes
+    block: usize,       // offset of the current block
+    separators: u64,    // its separators not returned yet
+    quotes: u64,        // its quote bits
+    quotes_before: u64, // quotes between the start of the run and the block
+    inside: u64,        // all ones if the block ended inside quotes
 }
 
 impl<'a> Scanner<'a> {
     /// Starts at `start`, which must be outside quotes: a record start.
     fn new(text: &'a [u8], start: usize) -> Self {
-        let mut scanner = Scanner { text, block: start, separators: 0, quotes: 0, quotes_before: 0, inside: 0 };
+        let mut scanner = Scanner {
+            text,
+            block: start,
+            separators: 0,
+            quotes: 0,
+            quotes_before: 0,
+            inside: 0,
+        };
         scanner.load(start);
         scanner
     }
@@ -564,13 +675,19 @@ impl<'a> Scanner<'a> {
     fn next(&mut self) -> (usize, u64) {
         while self.separators == 0 {
             if self.block + 64 >= self.text.len() {
-                return (self.text.len(), self.quotes_before + self.quotes.count_ones() as u64);
+                return (
+                    self.text.len(),
+                    self.quotes_before + self.quotes.count_ones() as u64,
+                );
             }
             self.load(self.block + 64);
         }
         let k = self.separators.trailing_zeros();
         self.separators &= self.separators - 1;
-        (self.block + k as usize, self.quotes_before + (self.quotes & ((1 << k) - 1)).count_ones() as u64)
+        (
+            self.block + k as usize,
+            self.quotes_before + (self.quotes & ((1 << k) - 1)).count_ones() as u64,
+        )
     }
 }
 
@@ -584,16 +701,27 @@ fn masks(block: &[u8; 64]) -> (u64, u64) {
         // SAFETY: AVX2 is enabled for this build (the cfg), and the two unaligned
         // 32-byte loads are inside the 64-byte array.
         unsafe {
-            let (lo, hi) = (_mm256_loadu_si256(block.as_ptr().cast()), _mm256_loadu_si256(block.as_ptr().add(32).cast()));
+            let (lo, hi) = (
+                _mm256_loadu_si256(block.as_ptr().cast()),
+                _mm256_loadu_si256(block.as_ptr().add(32).cast()),
+            );
             let eq = |v, byte: u8| _mm256_cmpeq_epi8(v, _mm256_set1_epi8(byte as i8));
             let separators = |v| _mm256_or_si256(eq(v, b','), eq(v, b'\n'));
             let bits = |lo, hi| movemask(lo) as u64 | (movemask(hi) as u64) << 32;
-            (bits(eq(lo, b'"'), eq(hi, b'"')), bits(separators(lo), separators(hi)))
+            (
+                bits(eq(lo, b'"'), eq(hi, b'"')),
+                bits(separators(lo), separators(hi)),
+            )
         }
     }
     #[cfg(not(target_feature = "avx2"))]
     {
-        let bits = |hit: fn(u8) -> bool| block.iter().rev().fold(0u64, |acc, &b| acc << 1 | hit(b) as u64);
+        let bits = |hit: fn(u8) -> bool| {
+            block
+                .iter()
+                .rev()
+                .fold(0u64, |acc, &b| acc << 1 | hit(b) as u64)
+        };
         (bits(|b| b == b'"'), bits(|b| b == b',' || b == b'\n'))
     }
 }
@@ -606,7 +734,9 @@ fn masks(block: &[u8; 64]) -> (u64, u64) {
 fn movemask(v: std::arch::x86_64::__m256i) -> u32 {
     let mask: u32;
     // SAFETY: AVX2 is enabled for this build; the instruction reads one register.
-    unsafe { std::arch::asm!("vpmovmskb {0:e}, {1}", out(reg) mask, in(ymm_reg) v, options(pure, nomem, nostack)) };
+    unsafe {
+        std::arch::asm!("vpmovmskb {0:e}, {1}", out(reg) mask, in(ymm_reg) v, options(pure, nomem, nostack))
+    };
     mask
 }
 
@@ -619,11 +749,19 @@ fn prefix_xor(bits: u64) -> u64 {
         use std::arch::x86_64::*;
         // A carry-less multiply by all ones XORs every lower bit into each bit.
         // SAFETY: PCLMULQDQ is enabled for this build (the cfg).
-        unsafe { _mm_cvtsi128_si64(_mm_clmulepi64_si128(_mm_set_epi64x(0, bits as i64), _mm_set1_epi8(-1), 0)) as u64 }
+        unsafe {
+            _mm_cvtsi128_si64(_mm_clmulepi64_si128(
+                _mm_set_epi64x(0, bits as i64),
+                _mm_set1_epi8(-1),
+                0,
+            )) as u64
+        }
     }
     #[cfg(not(target_feature = "pclmulqdq"))]
     {
-        [1, 2, 4, 8, 16, 32].iter().fold(bits, |x, &shift| x ^ x << shift)
+        [1, 2, 4, 8, 16, 32]
+            .iter()
+            .fold(bits, |x, &shift| x ^ x << shift)
     }
 }
 
@@ -647,9 +785,11 @@ fn digits(text: &[u8], s: usize, e: usize) -> Option<u64> {
     if (1..=8).contains(&len) && e >= 8 {
         // The 8 bytes ending at the field, minus '0', with the bytes before the
         // field zeroed: they read as leading zeros.
-        let word = (u64::from_le_bytes(text[e - 8..e].try_into().unwrap()) ^ 0x3030_3030_3030_3030) & u64::MAX << (8 * (8 - len));
+        let word = (u64::from_le_bytes(text[e - 8..e].try_into().unwrap()) ^ 0x3030_3030_3030_3030)
+            & u64::MAX << (8 * (8 - len));
         // Every byte must now be 0..=9: adding 0x76 sets the top bit of any above 9.
-        return ((word.wrapping_add(0x7676_7676_7676_7676) | word) & 0x8080_8080_8080_8080 == 0).then(|| eight_digits(word));
+        return ((word.wrapping_add(0x7676_7676_7676_7676) | word) & 0x8080_8080_8080_8080 == 0)
+            .then(|| eight_digits(word));
     }
     parse_digits(text.get(s..e)?)
 }
@@ -666,7 +806,11 @@ fn parse_digits(digits: &[u8]) -> Option<u64> {
     if digits.is_empty() || digits.len() > 18 || !digits.iter().all(u8::is_ascii_digit) {
         return None;
     }
-    Some(digits.iter().fold(0, |acc, &b| acc * 10 + (b - b'0') as u64))
+    Some(
+        digits
+            .iter()
+            .fold(0, |acc, &b| acc * 10 + (b - b'0') as u64),
+    )
 }
 
 /// `[ "-" ] 1*DIGIT "." 2DIGIT` in `text[s..e]`, before the CR of a CRLF: cents.
@@ -699,7 +843,11 @@ impl Field {
                 }
                 let abs = cents.unsigned_abs();
                 push_decimal(out, abs / 100);
-                out.extend_from_slice(&[b'.', b'0' + (abs % 100 / 10) as u8, b'0' + (abs % 10) as u8]);
+                out.extend_from_slice(&[
+                    b'.',
+                    b'0' + (abs % 100 / 10) as u8,
+                    b'0' + (abs % 10) as u8,
+                ]);
             }
         }
     }

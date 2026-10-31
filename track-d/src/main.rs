@@ -19,10 +19,10 @@
 
 mod mmap;
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, AtomicU8, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering::Relaxed};
 use std::thread;
 
 const UNCLAIMED: u8 = u8::MAX;
@@ -81,7 +81,9 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
     mmap::no_huge_pages();
 
     // Answer the queries in parallel; threads take the next unanswered one.
-    let answers: Vec<AtomicI64Cell> = (0..queries.len()).map(|_| AtomicI64Cell::default()).collect();
+    let answers: Vec<AtomicI64Cell> = (0..queries.len())
+        .map(|_| AtomicI64Cell::default())
+        .collect();
     let next = AtomicUsize::new(0);
     thread::scope(|s| {
         for _ in 0..threads.min(queries.len().max(1)) {
@@ -89,8 +91,17 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
                 let (mut forward, mut backward) = (Search::new(n), Search::new(n));
                 loop {
                     let q = next.fetch_add(1, Relaxed);
-                    let Some(&(source, target)) = queries.get(q) else { break };
-                    answers[q].set(distance(&graph, &reverse, &mut forward, &mut backward, source, target));
+                    let Some(&(source, target)) = queries.get(q) else {
+                        break;
+                    };
+                    answers[q].set(distance(
+                        &graph,
+                        &reverse,
+                        &mut forward,
+                        &mut backward,
+                        source,
+                        target,
+                    ));
                 }
             });
         }
@@ -147,7 +158,8 @@ fn build_graph(text: &[u8], threads: usize) -> Result<Graph, String> {
             .into_iter()
             .map(|chunk| {
                 s.spawn(move || -> Result<Vec<Vec<(u32, u32, u32)>>, String> {
-                    let mut out = vec![Vec::with_capacity(chunk.len() / 18 / buckets + 16); buckets];
+                    let mut out =
+                        vec![Vec::with_capacity(chunk.len() / 18 / buckets + 16); buckets];
                     let mut i = 0;
                     while i < chunk.len() {
                         let (u, j) = parse_u32(chunk, i);
@@ -164,7 +176,10 @@ fn build_graph(text: &[u8], threads: usize) -> Result<Graph, String> {
                 })
             })
             .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect::<Result<_, _>>()
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect::<Result<_, _>>()
     })?;
     let total: usize = parts.iter().flatten().map(Vec::len).sum();
     if total != m {
@@ -174,7 +189,8 @@ fn build_graph(text: &[u8], threads: usize) -> Result<Graph, String> {
     // Where each bucket's edges start in the CSR.
     let mut bucket_start = vec![0usize; buckets + 1];
     for b in 0..buckets {
-        bucket_start[b + 1] = bucket_start[b] + parts.iter().map(|part| part[b].len()).sum::<usize>();
+        bucket_start[b + 1] =
+            bucket_start[b] + parts.iter().map(|part| part[b].len()).sum::<usize>();
     }
 
     // Pass 2, parallel: lay out bucket after bucket; each writes only its own
@@ -185,7 +201,8 @@ fn build_graph(text: &[u8], threads: usize) -> Result<Graph, String> {
     let next = AtomicUsize::new(0);
     thread::scope(|s| {
         for _ in 0..threads {
-            let (parts, bucket_start, next, offsets_out, edges_out) = (&parts, &bucket_start, &next, &offsets_out, &edges_out);
+            let (parts, bucket_start, next, offsets_out, edges_out) =
+                (&parts, &bucket_start, &next, &offsets_out, &edges_out);
             s.spawn(move || {
                 let mut cursor = Vec::new();
                 loop {
@@ -237,7 +254,9 @@ fn relabel(graph: Graph, threads: usize) -> (Graph, Vec<u32>) {
     let owner: Vec<AtomicU8> = (0..n).map(|_| AtomicU8::new(UNCLAIMED)).collect();
     let claim = |v: u32, by: usize| {
         owner[v as usize].load(Relaxed) == UNCLAIMED
-            && owner[v as usize].compare_exchange(UNCLAIMED, by as u8, Relaxed, Relaxed).is_ok()
+            && owner[v as usize]
+                .compare_exchange(UNCLAIMED, by as u8, Relaxed, Relaxed)
+                .is_ok()
     };
     let grow = |queue: &mut Vec<u32>, by: usize| {
         let mut head = queue.len() - 1;
@@ -275,7 +294,10 @@ fn relabel(graph: Graph, threads: usize) -> (Graph, Vec<u32>) {
                 })
             })
             .collect();
-        handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect()
     });
     for root in 0..n as u32 {
         if claim(root, 0) {
@@ -379,7 +401,14 @@ fn reverse(graph: &Graph, threads: usize) -> Graph {
 /// labelled by both sides; it is exact once the two last-popped keys, each a lower
 /// bound for its side's unsettled nodes, add up to at least `best`, or once a side
 /// has run out of nodes.
-fn distance(graph: &Graph, reverse: &Graph, forward: &mut Search, backward: &mut Search, source: u32, target: u32) -> i64 {
+fn distance(
+    graph: &Graph,
+    reverse: &Graph,
+    forward: &mut Search,
+    backward: &mut Search,
+    source: u32,
+    target: u32,
+) -> i64 {
     if source == target {
         return 0;
     }
@@ -400,7 +429,12 @@ fn prefetch<T>(item: Option<&T>) {
     #[cfg(target_arch = "x86_64")]
     if let Some(item) = item {
         // SAFETY: prefetching is only a hint and never faults.
-        unsafe { std::arch::x86_64::_mm_prefetch(item as *const T as *const i8, std::arch::x86_64::_MM_HINT_T0) };
+        unsafe {
+            std::arch::x86_64::_mm_prefetch(
+                item as *const T as *const i8,
+                std::arch::x86_64::_MM_HINT_T0,
+            )
+        };
     }
 }
 
@@ -433,7 +467,13 @@ impl Search {
         // The pool is reserved once, so it never moves (and is never unmapped and
         // remapped, which interrupts every core); only pages in use are touched.
         let pool = Vec::with_capacity(n.div_ceil(PAGE) * PAGE);
-        Search { page_of: vec![0; n.div_ceil(PAGE)], pool, used: Vec::new(), big: HashMap::new(), heap: RadixHeap::new() }
+        Search {
+            page_of: vec![0; n.div_ceil(PAGE)],
+            pool,
+            used: Vec::new(),
+            big: HashMap::new(),
+            heap: RadixHeap::new(),
+        }
     }
 
     // get and set run once per edge relaxation: always inlined, with the rare
@@ -538,7 +578,11 @@ struct RadixHeap {
 
 impl RadixHeap {
     fn new() -> Self {
-        RadixHeap { last: 0, len: 0, buckets: std::array::from_fn(|_| Vec::new()) }
+        RadixHeap {
+            last: 0,
+            len: 0,
+            buckets: std::array::from_fn(|_| Vec::new()),
+        }
     }
 
     fn clear(&mut self) {

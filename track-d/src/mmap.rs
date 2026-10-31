@@ -6,7 +6,14 @@ use std::os::fd::AsRawFd;
 use std::os::raw::{c_int, c_long, c_void};
 
 unsafe extern "C" {
-    fn mmap(addr: *mut c_void, len: usize, prot: c_int, flags: c_int, fd: c_int, offset: c_long) -> *mut c_void;
+    fn mmap(
+        addr: *mut c_void,
+        len: usize,
+        prot: c_int,
+        flags: c_int,
+        fd: c_int,
+        offset: c_long,
+    ) -> *mut c_void;
     fn prctl(option: c_int, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> c_int;
     fn madvise(addr: *mut c_void, len: usize, advice: c_int) -> c_int;
 }
@@ -49,7 +56,16 @@ pub fn map(file: &File) -> io::Result<&'static [u8]> {
     }
     // SAFETY: a fresh read-only private mapping of `len` bytes; the dataset is
     // mounted read-only, so the bytes cannot change under us.
-    let ptr = unsafe { mmap(std::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, file.as_raw_fd(), 0) };
+    let ptr = unsafe {
+        mmap(
+            std::ptr::null_mut(),
+            len,
+            PROT_READ,
+            MAP_PRIVATE,
+            file.as_raw_fd(),
+            0,
+        )
+    };
     if ptr as isize == -1 {
         return Err(io::Error::last_os_error());
     }
