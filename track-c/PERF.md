@@ -23,6 +23,9 @@ much higher than the box's, so only the board decided what stayed.
 | 13 | 152db08 | The barrier's spin is bounded, then waiters sleep on a condition variable | | | | | |
 | 14 | 0030dfe | Exit as soon as the output is written; each run's pages dropped by the thread that parsed it | run-a476140e0850 | 0.0422 | 15.7 | 744 | 70.8 |
 | 15 | eb2cf64 | Per-record fast path (one 64-byte bitmap window, one 32-byte tail compare, one AVX2 number pass); batched dedupe; mallopt top pad; regions passes in the parse threads | run-db85f475f012 | 0.0268 | 16.0 | 914 | 75.0 |
+| 16 | 007cea6 | Fewer lines: a byte-by-byte spec 2.1 parser replaces the SIMD general scanner; regions.csv in one pass, groups numbered as first seen and sorted at output; worker 0 is the main thread and exits right after writing; std locks instead of `UnsafeCell` | run-20006a569215 | 0.0273 | 16.2 | 753 | 75.3 |
+| 17 | 48290f6 | One-pass digit loop for regions.csv; name and note bytes packed in one column; branchy min/max; fast-path bounds check out of the loop | run-bf1770e98008 | 0.0260 | 16.7 | 740 | 75.8 |
+| 18 | 2bf221c | Each thread owns 4 name partitions (threads × 4) in every round: no locks, tables stay in its cache | | | | 733 | |
 
 ## What each step taught
 
@@ -68,6 +71,24 @@ much higher than the box's, so only the board decided what stayed.
   - Each thread finds its own cuts. regions.csv lines go through a SWAR fast path. Both
     regions.csv passes run in the parse threads (one spawn of threads instead of three).
 
+- **Steps 16–18** (round 2). Times on the test server, 12 threads, PGO + static builds, medians of 21–31
+  interleaved runs (they include about 2.4 ms of fork/exec):
+  - 894c8a7 24.2 ms → step 16 23.9 → step 17 23.7 → step 18 22.0–22.9. Memory 15.0 MB → 15.5 MB at
+    12 threads (step 18 is 1 MB below step 17 there).
+  - Phases at 12 threads, before step 16: setup until the first parse 1.8 ms, parse rounds 12.7, dedupe
+    3.3, then 0.75 ms of thread joins and frees after the last barrier, 0.3 ms output. Step 16 took the
+    setup to 1.3 ms and removed the joins: worker 0 writes the output and calls `exit`.
+  - Two regressions found on the way, both 1 ms at 12 threads and invisible single-threaded: the
+    per-thread pair-buffer headers sitting inline in one shared `Vec` (false sharing on their lengths),
+    and `parse_run` taking `&Regions`. Regions holds a `Mutex` inline, so the reference is not
+    read-only to LLVM, and every record reloaded the table's address with two loads in front of the
+    lookup. `parse_run` takes the `&[AtomicU8]` slice.
+  - Step 18 had been rejected before (64 partitions over 12 threads, 6 vs 5 each, with locks). With
+    exactly 4 partitions per thread the dedupe is balanced and a thread's tables never leave its core.
+  - The single largest stall is the region-table lookup: 25–30% of single-thread cycles sit on the
+    load. It is cache footprint, not latency: with the id masked to a smaller table (wrong output,
+    timing only) 16 KB saves 2.3 ms, 256 KB 1.6 ms, 512 KB 0.7 ms. Prefetching does not help (below).
+
 ## Experiments that did not make it (measured, reverted)
 
 | Experiment | Where measured | Result |
@@ -90,10 +111,23 @@ much higher than the box's, so only the board decided what stayed.
 | All tables and pair buffers in a few big zeroed allocations, fixed pair segments | server | 44 ms vs 26: twice the page faults (zero-page read, then write) and 171 ms of system time |
 | 128 or 256 partitions so that a table fits in L1 | server | no change single-threaded |
 | Hash computed before the record's checks | fuzz | crashed: a rejected record can have a negative name length. Hash only after the checks |
+| Records counted one late, each region entry prefetched when parsed | server | +130M instructions, same time |
+| Batches of 4 / 8 / 16 records parsed with prefetches, then counted | server | +80M instructions; 12 threads 24.5 / 25.1 / 25.8 ms vs 24.5 |
+| Compact region table: 32-id blocks (`rank << 32 \| bits`, 250 KB) and 200 KB of groups | server | parse 16.2 ms vs 12.8: two dependent random loads cost more than one into 1 MB |
+| Name table 7/8 full with seen rows by slot (no ids) | server | −23% table memory, +0.8M branch misses, +1 ms |
+| 4096-slot tables (half the load) | server | +1.3 ms: the larger footprint |
+| `madvise(MADV_POPULATE_READ)` on each run before parsing it | server | 23.9 vs 23.6 ms |
+| Threads started as a binary tree | server | no change: thread starts still serialize in the kernel, about 55 µs each |
+| 128 partitions (before step 18) | server | 23.8 vs 23.6 ms |
+| ROUNDS 6 / 10 / 12 / 16 after step 18 (8 kept) | server | 22.6 / 22.5 / 22.7 / 23.2 ms vs 22.4; memory 17.5 / 14.8 / 14.4 / 13.8 MB vs 15.6 |
 
 ## Correctness checks run before every push
 
-sha256 of the seed-1 output; byte comparison with the reference output for sample seeds 2–4; the
-same output at 1, 2, 3, 5, 12 and 16 threads; forced wrong cuts, which must fall back to the
-quote-parity split and still give the same output; a tiny name table, which must overflow and retry;
-`objdump | grep -c vpinsrb` = 0 on the server build.
+sha256 of the seed-1 output; byte comparison with the reference output for sample seeds 2–4 and the
+holdout-like seed 99; the same output at 1, 2, 3, 5, 12 and 16 threads; 6 tiny and 6 sample seeds
+freshly generated and compared with the reference at 1, 3 and all threads; the `test_c_join.py`
+fixtures, as written and with their records repeated 300 times so the fast path sees them; forced
+wrong cuts, which must fall back to the quote-parity split and still give the same output; a tiny
+name table, which must overflow and retry; 60 mutated or truncated records.csv files and 21 mutated
+regions.csv files, which must exit as before, without a crash; `objdump | grep -c vpinsrb` = 0 on the
+server build.
