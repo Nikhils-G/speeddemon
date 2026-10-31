@@ -19,7 +19,7 @@ mod mmap;
 use std::fs::File;
 use std::io::Write;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering::Relaxed};
 use std::thread;
 
 const UNCLAIMED: u8 = u8::MAX;
@@ -111,22 +111,33 @@ impl AtomicI64Cell {
     }
 }
 
+/// Source-node buckets for building the CSR: few enough that each parsing thread's
+/// 128 append cursors stay in cache, enough that one bucket's nodes (~14K) and
+/// their counts fit in L1/L2 while the bucket is laid out.
+const BUCKET_BITS: u32 = 7;
+
+/// Builds the CSR without a random write per edge. Pass 1 parses every slice in
+/// parallel and appends each edge to the thread's bucket for its source node, a
+/// sequential write. Pass 2 lays out one bucket at a time: its edges cover a
+/// small range of source nodes, so counting their degrees and placing them is a
+/// counting sort that stays in cache, written to a disjoint part of the CSR.
 fn build_graph(text: &[u8], threads: usize) -> Result<Graph, String> {
     let (n, j) = parse_u32(text, 0);
     let (m, j) = parse_u32(text, j + 1);
     let (n, m) = (n as usize, m as usize);
     let body = &text[j + 1..];
+    let shift = (usize::BITS - n.max(1).leading_zeros()).saturating_sub(BUCKET_BITS);
+    let buckets = (n >> shift) + 1;
 
-    // Pass 1, parallel: parse each slice, count out-degrees, mark heads.
-    let degree: Vec<AtomicU32> = (0..=n).map(|_| AtomicU32::new(0)).collect();
+    // Pass 1, parallel: parse each slice into source-node buckets; mark heads.
     let has_in: Vec<AtomicU8> = (0..n).map(|_| AtomicU8::new(0)).collect();
-    let parsed: Vec<Vec<[u32; 3]>> = thread::scope(|s| {
+    let parts: Vec<Vec<Vec<(u32, u32, u32)>>> = thread::scope(|s| {
         let handles: Vec<_> = split_at_lines(body, threads)
             .into_iter()
             .map(|chunk| {
-                let (degree, has_in) = (&degree, &has_in);
-                s.spawn(move || -> Result<Vec<[u32; 3]>, String> {
-                    let mut edges = Vec::with_capacity(chunk.len() / 18 + 16);
+                let has_in = &has_in;
+                s.spawn(move || -> Result<Vec<Vec<(u32, u32, u32)>>, String> {
+                    let mut out = vec![Vec::with_capacity(chunk.len() / 18 / buckets + 16); buckets];
                     let mut i = 0;
                     while i < chunk.len() {
                         let (u, j) = parse_u32(chunk, i);
@@ -135,48 +146,70 @@ fn build_graph(text: &[u8], threads: usize) -> Result<Graph, String> {
                         if u as usize >= n || v as usize >= n {
                             return Err(format!("edge {u} {v} names a node outside 0..{n}"));
                         }
-                        degree[u as usize].fetch_add(1, Relaxed);
                         has_in[v as usize].store(1, Relaxed);
-                        edges.push([u, v, w]);
+                        out[(u >> shift) as usize].push((u, v, w));
                         i = j + 1;
                     }
-                    Ok(edges)
+                    Ok(out)
                 })
             })
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect::<Result<_, _>>()
     })?;
-    let total: usize = parsed.iter().map(Vec::len).sum();
+    let total: usize = parts.iter().flatten().map(Vec::len).sum();
     if total != m {
         return Err(format!("header says {m} edges, file has {total}"));
     }
 
-    // Exclusive prefix sum: offsets[u] is where u's edges start. `degree` is reused
-    // as each node's write cursor.
-    let mut offsets = Vec::with_capacity(n + 1);
-    let mut sum = 0u32;
-    for d in &degree {
-        offsets.push(sum);
-        sum += d.swap(sum, Relaxed);
+    // Where each bucket's edges start in the CSR.
+    let mut bucket_start = vec![0usize; buckets + 1];
+    for b in 0..buckets {
+        bucket_start[b + 1] = bucket_start[b] + parts.iter().map(|part| part[b].len()).sum::<usize>();
     }
 
-    // Pass 2, parallel: scatter every edge into its node's range. The order inside
-    // one node's range depends on thread timing, which cannot change a distance.
+    // Pass 2, parallel: lay out bucket after bucket; each writes only its own
+    // nodes' offsets and its own range of edges. Edges keep file order per node.
+    let mut offsets = vec![0u32; n + 1];
     let mut edges = vec![(0u32, 0u32); m];
-    let target = SharedEdges(edges.as_mut_ptr());
+    let (offsets_out, edges_out) = (Shared(offsets.as_mut_ptr()), Shared(edges.as_mut_ptr()));
+    let next = AtomicUsize::new(0);
     thread::scope(|s| {
-        for part in &parsed {
-            let (degree, target) = (&degree, &target);
+        for _ in 0..threads {
+            let (parts, bucket_start, next, offsets_out, edges_out) = (&parts, &bucket_start, &next, &offsets_out, &edges_out);
             s.spawn(move || {
-                for &[u, v, w] in part {
-                    let slot = degree[u as usize].fetch_add(1, Relaxed);
-                    // SAFETY: each fetch_add hands out a distinct slot inside u's range,
-                    // which lies inside `edges`, so writes never overlap or overflow.
-                    unsafe { *target.0.add(slot as usize) = (v, w) };
+                let mut cursor = Vec::new();
+                loop {
+                    let b = next.fetch_add(1, Relaxed);
+                    if b >= buckets {
+                        break;
+                    }
+                    let (lo, hi) = (b << shift, ((b + 1) << shift).min(n));
+                    cursor.clear();
+                    cursor.resize(hi - lo + 1, 0u32);
+                    for &(u, _, _) in parts.iter().flat_map(|part| &part[b]) {
+                        cursor[u as usize - lo + 1] += 1;
+                    }
+                    let mut at = bucket_start[b] as u32;
+                    for (k, slot) in cursor.iter_mut().enumerate() {
+                        at += *slot;
+                        *slot = at;
+                        if lo + k < hi {
+                            // SAFETY: offsets[lo..hi] belong to this bucket alone.
+                            unsafe { *offsets_out.0.add(lo + k) = at };
+                        }
+                    }
+                    for &(u, v, w) in parts.iter().flat_map(|part| &part[b]) {
+                        let slot = &mut cursor[u as usize - lo];
+                        // SAFETY: the counting sort above gives every edge of this
+                        // bucket a distinct slot inside its own range of `edges`.
+                        unsafe { *edges_out.0.add(*slot as usize) = (v, w) };
+                        *slot += 1;
+                    }
                 }
             });
         }
     });
+    offsets[n] = m as u32;
     Ok(Graph { offsets, edges, has_in })
 }
 
@@ -285,9 +318,9 @@ fn prefetch<T>(item: Option<&T>) {
     }
 }
 
-struct SharedEdges(*mut (u32, u32));
-// SAFETY: only used for the disjoint scatter writes above.
-unsafe impl Sync for SharedEdges {}
+struct Shared<T>(*mut T);
+// SAFETY: only used for the disjoint writes in build_graph.
+unsafe impl<T> Sync for Shared<T> {}
 
 /// One thread's reusable Dijkstra state.
 struct Search {
