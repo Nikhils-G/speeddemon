@@ -51,7 +51,13 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
 
     // Pass 1, parallel: parse each chunk into packed records.
     let parts: Vec<Part> = thread::scope(|s| {
-        let handles: Vec<_> = chunks.iter().map(|&chunk| s.spawn(move || parse_chunk(chunk, base))).collect();
+        let handles: Vec<_> = chunks
+            .iter()
+            .map(|&chunk| {
+                let start = chunk.as_ptr() as usize - log.as_ptr() as usize;
+                s.spawn(move || parse_chunk(log, start, start + chunk.len(), base))
+            })
+            .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect::<Result<_, _>>()
     })?;
 
@@ -196,16 +202,23 @@ struct Part<'a> {
     hour_hi: u32,
 }
 
-fn parse_chunk(chunk: &[u8], base: u32) -> Result<Part<'_>, String> {
-    let mut part = Part { records: Vec::with_capacity(chunk.len() / 70), errors: Vec::new(), endpoints: Vec::new(), hour_lo: u32::MAX, hour_hi: 0 };
+/// The longest possible line: 27 + 1 + 7 + 1 + 125 + 1 + 3 + 1 + 10 + 1 bytes.
+const MAX_LINE: usize = 177;
+/// SIMD loads read up to 32 bytes past a field start, so the fast path needs this
+/// much of the file left after the line start; the last lines take the scalar path.
+const FAST_MARGIN: usize = MAX_LINE + 64;
+
+/// Parses the lines in `log[start..end]`.
+fn parse_chunk(log: &[u8], start: usize, end: usize, base: u32) -> Result<Part<'_>, String> {
+    let mut part = Part { records: Vec::with_capacity((end - start) / 70), errors: Vec::new(), endpoints: Vec::new(), hour_lo: u32::MAX, hour_hi: 0 };
     let mut interner = Interner::new();
     // Lines from one shard arrive in time order, so most lines repeat the previous
     // line's hour: compare the 13 bytes "YYYY-MM-DDTHH" instead of reparsing them.
     let mut last_prefix = [0u8; 13];
     let mut hour = 0u32;
-    let mut i = 0;
-    while i < chunk.len() {
-        let line = &chunk[i..];
+    let mut i = start;
+    while i < end {
+        let line = &log[i..];
         if line[..13] != last_prefix {
             last_prefix.copy_from_slice(&line[..13]);
             let absolute = hour_of(line);
@@ -216,8 +229,35 @@ fn parse_chunk(chunk: &[u8], base: u32) -> Result<Part<'_>, String> {
             part.hour_lo = part.hour_lo.min(hour);
             part.hour_hi = part.hour_hi.max(hour);
         }
-        // "ts SP method SP endpoint SP status SP latency LF": ts is 27 bytes and the
-        // shortest method is 3, so the method's space is at 31 or later.
+        let fields = if log.len() - i >= FAST_MARGIN { Fields::fast(line) } else { Fields::scalar(line) };
+        let endpoint = interner.intern(&line[fields.endpoint.clone()], fields.hash, &mut part.endpoints);
+        if endpoint >= 1 << ENDPOINT_BITS {
+            return Err("more endpoints than the record layout holds".into());
+        }
+        let key = hour << ENDPOINT_BITS | endpoint;
+        if fields.error {
+            part.errors.push(key);
+        }
+        part.records.push((key as u64) << 32 | fields.latency);
+        i += fields.len;
+    }
+    Ok(part)
+}
+
+/// The fields of one line "ts SP method SP endpoint SP status SP latency LF".
+struct Fields {
+    endpoint: std::ops::Range<usize>,
+    hash: u64,
+    error: bool,
+    latency: u64,
+    /// Line length including the LF.
+    len: usize,
+}
+
+impl Fields {
+    /// The plain byte-by-byte parse, used near the end of the file.
+    fn scalar(line: &[u8]) -> Self {
+        // ts is 27 bytes and the shortest method is 3, so its space is at 31 or later.
         let mut e = 31;
         while line[e] != b' ' {
             e += 1;
@@ -227,25 +267,84 @@ fn parse_chunk(chunk: &[u8], base: u32) -> Result<Part<'_>, String> {
         while line[e] != b' ' {
             e += 1;
         }
-        let endpoint = interner.intern(&line[start..e], &mut part.endpoints);
-        if endpoint >= 1 << ENDPOINT_BITS {
-            return Err("more endpoints than the record layout holds".into());
-        }
-        let key = hour << ENDPOINT_BITS | endpoint;
-        // Status is always three digits, 100 to 599, so a 5xx starts with '5'.
-        if line[e + 1] == b'5' {
-            part.errors.push(key);
-        }
         let mut j = e + 5;
         let mut latency = 0u64;
         while line[j] != b'\n' {
             latency = latency * 10 + (line[j] - b'0') as u64;
             j += 1;
         }
-        part.records.push((key as u64) << 32 | latency);
-        i += j + 1;
+        // Status is always three digits, 100 to 599, so a 5xx starts with '5'.
+        Fields { endpoint: start..e, hash: hash(&line[start..e]), error: line[e + 1] == b'5', latency, len: j + 1 }
     }
-    Ok(part)
+
+    /// The same parse with AVX2: the endpoint's closing space and the latency's LF
+    /// are found 32 and 16 bytes at a time, and an endpoint of up to 32 bytes is
+    /// hashed straight from the register it was loaded into. The caller guarantees
+    /// FAST_MARGIN readable bytes from `line`.
+    #[cfg(target_feature = "avx2")]
+    fn fast(line: &[u8]) -> Self {
+        use std::arch::x86_64::*;
+        debug_assert!(line.len() >= FAST_MARGIN);
+        // The method is one of seven fixed words; its first letters give its length.
+        let method = match (line[28], line[29]) {
+            (b'G', _) | (b'P', b'U') => 3, // GET, PUT
+            (b'P', b'O') | (b'H', _) => 4, // POST, HEAD
+            (b'P', b'A') => 5,             // PATCH
+            (b'D', _) => 6,                // DELETE
+            _ => 7,                        // OPTIONS
+        };
+        if line[28 + method] != b' ' {
+            return Self::scalar(line); // not one of the seven: let the scalar parse decide
+        }
+        let start = 29 + method;
+        // SAFETY: FAST_MARGIN covers every load below: the endpoint starts at most 37
+        // bytes in, is at most 125 bytes, and the latency field at most 11 more.
+        unsafe {
+            let ptr = line.as_ptr().add(start);
+            let head = _mm256_loadu_si256(ptr as *const __m256i);
+            let spaces = _mm256_movemask_epi8(_mm256_cmpeq_epi8(head, _mm256_set1_epi8(b' ' as i8))) as u32;
+            let (len, hash) = if spaces != 0 {
+                let len = spaces.trailing_zeros() as usize;
+                // Keep only the endpoint's bytes and fold the four 64-bit lanes.
+                let index = _mm256_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31);
+                let keep = _mm256_cmpgt_epi8(_mm256_set1_epi8(len as i8), index);
+                let key = _mm256_and_si256(head, keep);
+                let lanes: [u64; 4] = std::mem::transmute(key);
+                (len, vector_hash(lanes, len))
+            } else {
+                let mut e = start + 32;
+                while line[e] != b' ' {
+                    e += 1;
+                }
+                (e - start, hash(&line[start..e]))
+            };
+            let end = start + len;
+            let digits = line.as_ptr().add(end + 5);
+            let lf = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128(digits as *const __m128i), _mm_set1_epi8(b'\n' as i8)));
+            let count = lf.trailing_zeros() as usize;
+            let mut latency = 0u64;
+            for k in 0..count {
+                latency = latency * 10 + (*digits.add(k) - b'0') as u64;
+            }
+            Fields { endpoint: start..end, hash, error: line[end + 1] == b'5', latency, len: end + 5 + count + 1 }
+        }
+    }
+
+    #[cfg(not(target_feature = "avx2"))]
+    fn fast(line: &[u8]) -> Self {
+        Self::scalar(line)
+    }
+}
+
+/// The hash of an endpoint of at most 32 bytes, from its zero-padded 64-bit lanes.
+/// `hash` below gives the same value for the same bytes, so both paths agree.
+fn vector_hash(lanes: [u64; 4], len: usize) -> u64 {
+    const K: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut h = len as u64;
+    for lane in lanes {
+        h = (h ^ lane).wrapping_mul(K).rotate_left(31);
+    }
+    h ^ (h >> 32)
 }
 
 /// Open-addressing endpoint table; names are slices of the mmap, so nothing is copied.
@@ -258,9 +357,9 @@ impl Interner {
         Interner { slots: vec![0; 1 << 13] }
     }
 
-    fn intern<'a>(&mut self, name: &'a [u8], names: &mut Vec<&'a [u8]>) -> u32 {
+    fn intern<'a>(&mut self, name: &'a [u8], hash: u64, names: &mut Vec<&'a [u8]>) -> u32 {
         let mask = self.slots.len() - 1;
-        let mut i = hash(name) as usize & mask;
+        let mut i = hash as usize & mask;
         loop {
             match self.slots[i] {
                 0 => break,
@@ -289,18 +388,20 @@ impl Interner {
     }
 }
 
-/// A fast multiply-rotate hash over 8-byte words.
+/// The endpoint hash: `vector_hash` of the bytes split into zero-padded 64-bit
+/// lanes, four at a time, so it matches the SIMD path for endpoints up to 32 bytes.
 fn hash(bytes: &[u8]) -> u64 {
-    const K: u64 = 0x9E37_79B9_7F4A_7C15;
-    let mut h = bytes.len() as u64;
-    let mut words = bytes.chunks_exact(8);
-    for word in &mut words {
-        h = (h ^ u64::from_le_bytes(word.try_into().unwrap())).wrapping_mul(K).rotate_left(31);
+    let mut lanes = [0u64; 4];
+    let mut h = 0u64;
+    for (n, block) in bytes.chunks(32).enumerate() {
+        for (lane, word) in lanes.iter_mut().zip(block.chunks(8).chain(std::iter::repeat(&[][..]))) {
+            let mut padded = [0u8; 8];
+            padded[..word.len()].copy_from_slice(word);
+            *lane = u64::from_le_bytes(padded);
+        }
+        h ^= vector_hash(lanes, bytes.len()).rotate_left(n as u32);
     }
-    let mut tail = [0u8; 8];
-    tail[..words.remainder().len()].copy_from_slice(words.remainder());
-    h = (h ^ u64::from_le_bytes(tail)).wrapping_mul(K);
-    h ^ (h >> 32)
+    h
 }
 
 /// Hours since 1970-01-01T00Z of a line starting "YYYY-MM-DDTHH".
