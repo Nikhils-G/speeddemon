@@ -30,8 +30,7 @@ use std::cell::UnsafeCell;
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::fs::FileExt;
-use std::sync::Barrier;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering::*};
 use std::thread;
 
 const RECORDS_HEADER: &[u8] = b"id,name,note,region_id,amount";
@@ -152,7 +151,7 @@ fn aggregate(
     };
     let pairs: Vec<Turns<Vec<Vec<u64>>>> = (0..threads).map(|_| Turns::new(buffers())).collect();
     let next_partition: Vec<AtomicUsize> = (0..ROUNDS).map(|_| AtomicUsize::new(0)).collect();
-    let barrier = Barrier::new(threads);
+    let barrier = SpinBarrier::new(threads);
     let results: Vec<Result<Vec<Totals>, ParseError>> = thread::scope(|s| {
         let handles: Vec<_> = (0..threads)
             .map(|w| {
@@ -226,6 +225,46 @@ fn aggregate(
         Err(ParseError::NamesFull)
     } else {
         Ok(parts)
+    }
+}
+
+/// A barrier whose waiters spin instead of sleeping. Each round's phases last a
+/// millisecond or two, and waking a dozen sleeping threads takes a good part of
+/// that (std's Barrier: about 1 ms more per run). `spin_loop` lets a waiting
+/// hyperthread hand its core to its sibling.
+struct SpinBarrier {
+    threads: usize,
+    arrived: AtomicUsize,
+    generation: AtomicUsize,
+}
+
+impl SpinBarrier {
+    fn new(threads: usize) -> Self {
+        let (arrived, generation) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        SpinBarrier {
+            threads,
+            arrived,
+            generation,
+        }
+    }
+
+    fn wait(&self) {
+        let generation = self.generation.load(Acquire);
+        if self.arrived.fetch_add(1, AcqRel) + 1 == self.threads {
+            self.arrived.store(0, Relaxed);
+            self.generation.fetch_add(1, Release);
+        } else {
+            // Spin, then yield, in case another process wants this core.
+            let mut spins = 0u32;
+            while self.generation.load(Acquire) == generation {
+                spins += 1;
+                if spins < 1 << 16 {
+                    std::hint::spin_loop();
+                } else {
+                    thread::yield_now();
+                }
+            }
+        }
     }
 }
 
