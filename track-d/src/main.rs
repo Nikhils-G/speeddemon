@@ -363,6 +363,9 @@ impl Search {
         Search { page_of: vec![0; n.div_ceil(PAGE)], pool: Vec::new(), used: Vec::new(), big: HashMap::new(), heap: RadixHeap::new() }
     }
 
+    // get and set run once per edge relaxation: always inlined, with the rare
+    // over-2^32 path kept out of line.
+    #[inline(always)]
     fn get(&self, node: u32) -> u64 {
         let page = self.page_of[(node >> PAGE_BITS) as usize];
         if page == 0 {
@@ -370,11 +373,24 @@ impl Search {
         }
         match self.pool[(page as usize - 1) * PAGE + (node as usize & (PAGE - 1))] {
             0 => u64::MAX,
-            BIG => self.big[&node],
+            BIG => self.get_big(node),
             stored => stored as u64 - 1,
         }
     }
 
+    #[cold]
+    #[inline(never)]
+    fn get_big(&self, node: u32) -> u64 {
+        self.big[&node]
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn set_big(&mut self, node: u32, d: u64) {
+        self.big.insert(node, d);
+    }
+
+    #[inline(always)]
     fn set(&mut self, node: u32, d: u64) {
         let mut page = self.page_of[(node >> PAGE_BITS) as usize];
         if page == 0 {
@@ -390,7 +406,7 @@ impl Search {
             *slot = d as u32 + 1;
         } else {
             *slot = BIG;
-            self.big.insert(node, d);
+            self.set_big(node, d);
         }
     }
 
