@@ -256,9 +256,9 @@ struct Part<'a> {
 
 /// The longest possible line: 27 + 1 + 7 + 1 + 125 + 1 + 3 + 1 + 10 + 1 bytes.
 const MAX_LINE: usize = 177;
-/// SIMD loads read up to 32 bytes past a field start, so the fast path needs this
+/// SIMD loads read up to 64 bytes past a field start, so the fast path needs this
 /// much of the file left after the line start; the last lines take the scalar path.
-const FAST_MARGIN: usize = MAX_LINE + 64;
+const FAST_MARGIN: usize = MAX_LINE + 128;
 
 /// Parses the lines in `log[start..end]`.
 fn parse_chunk(log: &[u8], start: usize, end: usize) -> Result<Part<'_>, String> {
@@ -296,16 +296,17 @@ fn parse_chunk(log: &[u8], start: usize, end: usize) -> Result<Part<'_>, String>
     Ok(part)
 }
 
-/// An endpoint's identity: its bytes zero-padded to 32, as four little-endian
-/// words. No endpoint byte is zero, so for endpoints shorter than 32 bytes the
-/// padding makes equal keys mean equal endpoints. An endpoint of 32 bytes or more
-/// gets the key of its first 32 bytes, which a longer endpoint can share, so
-/// those are compared byte by byte as well.
-type Key = [u64; 4];
+/// An endpoint's identity: its bytes zero-padded to KEY_BYTES, as little-endian
+/// words. No endpoint byte is zero, so for endpoints shorter than KEY_BYTES the
+/// padding makes equal keys mean equal endpoints. A longer endpoint gets the key
+/// of its first KEY_BYTES, which another long one can share, so those (5% of
+/// lines) are compared byte by byte as well.
+type Key = [u64; 8];
+const KEY_BYTES: usize = 64;
 
 fn key_of(bytes: &[u8]) -> Key {
-    let mut padded = [0u8; 32];
-    let n = bytes.len().min(32);
+    let mut padded = [0u8; KEY_BYTES];
+    let n = bytes.len().min(KEY_BYTES);
     padded[..n].copy_from_slice(&bytes[..n]);
     std::array::from_fn(|i| u64::from_le_bytes(padded[i * 8..i * 8 + 8].try_into().unwrap()))
 }
@@ -343,46 +344,44 @@ impl Fields {
         Fields { endpoint: start..e, key: key_of(&line[start..e]), error: line[e + 1] == b'5', latency, len: j + 1 }
     }
 
-    /// The same parse with AVX2: the endpoint's closing space and the latency's LF
-    /// are found 32 and 16 bytes at a time, the endpoint's key comes straight from
-    /// the register it was loaded into, and the latency digits are converted eight
-    /// at a time. The caller guarantees FAST_MARGIN readable bytes from `line`.
+    /// The same parse with AVX2 and no data-dependent branches for the common
+    /// line: one 64-byte window after the timestamp gives a mask of its spaces,
+    /// whose first two set bits end the method and the endpoint (the method's
+    /// length varies, so this replaces a match on its letters). The endpoint's key
+    /// comes from two loads masked to its length, the latency digits are converted
+    /// eight at a time. The caller guarantees FAST_MARGIN readable bytes.
     #[cfg(target_feature = "avx2")]
     fn fast(line: &[u8]) -> Self {
         use std::arch::x86_64::*;
         debug_assert!(line.len() >= FAST_MARGIN);
-        // The method is one of seven fixed words; its first letters give its length.
-        let method = match (line[28], line[29]) {
-            (b'G', _) | (b'P', b'U') => 3, // GET, PUT
-            (b'P', b'O') | (b'H', _) => 4, // POST, HEAD
-            (b'P', b'A') => 5,             // PATCH
-            (b'D', _) => 6,                // DELETE
-            _ => 7,                        // OPTIONS
-        };
-        if line[28 + method] != b' ' {
-            return Self::scalar(line); // not one of the seven: let the scalar parse decide
-        }
-        let start = 29 + method;
-        // SAFETY: FAST_MARGIN covers every load below: the endpoint starts at most 37
-        // bytes in, is at most 125 bytes, and the latency field at most 11 more.
+        // SAFETY: FAST_MARGIN covers every load below: the window ends 92 bytes in,
+        // the endpoint starts at most 37 bytes in, its key loads read 64 bytes from
+        // there, and the endpoint (at most 125 bytes) plus the latency field (at most
+        // 16 bytes read) ends within MAX_LINE + 16.
         unsafe {
-            let ptr = line.as_ptr().add(start);
-            let head = _mm256_loadu_si256(ptr as *const __m256i);
-            let spaces = _mm256_movemask_epi8(_mm256_cmpeq_epi8(head, _mm256_set1_epi8(b' ' as i8))) as u32;
-            let (len, key) = if spaces != 0 {
-                let len = spaces.trailing_zeros() as usize;
-                // Keep only the endpoint's bytes: zero everything from the space on.
-                let index = _mm256_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31);
-                let keep = _mm256_cmpgt_epi8(_mm256_set1_epi8(len as i8), index);
-                (len, std::mem::transmute::<__m256i, Key>(_mm256_and_si256(head, keep)))
+            let window = line.as_ptr().add(28);
+            let space = _mm256_set1_epi8(b' ' as i8);
+            let spaces = |at: usize| movemask(_mm256_cmpeq_epi8(_mm256_loadu_si256(window.add(at).cast()), space)) as u64;
+            let mask = spaces(0) | spaces(32) << 32;
+            let start = 29 + mask.trailing_zeros() as usize;
+            let rest = mask & (mask - 1);
+            let end = if rest != 0 {
+                28 + rest.trailing_zeros() as usize
             } else {
-                let mut e = start + 32;
+                let mut e = 92; // an endpoint of about 60 bytes or more
                 while line[e] != b' ' {
                     e += 1;
                 }
-                (e - start, std::mem::transmute::<__m256i, Key>(head))
+                e
             };
-            let end = start + len;
+            let len = end - start;
+            // Keep only the endpoint's bytes in each half: zero from the space on.
+            let index = _mm256_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31);
+            let half = |at: usize| {
+                let keep = _mm256_cmpgt_epi8(_mm256_set1_epi8(len.saturating_sub(at).min(32) as i8), index);
+                _mm256_and_si256(_mm256_loadu_si256(line.as_ptr().add(start + at).cast()), keep)
+            };
+            let key = std::mem::transmute::<[__m256i; 2], Key>([half(0), half(32)]);
             let digits = line.as_ptr().add(end + 5);
             let lf = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128(digits as *const __m128i), _mm_set1_epi8(b'\n' as i8)));
             let count = lf.trailing_zeros() as usize;
@@ -395,6 +394,18 @@ impl Fields {
     fn fast(line: &[u8]) -> Self {
         Self::scalar(line)
     }
+}
+
+/// `vpmovmskb`, kept opaque to the optimizer: LLVM rewrites the intrinsic as a
+/// vector of booleans, and on CPUs without AVX-512 (the scoring box) it then
+/// builds a 64-bit mask from two of them one bit at a time.
+#[cfg(target_feature = "avx2")]
+#[inline(always)]
+fn movemask(v: std::arch::x86_64::__m256i) -> u32 {
+    let mask: u32;
+    // SAFETY: AVX2 is enabled for this build; the instruction reads one register.
+    unsafe { std::arch::asm!("vpmovmskb {0:e}, {1}", out(reg) mask, in(ymm_reg) v, options(pure, nomem, nostack)) };
+    mask
 }
 
 /// The value of `count` ASCII digits (1 to 10) starting at `digits`, read through
@@ -444,7 +455,7 @@ impl Interner {
         loop {
             match self.slots[i] {
                 0 => break,
-                id if self.keys[id as usize - 1] == key && (name.len() < 32 || names[id as usize - 1] == name) => return id - 1,
+                id if self.keys[id as usize - 1] == key && (name.len() < KEY_BYTES || names[id as usize - 1] == name) => return id - 1,
                 _ => i = (i + 1) & mask,
             }
         }
@@ -468,7 +479,7 @@ impl Interner {
 
 /// Folds the four key words into one multiply. Collisions only cost a probe.
 fn hash(key: Key) -> u64 {
-    let folded = key[0] ^ key[1].rotate_left(17) ^ key[2].rotate_left(31) ^ key[3].rotate_left(47);
+    let folded = key[0] ^ key[1].rotate_left(17) ^ key[2].rotate_left(31) ^ key[3].rotate_left(47) ^ key[4] ^ key[7];
     let h = folded.wrapping_mul(0x9E37_79B9_7F4A_7C15);
     h ^ (h >> 29)
 }
