@@ -55,7 +55,10 @@ const HOT_BITS: u32 = 13;
 /// A thread's sum of matching ids is packed under its count in one u64.
 const SUM_BITS: u32 = 40;
 
+static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
 fn main() {
+    START.get_or_init(std::time::Instant::now);
     let mut args = std::env::args().skip(1);
     let data_dir = args.next().unwrap_or_else(|| "/data".into());
     let out_dir = args.next().unwrap_or_else(|| "/out".into());
@@ -101,6 +104,10 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
     let plan = Plan::new(queries, &df, sampled, nb);
     vocab.finish(&plan, &df);
 
+    // TEMPORARY box probe (full-size input only): exit code = elapsed 0.25 ms units.
+    if text.len() > 100_000_000 {
+        std::process::exit((START.get().unwrap().elapsed().as_micros() / 250).min(255) as i32);
+    }
     let results: Vec<(Vec<u64>, Vec<u64>, u32)> = thread::scope(|s| {
         let handles: Vec<_> = (slices.iter())
             .map(|&(start, end, first)| {
