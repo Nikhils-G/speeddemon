@@ -147,6 +147,12 @@ impl Regions {
         Ok(Regions { group_of, keys })
     }
 
+    fn prefetch(&self, region_id: u64) {
+        if let Some(entry) = self.group_of.get(region_id as usize) {
+            prefetch(entry);
+        }
+    }
+
     fn group(&self, region_id: u64) -> usize {
         match self.group_of.get(region_id as usize) {
             Some(&g) if g != NO_GROUP => g as usize,
@@ -211,23 +217,23 @@ enum ParseError {
 /// Lock-free name table shared by all threads: 64-bit name hash -> dense id, plus
 /// one bit per (name id, group).
 struct Names {
-    hashes: &'static [AtomicU64], // 0 = empty
-    ids: &'static [AtomicU32],    // id + 1 once published, FULL if the table ran out
+    /// Slot i is `table[2i]` (the hash, 0 = empty) and `table[2i + 1]` (id + 1 once
+    /// published, FULL if the table ran out): both in one cache line.
+    table: &'static [AtomicU64],
     next_id: AtomicU32,
     max_ids: u32,
     seen: &'static [AtomicU64], // `words` per name id
     words: usize,
 }
 
-const FULL: u32 = u32::MAX;
+const FULL: u64 = u64::MAX;
 
 impl Names {
     fn new(slots: usize, groups: usize) -> Self {
         let words = groups.div_ceil(64);
         let max_ids = slots / 2;
         Names {
-            hashes: zeroed_atomics(slots),
-            ids: zeroed_atomics(slots),
+            table: zeroed_atomics(slots * 2),
             next_id: AtomicU32::new(0),
             max_ids: max_ids as u32,
             seen: zeroed_atomics(max_ids * words),
@@ -236,18 +242,22 @@ impl Names {
     }
 
     /// The dense id of the name with this hash, inserting it if it is new.
+    fn home(&self, hash: u64) -> usize {
+        (hash >> 32) as usize & (self.table.len() / 2 - 1)
+    }
+
     fn id(&self, hash: u64) -> Result<usize, ParseError> {
         let hash = hash.max(1);
-        let mask = self.hashes.len() - 1;
-        let mut i = (hash >> 32) as usize & mask;
+        let mask = self.table.len() / 2 - 1;
+        let mut i = self.home(hash);
         loop {
-            let current = self.hashes[i].load(Acquire);
+            let current = self.table[2 * i].load(Acquire);
             if current == 0 {
-                match self.hashes[i].compare_exchange(0, hash, AcqRel, Acquire) {
+                match self.table[2 * i].compare_exchange(0, hash, AcqRel, Acquire) {
                     Ok(_) => {
                         let id = self.next_id.fetch_add(1, Relaxed);
                         let full = id >= self.max_ids;
-                        self.ids[i].store(if full { FULL } else { id + 1 }, Release);
+                        self.table[2 * i + 1].store(if full { FULL } else { id as u64 + 1 }, Release);
                         return if full { Err(ParseError::NamesFull) } else { Ok(id as usize) };
                     }
                     Err(other) if other == hash => return self.published(i),
@@ -263,12 +273,20 @@ impl Names {
     /// Waits the few nanoseconds until the inserting thread publishes slot i's id.
     fn published(&self, i: usize) -> Result<usize, ParseError> {
         loop {
-            match self.ids[i].load(Acquire) {
+            match self.table[2 * i + 1].load(Acquire) {
                 0 => std::hint::spin_loop(),
                 FULL => return Err(ParseError::NamesFull),
                 id => return Ok(id as usize - 1),
             }
         }
+    }
+
+    fn prefetch_slot(&self, hash: u64) {
+        prefetch(&self.table[2 * self.home(hash.max(1))]);
+    }
+
+    fn prefetch_row(&self, id: usize, group: usize) {
+        prefetch(&self.seen[id * self.words + group / 64]);
     }
 
     /// Marks (name, group); true for exactly one caller per pair, the first.
@@ -332,38 +350,80 @@ fn record_starts(text: &[u8], from: usize, parts: usize) -> Vec<usize> {
     starts
 }
 
+/// Records are handled in batches of this many, so that their cache misses overlap.
+const BATCH: usize = 16;
+
+/// One parsed record, waiting for its table lookups.
+#[derive(Clone, Copy, Default)]
+struct Record {
+    id: u64,
+    region_id: u64,
+    cents: i64,
+    name_bytes: u64,
+    note_bytes: u64,
+    hash: u64,
+    group: usize,
+    name: usize,
+}
+
 fn parse_records(text: &[u8], mut i: usize, end: usize, regions: &Regions, names: &Names) -> Result<Vec<Totals>, ParseError> {
     let mut totals = vec![Totals::default(); regions.keys.len()];
     let bad = |at: usize, what: &str| ParseError::Bad(format!("records.csv byte {at}: {what}"));
+    let mut batch = [Record::default(); BATCH];
     while i < end {
-        if text[i..].starts_with(BOM) {
-            i += BOM.len(); // a BOM right after a terminator is not data
+        // Each record needs three random reads: its region's group, its name's slot,
+        // then the (name, group) bit. Done one record at a time, each is a stall.
+        // So: parse a batch and prefetch the first two for all of it, then resolve
+        // them and prefetch the bits, then set the bits. The misses now overlap.
+        let mut n = 0;
+        while n < BATCH && i < end {
+            if text[i..].starts_with(BOM) {
+                i += BOM.len(); // a BOM right after a terminator is not data
+            }
+            let (id, next) = digits_until_comma(text, i).ok_or_else(|| bad(i, "bad id"))?;
+            let (name, name_bytes, next) = text_field(text, next).ok_or_else(|| bad(next, "bad name"))?;
+            let (_, note_bytes, next) = text_field(text, next).ok_or_else(|| bad(next, "bad note"))?;
+            let (region_id, next) = digits_until_comma(text, next).ok_or_else(|| bad(next, "bad region_id"))?;
+            let (cents, next) = amount(text, next).ok_or_else(|| bad(next, "bad amount"))?;
+            i = match &text[next..] {
+                [b'\r', b'\n', ..] => next + 2,
+                [b'\n', ..] | [] => next + 1,
+                _ => return Err(bad(next, "expected a record terminator")),
+            };
+            let hash = hash(name);
+            names.prefetch_slot(hash);
+            regions.prefetch(region_id);
+            batch[n] = Record { id, region_id, cents, name_bytes, note_bytes, hash, group: 0, name: 0 };
+            n += 1;
         }
-        let (id, next) = digits_until_comma(text, i).ok_or_else(|| bad(i, "bad id"))?;
-        let (name, name_bytes, next) = text_field(text, next).ok_or_else(|| bad(next, "bad name"))?;
-        let (_, note_bytes, next) = text_field(text, next).ok_or_else(|| bad(next, "bad note"))?;
-        let (region_id, next) = digits_until_comma(text, next).ok_or_else(|| bad(next, "bad region_id"))?;
-        let (cents, next) = amount(text, next).ok_or_else(|| bad(next, "bad amount"))?;
-        i = match &text[next..] {
-            [b'\r', b'\n', ..] => next + 2,
-            [b'\n', ..] | [] => next + 1,
-            _ => return Err(bad(next, "expected a record terminator")),
-        };
-
-        let g = regions.group(region_id);
-        let total = &mut totals[g];
-        total.count += 1;
-        total.id_sum += id;
-        total.amount_sum += cents;
-        total.amount_min = total.amount_min.min(cents);
-        total.amount_max = total.amount_max.max(cents);
-        total.name_bytes += name_bytes;
-        total.note_bytes += note_bytes;
-        if names.first_in_group(names.id(hash(name))?, g) {
-            total.names_distinct += 1;
+        for r in &mut batch[..n] {
+            r.group = regions.group(r.region_id);
+            let total = &mut totals[r.group];
+            total.count += 1;
+            total.id_sum += r.id;
+            total.amount_sum += r.cents;
+            total.amount_min = total.amount_min.min(r.cents);
+            total.amount_max = total.amount_max.max(r.cents);
+            total.name_bytes += r.name_bytes;
+            total.note_bytes += r.note_bytes;
+            r.name = names.id(r.hash)?;
+            names.prefetch_row(r.name, r.group);
+        }
+        for r in &batch[..n] {
+            if names.first_in_group(r.name, r.group) {
+                totals[r.group].names_distinct += 1;
+            }
         }
     }
     Ok(totals)
+}
+
+fn prefetch<T>(item: &T) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: prefetching is only a hint and never faults.
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(item as *const T as *const i8, std::arch::x86_64::_MM_HINT_T0)
+    };
 }
 
 /// `1*DIGIT ","` at `i`: the value and the offset after the comma.
