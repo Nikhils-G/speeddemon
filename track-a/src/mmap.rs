@@ -7,6 +7,18 @@ use std::os::raw::{c_int, c_long, c_void};
 
 unsafe extern "C" {
     fn mmap(addr: *mut c_void, len: usize, prot: c_int, flags: c_int, fd: c_int, offset: c_long) -> *mut c_void;
+    fn prctl(option: c_int, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> c_int;
+    fn madvise(addr: *mut c_void, len: usize, advice: c_int) -> c_int;
+}
+
+const PR_SET_THP_DISABLE: c_int = 41;
+
+/// Turns off transparent huge pages for this process. With THP set to "always",
+/// touching one byte of a sparse, lazily zeroed table can fault in a whole 2 MB
+/// page, so the memory peak would depend on how fragmented the host is that run.
+pub fn no_huge_pages() {
+    // SAFETY: a plain syscall wrapper; failure only means THP stays on.
+    unsafe { prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0) };
 }
 
 const PROT_READ: c_int = 1;
@@ -27,4 +39,15 @@ pub fn map(file: &File) -> io::Result<&'static [u8]> {
     }
     // SAFETY: the mapping is valid for `len` bytes and lives until exit.
     Ok(unsafe { std::slice::from_raw_parts(ptr as *const u8, len) })
+}
+
+/// Populates a writable mapping's pages in one call, with real pages, before
+/// threads touch them. Zeroed pages that threads fault in lazily are populated
+/// one page at a time under the kernel's page-table locks, and twelve threads
+/// filling one array that way spend a quarter of their time spinning on those
+/// locks. On a kernel without the call the array is simply faulted in lazily.
+pub fn populate<T>(slice: &mut [T]) {
+    const MADV_POPULATE_WRITE: c_int = 23;
+    // SAFETY: the range is this slice's own memory; the advice never faults.
+    unsafe { madvise(slice.as_mut_ptr() as *mut c_void, std::mem::size_of_val(slice), MADV_POPULATE_WRITE) };
 }

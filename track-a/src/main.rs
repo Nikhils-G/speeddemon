@@ -35,6 +35,7 @@ const ERROR_BIT: u32 = 1 << 19;
 const ENDPOINT_MASK: u32 = ERROR_BIT - 1;
 
 fn main() {
+    mmap::no_huge_pages();
     let mut args = std::env::args().skip(1);
     let data_dir = args.next().unwrap_or_else(|| "/data".into());
     let out_dir = args.next().unwrap_or_else(|| "/out".into());
@@ -158,12 +159,17 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
     });
 
     // Pass 3, parallel: scatter each latency to its slot, counting 5xx on the way.
+    // Both arrays are written by every thread at random: populated up front, so
+    // the threads do not all fault the same pages in (see `mmap::populate`).
     let mut latencies = vec![0u32; next as usize];
-    let errors: Vec<AtomicU32> = (0..groups).map(|_| AtomicU32::new(0)).collect();
+    mmap::populate(&mut latencies);
+    let mut errors: Vec<AtomicU32> = (0..groups).map(|_| AtomicU32::new(0)).collect();
+    mmap::populate(&mut errors);
+    let errors = &errors;
     let target = SharedSlice(latencies.as_mut_ptr());
     thread::scope(|s| {
         for (i, (part, part_slots)) in parts.iter().zip(slots.iter_mut()).enumerate() {
-            let (target, errors) = (&target, &errors);
+            let target = &target;
             s.spawn(move || {
                 for &record in &part.records {
                     let key = (record >> 32) as u32;
@@ -202,7 +208,7 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
             let len = (group_start[g1] - group_start[g0]) as usize;
             let (mine, tail) = rest.split_at_mut(len);
             rest = tail;
-            let (group_start, errors, names, hour_labels) = (&group_start, &errors, &names, &hour_labels);
+            let (group_start, names, hour_labels) = (&group_start, &names, &hour_labels);
             handles.push(s.spawn(move || {
                 let mut out = Vec::with_capacity(len * 4);
                 let offset = group_start[g0] as usize;
