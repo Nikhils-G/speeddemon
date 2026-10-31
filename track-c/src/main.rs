@@ -43,8 +43,8 @@ const ROUNDS: usize = 8;
 /// Names are split by their top hash bits into this many partitions.
 const PARTITION_BITS: u32 = 6;
 const PARTITIONS: usize = 1 << PARTITION_BITS;
-/// Name-table slots per partition for the first attempt: the spec's 100,000 names
-/// are about 1,560 per partition.
+/// Names per partition for the first attempt: the spec's 100,000 names are about
+/// 1,560 per partition.
 const FIRST_SLOTS: usize = 1 << 11;
 /// Bytes per read of records.csv.
 const READ: usize = 1 << 17;
@@ -292,19 +292,23 @@ impl<T> Turns<T> {
     }
 }
 
-/// One partition's names: an open-addressing table of name hashes, and one row of
-/// bits per slot, a bit per group.
+/// One partition's names: an open-addressing table of name hashes, kept at most
+/// half full so that a lookup is nearly always one probe, with a dense id per
+/// name, and one row of bits per id, a bit per group.
 struct Partition {
     keys: Vec<u64>, // 0 = empty, else the name hash with its low byte set to 0xFF
-    seen: Vec<u64>, // `words` per slot
+    ids: Vec<u16>,  // by slot
+    seen: Vec<u64>, // `words` per id
     used: usize,
 }
 
 impl Partition {
-    fn new(slots: usize, words: usize) -> Self {
+    /// A table for up to `names` names.
+    fn new(names: usize, words: usize) -> Self {
         Partition {
-            keys: vec![0; slots],
-            seen: vec![0; slots * words],
+            keys: vec![0; names * 2],
+            ids: vec![0; names * 2],
+            seen: vec![0; names * words],
             used: 0,
         }
     }
@@ -315,21 +319,18 @@ impl Partition {
         let mask = self.keys.len() - 1;
         // The top hash bits picked the partition; the bits above the group pick the slot.
         let mut i = (pair >> 8) as usize & mask;
-        loop {
-            match self.keys[i] {
-                k if k == key => break,
-                0 => {
-                    if self.used * 8 >= self.keys.len() * 7 {
-                        return Err(ParseError::NamesFull);
-                    }
-                    self.used += 1;
-                    self.keys[i] = key;
-                    break;
+        while self.keys[i] != key {
+            if self.keys[i] == 0 {
+                if self.used == self.keys.len() / 2 {
+                    return Err(ParseError::NamesFull);
                 }
-                _ => i = (i + 1) & mask,
+                (self.keys[i], self.ids[i]) = (key, self.used as u16);
+                self.used += 1;
+                break;
             }
+            i = (i + 1) & mask;
         }
-        let word = &mut self.seen[i * words + group / 64];
+        let word = &mut self.seen[self.ids[i] as usize * words + group / 64];
         let bit = 1 << (group % 64);
         let new = *word & bit == 0;
         *word |= bit;
