@@ -101,7 +101,6 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
     let lines = queries.lines.len();
     let plan = Plan::new(queries, &df, sampled, nb);
     vocab.finish(&plan);
-    if docs.len() > 100 << 20 { std::process::exit((probe_t0.elapsed().as_micros() / 250).min(255) as i32) } // PROBE
 
     let results: Vec<(Vec<u64>, Vec<u64>, u32)> = thread::scope(|s| {
         let handles: Vec<_> = (slices.iter())
@@ -122,6 +121,7 @@ fn run(data_dir: &str, out_dir: &str) -> Result<(), String> {
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect::<Result<_, String>>()
     })?;
+    if docs.len() > 100 << 20 { std::process::exit((probe_t0.elapsed().as_micros() / 1000).min(255) as i32) } // PROBE
     let next_firsts = slices.iter().skip(1).map(|s| s.2).chain([doc_count]);
     if slices.first().is_some_and(|s| s.2 != 0) || results.iter().zip(next_firsts).any(|(r, next)| r.2 + 1 != next) {
         return Err("docs.txt: ids must be 0, 1, 2, ... in order".into());
