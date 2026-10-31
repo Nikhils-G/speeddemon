@@ -24,13 +24,14 @@ a record start.
 
 **Parsing.** Each record is taken from the 64 bytes at its start, as simdjson does for JSON: AVX2
 compares give a bitmap of `"` and one of `,`; a carry-less multiply of the quote bits by all ones
-gives, for every byte, whether it is inside quotes, and what is left of the comma bitmap are exactly
+gives, for every byte, whether it is inside quotes (`masks()` returns all three bitmaps), and what is left of the comma bitmap are exactly
 the field separators. Counting quote bits between separators gives each text field's unescaped
 length (`""` is one byte) without looking at its bytes. One 32-byte compare finds the region's comma
 and the amount's dot, and one AVX2 pass converts the three numbers. About 10% of records need a
 second 64-byte window for the note, still on the fast path. A record whose name or note runs past
-both windows, and the last records of the file, go through a short walker that reads the same
-2.2 shapes byte by byte. Each run is parsed as two halves at
+both windows, and the last records of the file, go through a short walker: one `field()` scan
+reads each of the five fields (quoted or not), and a digit fold gives the numbers, an amount's
+digits without its sign and dot being its cents. Each run is parsed as two halves at
 once, so that two records' region-table loads are in flight together.
 
 **Distinct names per country.** A name is identified by a hash of its raw bytes between the quotes:

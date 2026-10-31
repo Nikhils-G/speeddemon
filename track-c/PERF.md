@@ -34,6 +34,7 @@ much higher than the box's, so only the board decided what stayed.
 | 24 | | Fewer lines (mmap.rs folded in, regions as locals, compact slow path, seen rows grown per name); a filer takes over an inbox that grows past 16 x threads buffers | run-a80b6d932516 | 0.0263 | 13.5 | 541 | 77.6 |
 | 25 | e99accf | Trust spec 2.2 (what the generator writes): the 2.1 parser, the one-run second pass and the per-record validation removed; a 2.2 walker for long fields and the file's end; panics as tripwires | run-d1003468b70d | 0.0229 | 13.3 | 445 | 79.8 |
 | 26 | 7a72ab7 | Fewer lines: one field walker for all five fields, `masks` returns the inside-quotes mask, the own inbox taken in the filing loop. Equal on the server, 10% slower on the box: reverted to step 25 (0cc7815) | run-5b165ed65fa8, run-cb0af101a699 | 0.0253, 0.0252 | | 407 | |
+| 27 | 80fbcfd | Step 26 without its two suspects: the regions fill keeps its digit loop, and a thread takes its own inbox after the block release, as in step 25 | run-0495510fc87f | 0.0229 | 13.35 | 418 | 80.0 |
 
 ## What each step taught
 
@@ -213,6 +214,11 @@ guessed cut sent the whole file through a second pass. Neither can happen on gen
   variant measured the same (20.05–20.31 ms), so the server cannot say which change costs on the
   box. The prime suspects are the regions fill and the merged take, which changes when a thread
   takes its own inbox.
+- Step 27 kept every other step-26 cut and left out exactly those two. Server: 20.22 ms, 854.0M
+  single-thread instructions (step 25: 854.2M). On the box: 0.0229 s, the same as step 25, with 27
+  fewer lines (+0.15 points, best C run). Step 26 ran 0.0253 with them in, so together they cost
+  about 10% on the box, while the server showed nothing at 12 threads. Which of the two (or both)
+  is not separated: that would take two more board runs.
 - One codegen trap, found while bisecting a slower intermediate version with non-PGO builds:
   `fast_record(..).or_else(|| slow_record(..))` in the per-record closure cost 46M more
   instructions than the same logic as a `match`. The kernel keeps the `match`.
