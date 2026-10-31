@@ -290,15 +290,21 @@ impl Stats {
             + 1
     }
 
+    /// The line is put together in a stack buffer and appended in one copy:
+    /// appending each field took a library `memcpy` call apiece.
     fn write(&self, head: &Head, names: &[&[u8]], out: &mut Vec<u8>) {
-        out.extend_from_slice(head);
-        out.extend_from_slice(b":00:00Z ");
-        out.extend_from_slice(names[self.rank as usize]);
+        let mut line = [0u8; 256]; // 20 + 1 + 125 + 6 * 11 + 1 = 213 at most
+        line[..13].copy_from_slice(head);
+        line[13..21].copy_from_slice(b":00:00Z ");
+        let name = names[self.rank as usize];
+        line[21..21 + name.len()].copy_from_slice(name);
+        let mut at = 21 + name.len();
         for value in self.numbers() {
-            out.push(b' ');
-            push_decimal(out, value);
+            line[at] = b' ';
+            at = put_decimal(&mut line, at + 1, value);
         }
-        out.push(b'\n');
+        line[at] = b'\n';
+        out.extend_from_slice(&line[..at + 1]);
     }
 }
 
@@ -612,24 +618,26 @@ fn hash(key: Key) -> u64 {
 /// read at once: the next selection reorders that part, its own slot included.
 fn percentiles(values: &mut [u32]) -> [u32; 3] {
     let [r50, r95, r99] = [50, 95, 99].map(|p| (p * values.len()).div_ceil(100) - 1);
+    // Most groups are small: one insertion-sort pass beats three selections.
+    if values.len() <= 32 {
+        values.sort_unstable();
+        return [r50, r95, r99].map(|r| values[r]);
+    }
     let p50 = *values.select_nth_unstable(r50).1;
     let p95 = *values[r50..].select_nth_unstable(r95 - r50).1;
     let p99 = *values[r95..].select_nth_unstable(r99 - r95).1;
     [p50, p95, p99]
 }
 
-fn push_decimal(out: &mut Vec<u8>, mut value: u64) {
-    let mut digits = [0u8; 20];
-    let mut i = digits.len();
-    loop {
-        i -= 1;
-        digits[i] = b'0' + (value % 10) as u8;
-        value /= 10;
-        if value == 0 {
-            break;
-        }
+/// Writes `value` in decimal at `line[at..]` and returns the offset after it.
+fn put_decimal(line: &mut [u8], at: usize, value: u64) -> usize {
+    let len = value.checked_ilog10().map_or(1, |d| d as usize + 1);
+    let mut v = value;
+    for i in (at..at + len).rev() {
+        line[i] = b'0' + (v % 10) as u8;
+        v /= 10;
     }
-    out.extend_from_slice(&digits[i..]);
+    at + len
 }
 
 /// Splits `data` into about `parts` slices, each ending just after a newline.
