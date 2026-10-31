@@ -344,9 +344,10 @@ fn write_output(dir: &str, parts: &[[Totals; GROUPS]], codes: &[[u8; 3]]) -> Res
 }
 
 /// Spins for a while, then yields the core between checks, until `done()`. The
-/// phases between checks last a millisecond or two, and waking a dozen sleeping
-/// threads takes a good part of that (std's Barrier: about 1 ms more per run).
-/// Yielding after the spin keeps a thread that lost its core from being starved.
+/// waits (for regions.csv, and for the last runs) are short, and waking a dozen
+/// sleeping threads would take a good part of them (std's Barrier between rounds
+/// was about 1 ms slower per run). Yielding after the spin keeps a thread that
+/// lost its core from being starved by spinning siblings.
 fn spin_until(done: impl Fn() -> bool) {
     for spin in (0u32..).take_while(|_| !done()) {
         match spin < 1 << 14 {
@@ -770,6 +771,8 @@ unsafe fn hash_words(text: &[u8], s: usize, e: usize) -> u64 {
         at += 8;
     }
     let rest = e - at;
+    // SAFETY: BMI2 is enabled by target-cpu=native on the box (and comes with AVX2 on
+    // every Intel and AMD CPU that has it).
     let first = unsafe { _bzhi_u64(load(at), 8 * rest as u32) };
     let last = load(e - 8) & ((rest > 8) as u64).wrapping_neg();
     mix(h ^ first ^ P1, last ^ P0 ^ len)

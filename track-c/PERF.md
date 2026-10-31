@@ -27,7 +27,11 @@ much higher than the box's, so only the board decided what stayed.
 | 17 | 48290f6 | One-pass digit loop for regions.csv; name and note bytes packed in one column; branchy min/max; fast-path bounds check out of the loop | run-bf1770e98008 | 0.0260 | 16.7 | 740 | 75.8 |
 | 18 | 2bf221c | Each thread owns 4 name partitions (threads × 4) in every round: no locks, tables stay in its cache | run-b9a64cd5e4d6 | 0.0258 | 15.5 | 733 | 76.2 |
 | 19 | 7a7c57a | Non-temporal prefetch of the record stream 1 KB ahead, so the scan takes less of L2 and more of the 1 MB region table stays there (a box-only effect: no change on the AMD test server) | run-9389bfd9b77d | 0.0253 | 15.1 | 737 | 76.5 |
-| 20 | eba58c8 | Same engine in fewer lines: no NamesFull retry (tables sized from the generator's 100,000-name pool, 8 standard deviations of room), errors as strings, `aggregate` folded into `run`, a one-counter barrier, regions chunks cut by `run_start`, `parse_run` kept out of line | | | | 590 | |
+| 20 | eba58c8 | Same engine in fewer lines: no NamesFull retry (tables sized from the generator's 100,000-name pool, 8 standard deviations of room), errors as strings, `aggregate` folded into `run`, a one-counter barrier, regions chunks cut by `run_start`, `parse_run` kept out of line | run-6cd61471239e | 0.0259 | 16.4 | 590 | 76.7 |
+| 21 | 66d51c8 | Runs claimed from a per-round counter (4 per thread per round); a partition's dedupe taken by any thread once its owner has not started it; pages released after the barrier; the last thread to finish writes the output | run-cbeafca6a928 | 0.0263 | 14.6 | 610 | 76.9 |
+| 22 | 6b93c97 | No rounds and no barriers: runs claimed one at a time, pair buffers handed to the owner thread's inbox after each run, tables take their inboxes between runs | run-ad43390d62d8 | 0.0261 | 13.9 | 615 | 77.1 |
+| 23 | 68e5b56 | Claims go round the file's stripes, so that runs parsed at the same time do not share page tables | run-2a9b09524d9d | 0.0255 | 13.6 | 616 | 77.5 |
+| 24 | | Fewer lines (mmap.rs folded in, regions as locals, compact slow path, seen rows grown per name); a filer takes over an inbox that grows past 16 x threads buffers | run-a80b6d932516 | 0.0263 | 13.5 | 541 | 77.6 |
 
 ## What each step taught
 
@@ -116,10 +120,78 @@ much higher than the box's, so only the board decided what stayed.
   on spec 2.1 input (the spec's own RULES fixture has an LF followed by a BOM inside quotes) is
   parsed silently instead of failing over to the one-run parse.
 
+### Steps 21–24 (round 4): one slow CPU
+
+Four board runs of unchanged code took about twice the normal time:
+- 0.0778 s;
+- run-a960875d2df3, 0.0467 s;
+- run-66dc03aa76e1, 0.0507 s;
+- run-7f86618c8878, 0.0613 s.
+
+The test server shows the same 2x when a busy loop is pinned to one of the 12 CPUs
+(`taskset -c 3 sh -c 'while :; do :; done'`): 22.4 ms becomes 42 ms.
+- The cause: the scheduler's slice there is 2.8 ms. The thread that shares its CPU with the loop
+  is off its core for whole slices, and every one of the 17 barriers waited for it.
+- A probe of the barrier waits: 0.84 ms per thread unloaded, about 10.5 ms with the loaded CPU.
+- A loop on a hyperthread sibling outside our CPU set changed nothing.
+
+Medians of 21–41 interleaved runs, PGO builds, 12 threads:
+
+| Version | Unloaded (ms) | One CPU loaded (ms) | Memory peak (MB) |
+|---|---|---|---|
+| step 20 (8 rounds, fixed runs and partitions) | 22.3 | 42.2 | 15.5–16.3 |
+| d1: runs claimed within a round (4 per thread), partitions stolen | 24.3 | 33.2 | |
+| step 21 (d5t): d1 with one page release per thread share, after the barrier | 22.4 | 32.8 | 15.3–16.1 |
+| e1: a pool of pair sets and a publish log, no barriers | 22.7 | 30.8 | |
+| step 22 (e8): inboxes per owner thread, buffers handed over | 22.7 | 25.2 | 14.2–14.6 |
+| step 23 (g1): claims round the stripes | 22.3 | 25–26.8 | 14.0–14.6 |
+| step 24 (h6) | 22.4 | 25.8 | 14.3–15.7 (loaded) |
+
+- Claiming runs dynamically within a round helped only partly: a thread that is off its core
+  while it holds a run still holds the barrier, however small the run. The fix had to remove the
+  barriers.
+- Small runs cost +2 ms by themselves (d1) until the page release went back to one call per
+  2 MB: every `madvise(MADV_DONTNEED)` is a round of TLB-shootdown interrupts to all 12 CPUs.
+  Since step 22 the thread that parses the last run of a block of 4 releases the block.
+- e1 published each run's pair set in a log, and a set was free again once all 48 partitions
+  had taken it. A thread that was preempted while it held a partition then stalled the pool for
+  everyone (30.8 ms loaded). Inboxes per owner thread do not stall: an owner that falls behind
+  only lets its own inbox grow.
+- Handing buffers over instead of copying pairs into the inbox saved 1.2 ms (the copy wrote
+  each pair a second time, into lines last held by another core). Returning each buffer to the
+  thread that filed it was 0.3 ms slower.
+- The barrier-free version needs less memory (step 22: −1.4 MB), because pairs wait for about one
+  run instead of one round. But an owner that falls behind lets its inbox grow: h5 reached
+  17.6–21.9 MB with one loaded CPU. Step 24 bounds it: a filer that finds more than 16 x threads
+  buffers in an inbox takes that thread's tables over (14.3–15.7 MB loaded, same session).
+- Step 23 came from the profile: `native_queued_spin_lock_slowpath` was 2% of the samples. Under
+  claim order, four threads parsed adjacent 0.53 MB runs inside the same 2 MB page-table page, and
+  their file faults and releases contended on its lock. It was gone with the claims spread over the
+  stripes: −0.5 ms on the server and the best board run (0.0255).
+- Step 24's single-thread instruction count drifts between builds (963M for step 23, 986–1016M
+  for the compact versions) without any change to the hot loop. A bisection showed that putting
+  step 23's exact `parse_run` and `fast_record` into the compact file, or step 24's slow path
+  into step 23's file, moves it by the same amount: register allocation in `parse_run` changes (60
+  against 68 stack references). The 12-thread time does not change (22.35 against 22.39 ms over 41
+  runs). `Partition::add` is now out of line as well, so that the worker's code around it cannot
+  change its loop.
+
 ## Experiments that did not make it (measured, reverted)
 
 | Experiment | Where measured | Result |
 |---|---|---|
+| Waiters sleep (20 µs) instead of yielding, so the kernel can move the slowed thread | server, one CPU loaded | 33.9 vs 33.1 ms |
+| A pool of pair sets with a publish log (e1) | server | 22.7 / 30.8 ms (unloaded / loaded): one preempted partition holder stalls the pool |
+| Pairs copied into the inbox | server | flush 1.2 ms per thread vs 0.19 handed over |
+| Buffers returned to the thread that filed them | server | +0.3 ms |
+| 64 runs per thread (8-run release blocks) | server | +0.9 ms, memory 12.9–13.5 MB: the tables take smaller batches and are fetched again more often |
+| 16 / 24 runs per thread | server | −0.3 / ±0 ms, memory 16.4 / 14.7 MB |
+| One inbox lock per partition instead of per owner thread (48 lock calls per run) | server | same time |
+| Tables taken from any thread while waiting for the last runs | server | same time; removed (−9 lines) |
+| Regions entered before the thread's own tables are allocated | server | 23.02 vs 23.02 ms |
+| Release blocks of 8 or 16 runs | server | within 0.1 ms, memory up slightly |
+| Non-PIE static binary (`-C relocation-model=static`) | server | one-record input 5.06 vs 5.12 ms, full run the same |
+| Builds without PGO | server, 12 threads | the same wall time; single thread 1–2% more cycles |
 | Populate the tables before the threads start | board run-b4f2d95150d7 | T 0.106 vs 0.104, M 15.1: worse; 20% faster on the server |
 | `prefetchw` and batches of 32 | board run-d1cae4327c17 | T 0.0995 vs 0.0979: no gain |
 | Read records.csv with pread through 128 KB buffers instead of the mapping (2341842) | board run-4381f7c8201d | no change on the box (6 ms faster on the server); kept, neutral |
@@ -154,6 +226,10 @@ much higher than the box's, so only the board decided what stayed.
 | First hash round always taken (no branch for 17–24-byte names) | server | branch misses 960k → 571k, but +30M instructions (+57M under PGO), +0.3 ms |
 
 ## Correctness checks run before every push
+
+Round 4 ran all of these on the exact docker-built binary, plus loaded-CPU runs, and strace of the
+RULES fixture with its records repeated 300 times. The thread spawns are counted, to check that the
+one-run fallback really runs (22 clones = two sets of 11).
 
 sha256 of the seed-1 output; byte comparison with the reference output for sample seeds 2–4 and the
 holdout-like seed 99; the same output at 1, 2, 3, 5, 12 and 16 threads; 6 tiny and 6 sample seeds

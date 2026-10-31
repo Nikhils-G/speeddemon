@@ -26,24 +26,35 @@ this shape goes to a byte-by-byte parser of spec 2.1, which also rejects invalid
 
 **Distinct names per country.** A name is identified by a hash of its raw bytes between the quotes:
 inside quotes `""` maps one to one to the unescaped value, and an unquoted value cannot contain a
-quote, so equal values have equal raw bytes. Parsing files a (hash, country) pair under one of 4
-partitions per thread chosen by the hash. The file is parsed in 8 rounds; between rounds each thread
-marks the pairs of the partitions it owns (the same ones every round) in their small tables, which
-hold a bit per country for each name and stay in that thread's cache. No two threads ever write the
-same memory, so there are no atomics or locks on the hot path, and the rounds keep the pair buffers
-to about 3.5 MB.
+quote, so equal values have equal raw bytes. The hash has 56 bits: the chance that two of the
+generator's 100,000 names share one is about 7e-8. Parsing files a (hash, country) pair under one of 4
+partitions per thread, chosen by the hash. After each run it parses, a thread hands its buffers of
+pairs to their owners' inboxes, moving them rather than copying. It then lets its own 4 tables
+take what waits in its inbox. A table holds a bit per country for each name, and a thread's
+tables stay in its cache. No two threads ever write the same table, so the hot path has no
+atomics.
+
+**No waiting for a slow thread.** The file is cut into 32 runs per thread, which threads claim
+one at a time. A thread that loses its core to another process parses fewer runs, and its pairs
+wait in its inbox. No thread waits for another one until the very end. The earlier version had a
+barrier after each of 8 rounds, and one CPU shared with a busy loop made it take twice as long (42
+ms instead of 22 on the test server); now it takes 25. If an inbox grows past a bound because its
+thread fell behind, whoever files into it takes over its tables, so that memory stays bounded too.
+Claims go round the file's stripes, one per thread, so that runs parsed at the same time never share a page
+table, whose lock their page faults would otherwise contend on.
 
 ## Dependencies
 
-None: the Rust standard library only, with `mmap` and `prctl` declared by hand.
+None: the Rust standard library only, with `mmap`, `madvise`, `mallopt` and `prctl` declared by hand.
 
 ## With another 24 hours
 
-- Find where the box spends the remaining time. The test server's profile (half parsing, a quarter
-  deduplication) does not transfer reliably: a shared atomic table is 70% slower there but only 20%
-  slower on the box.
-- The fast path compiles to about 250 instructions per record, with some 25 register spills; a
-  version with fewer values live at once could approach 170.
-- The region-table lookup is the largest single stall (cache footprint: a 16 KB table would save
-  about 10%). A compact rank/select table needs two dependent loads and was slower; a structure with
+- Find where the box spends the remaining time. The test server's profile (about 60% parsing, 15%
+  deduplication, 15% kernel page faults and releases) does not transfer reliably to the box.
+- The fast path compiles to about 250 instructions per record, with 20 to 25 values spilled to the
+  stack. Small edits elsewhere in the file move the spill count (60 against 68 stack references in
+  `parse_run`) and the single-thread instruction count by up to 5%. A kernel that keeps fewer
+  values live at once would make the build both faster and stable.
+- The region-table lookup is the largest single stall: with a 16 KB table, the run would be about
+  10% faster. A compact rank/select table needs two dependent loads and was slower. A structure with
   one load into less than 512 KB is the open question.
