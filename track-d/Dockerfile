@@ -7,7 +7,7 @@ COPY . .
 # scored. target-cpu=native makes the board build this track on the scoring box.
 RUN python3 d_traverse.py --seed 7 --scale sample --out /tmp/train > /dev/null \
  && RUSTFLAGS="-C target-cpu=native -C profile-generate=/tmp/pgo" cargo build --release --offline \
- && mkdir /tmp/out && taskset -c 0 target/release/solution /tmp/train /tmp/out \
+ && mkdir /tmp/out && target/release/solution /tmp/train /tmp/out \
  && llvm-profdata merge -o /tmp/pgo.profdata /tmp/pgo \
  && RUSTFLAGS="-C target-cpu=native -C profile-use=/tmp/pgo.profdata" cargo build --release --offline
 
