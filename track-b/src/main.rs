@@ -810,7 +810,15 @@ impl<'a> Scan<'a> {
     fn end_block(&mut self, base: u32) {
         let w = &mut self.w;
         if let Some(plan) = self.plan {
-            for t in self.touched[..self.n].iter().map(|&t| t as usize) {
+            let touched = &self.touched[..self.n];
+            for (i, t) in touched.iter().map(|&t| t as usize).enumerate() {
+                // Fetched in advance: the group 16 slots ahead, the entries of 8 ahead.
+                // SAFETY: prefetches of the plan's arrays; touched slots are at most nb.
+                unsafe {
+                    let ahead = |k: usize| *touched.get(i + k).unwrap_or(&0) as usize;
+                    _mm_prefetch::<_MM_HINT_T0>(plan.group.as_ptr().add(ahead(16)) as *const i8);
+                    _mm_prefetch::<_MM_HINT_T0>(plan.entries.as_ptr().add(*plan.group.get_unchecked(ahead(8)) as usize) as *const i8);
+                }
                 // SAFETY: touched slots are at most nb, and group has nb + 2 entries.
                 let entries = unsafe { plan.entries.get_unchecked(*plan.group.get_unchecked(t) as usize..*plan.group.get_unchecked(t + 1) as usize) };
                 for e in entries {
