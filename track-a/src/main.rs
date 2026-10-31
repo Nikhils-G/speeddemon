@@ -390,8 +390,14 @@ fn parse_chunk(chunk: &'static [u8], table: &Interner) -> Part {
                 }
                 28 + at + spaces(at).trailing_zeros() as usize
             };
-            let name = std::slice::from_raw_parts(line.add(from), to - from);
-            let endpoint = table.id(&key_of(name), name);
+            // The key: the endpoint's first 64 bytes, zero from the space on.
+            let len = to - from;
+            let keep = KEEP.as_ptr().cast::<u8>().add(64 - len.min(64));
+            let half = |at: usize| {
+                _mm256_and_si256(load(from + at), _mm256_loadu_si256(keep.add(at).cast()))
+            };
+            let key = [half(0), half(32)];
+            let endpoint = table.id(&key, std::slice::from_raw_parts(line.add(from), len));
             // The latency: up to 10 digits from 5 bytes after the endpoint, to the LF.
             let digits = _mm_loadu_si128(line.add(to + 5).cast());
             let count = _mm_movemask_epi8(_mm_cmpeq_epi8(digits, _mm_set1_epi8(b'\n' as i8)))
@@ -412,21 +418,6 @@ fn parse_chunk(chunk: &'static [u8], table: &Interner) -> Part {
         records,
         escapes,
         runs,
-    }
-}
-
-/// The key of the endpoint `name`: its first 64 bytes, zero from its end on.
-/// `name` must be followed by 64 readable bytes.
-#[inline(always)]
-fn key_of(name: &[u8]) -> Key {
-    // SAFETY: AVX2 is enabled; the caller guarantees the bytes after `name`.
-    unsafe {
-        let keep = KEEP.as_ptr().cast::<u8>().add(64 - name.len().min(64));
-        let half = |at: usize| {
-            let bytes = _mm256_loadu_si256(name.as_ptr().add(at).cast());
-            _mm256_and_si256(bytes, _mm256_loadu_si256(keep.add(at).cast()))
-        };
-        [half(0), half(32)]
     }
 }
 
@@ -453,13 +444,6 @@ fn movemask(v: __m256i) -> u32 {
     mask
 }
 
-/// k - 16 at k: the 16 bytes from `count` are the shuffle that right-aligns `count`
-/// digits.
-static SHIFT: [i8; 32] = [
-    -16, -15, -14, -13, -12, -11, -10, -9, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7,
-    8, 9, 10, 11, 12, 13, 14, 15,
-];
-
 /// The value of the `count` (1 to 10) ASCII digits at the start of `digits`: they
 /// are moved to the end of the vector behind zeros, then combined pairwise by
 /// multiply-adds into two eight-digit halves.
@@ -469,7 +453,8 @@ fn parse_digits(digits: std::arch::x86_64::__m128i, count: usize) -> u64 {
     // SAFETY: SSSE3 and SSE4.1 come with AVX2.
     unsafe {
         // Byte j takes digit j + count - 16; a negative index makes it zero.
-        let order = _mm_loadu_si128(SHIFT.as_ptr().add(count).cast());
+        let index = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+        let order = _mm_add_epi8(index, _mm_set1_epi8(count as i8 - 16));
         let v = _mm_shuffle_epi8(_mm_sub_epi8(digits, _mm_set1_epi8(b'0' as i8)), order);
         let v = _mm_maddubs_epi16(v, _mm_set1_epi16(0x010A)); // pairs: 10 * a + b
         let v = _mm_madd_epi16(v, _mm_set1_epi32(0x0001_0064)); // fours: 100 * a + b
@@ -532,7 +517,7 @@ impl Interner {
             // SAFETY: i < SLOTS.
             let slot = unsafe { self.slots.get_unchecked(i) }.load(Acquire);
             if slot == 0 {
-                return self.insert(i, name); // rebuilds the key: none is spilled here
+                return self.insert(i, key, name);
             }
             if let Some(id) = self.matches(slot, key, name) {
                 return id;
@@ -546,8 +531,7 @@ impl Interner {
     /// here stays unused (a duplicate name that no record refers to).
     #[cold]
     #[inline(never)]
-    fn insert(&self, mut i: usize, name: &'static [u8]) -> u32 {
-        let key = &key_of(name);
+    fn insert(&self, mut i: usize, key: &Key, name: &'static [u8]) -> u32 {
         let id = self.count.fetch_add(1, Relaxed);
         assert!(id < MAX_ENDPOINTS, "too many distinct endpoints");
         // A long name is also compared byte by byte later, after the input's pages
