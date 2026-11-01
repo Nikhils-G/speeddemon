@@ -29,7 +29,7 @@ use std::arch::x86_64::*;
 use std::cmp::Reverse;
 use std::mem::{replace, take, transmute};
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
-use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicUsize};
 use std::sync::{Barrier, LazyLock, Mutex, OnceLock, RwLock};
 use std::thread::spawn;
 
@@ -227,22 +227,34 @@ fn format_part<'a>(plan: &Plan, results: &'a [Results], p: usize, parts: usize) 
 /// arena, and its CPU stays out of the deep idle states that take up to 1 ms to
 /// wake from.
 fn par<T: Send + Sync>(n: usize, f: &(impl Fn(usize) -> T + Sync)) -> Vec<T> {
+    // One call at a time: the job slot and the counters below serve one job, so an
+    // overlapping call (from another thread, or from a job) would mix two jobs' counts
+    // and could return while a worker still runs its job. The program calls par from
+    // the main thread only; this makes a misuse stop instead of corrupting memory.
+    assert!(!BUSY.swap(true, Acquire), "par: one call at a time");
     let out: Vec<_> = (0..n).map(|_| OnceLock::new()).collect();
     // Part i, if there is one: every worker runs the job with its i.
     let job = |i: usize| _ = out.get(i).map(|r| r.set(f(i)));
     let job: &(dyn Fn(usize) + Sync) = &job;
-    // SAFETY: the workers use the job until they count it in FINISHED, and this
-    // call returns only once all of them have.
+    // SAFETY: the lifetime is erased so that the static can hold the job. A worker
+    // reads JOB only after GENERATION reaches this call's generation, which is
+    // published after this store, and holds the read lock until it has run the job;
+    // it then counts it in FINISHED. This call returns only once every worker has, so
+    // no worker uses the job after it is dropped. The reference left in JOB afterwards
+    // is never read: the next call replaces it before it moves GENERATION on.
     *JOB.write().unwrap() = Some(unsafe { transmute(job) });
     let generation = GENERATION.fetch_add(1, Release) + 1;
     let workers = *WORKERS.get_or_init(|| (1..n).map(|i| spawn(move || worker(i))).count());
     (0..n).filter(|&i| i == 0 || i > workers).for_each(job);
     wait(&FINISHED, |f| f >= generation * workers);
+    BUSY.store(false, Release);
     out.into_iter().flat_map(OnceLock::into_inner).collect()
 }
 
 /// The pool's job, its lifetime erased (see `par`).
 static JOB: RwLock<Option<&'static (dyn Fn(usize) + Sync)>> = RwLock::new(None);
+/// Set while a call to `par` runs.
+static BUSY: AtomicBool = AtomicBool::new(false);
 /// The number of jobs so far, the number of times a worker has finished one,
 /// and the number of workers.
 static GENERATION: AtomicUsize = AtomicUsize::new(0);
@@ -253,8 +265,9 @@ static WAITPKG: LazyLock<bool> = LazyLock::new(|| __cpuid_count(7, 0).ecx & 1 <<
 
 /// Waits until `done(word)`: in C0.2 (umwait) on a CPU with WAITPKG, woken by a
 /// write to the word's cache line or by the kernel's limit (100,000 TSC cycles),
-/// so a waiting thread leaves its core to its SMT sibling (spinning measured
-/// 0.5 ms slower). Without WAITPKG, it polls.
+/// so a waiting thread leaves its core to its SMT sibling (in the phase probe,
+/// spinning workers with `pause` gained 1.19 ms over spawning threads, umwait
+/// 1.29; PERF.md, step 55). Without WAITPKG, it polls.
 fn wait(word: &AtomicUsize, done: impl Fn(usize) -> bool) {
     while !done(word.load(Acquire)) && *WAITPKG {
         // SAFETY: the CPU has WAITPKG. umonitor arms the monitor on the word's
@@ -271,7 +284,9 @@ fn wait(word: &AtomicUsize, done: impl Fn(usize) -> bool) {
             };
         }
     }
-    while !done(word.load(Acquire)) {}
+    while !done(word.load(Acquire)) {
+        std::hint::spin_loop();
+    }
 }
 
 /// Worker i of `par`'s pool: runs each job with its i.
@@ -615,7 +630,8 @@ impl Vocab {
         let seed = seed.wrapping_mul(SEEDS);
         let phf = Phf { seed, pilot, shift };
         // The table's address as a usize, so that the closure is Sync; each thread
-        // writes only its own regions (below).
+        // writes only its own regions (below). n = threads, the n of par's first call,
+        // which made the pool: every part runs at once, as the barrier needs.
         let (at, barrier) = (table.as_mut_ptr().expose_provenance(), Barrier::new(n));
         let ids = par(n, &|q| {
             let table = std::ptr::with_exposed_provenance_mut::<u128>(at);
@@ -1171,10 +1187,8 @@ impl<'a> Scan<'a> {
     /// long is rejected by `parse_id`. Returns the end of the token.
     #[cold]
     fn long_run(&mut self, docs: &[u8], p: usize, end: usize, id: bool) -> usize {
-        let len = docs[p..end]
-            .iter()
-            .take_while(|b| b.is_ascii_alphanumeric())
-            .count();
+        let alnum = |b: &&u8| b.is_ascii_alphanumeric();
+        let len = docs[p..end].iter().take_while(alnum).count();
         if id {
             parse_id(&docs[p..p + len]);
         }
