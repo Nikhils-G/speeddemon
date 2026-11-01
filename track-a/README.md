@@ -16,9 +16,12 @@ percentiles need every latency of a group, not a running summary.
 
 ## Where the time goes on the box
 
-The best board run is 0.0189 s (run-6cca232c0f6a). Two timing probes on the box split it. A probe
-is a temporary build that exits with the elapsed time as its exit code, in 0.1 ms units, because
-the board reports only T and the exit code of a failed run (PERF.md, step 32):
+The submitted engine's fastest board run is 0.018676 s (run-73354c271737, 85.61 points; PERF.md,
+step 40). The best-scoring Track A run on the board, run-faf8de198217 (0.018916 s, 85.72 points),
+is step 37's code, 16 lines shorter than step 40's (PERF.md, step 37). The probes below were taken
+on step 31's code. A probe is a temporary build that exits with the elapsed time as its exit code,
+in 0.1 ms units, because the board reports only T and the exit code of a failed run (PERF.md,
+step 32):
 
 - The parse ends at 11.0 ms (run-7d4218a4cdba, exit code 110).
 - A build that only touches one byte per 64 of each slice ends at 7.8 ms (run-be516aa463a5,
@@ -35,22 +38,24 @@ The program has five parts. Each one exists because of one bottleneck.
 
 | Part | Bottleneck it addresses |
 |---|---|
-| Mapped, padded input; one slice per thread | 239 MB to read once; no copy, no memory charge, no end-of-file special case |
+| Mapped, padded input; four slices per thread from a shared counter | 239 MB to read once; no copy, no memory charge, no end-of-file special case; a thread slowed by a shared CPU |
 | Branch-free AVX2 line parse | Branch mispredictions on the method and endpoint length; instructions per line |
 | 4-byte records, hours as runs | Memory per record; a calendar per line; unbounded disorder |
 | Pass 2 by hour, counting sort, selection | Cache misses of a global sort; full sorts for three ranks |
-| Output written in place, out of order; no teardown | Serial writes; page faults on one file lock; the cost of freeing at exit |
+| Output written in place, out of order; no teardown | Serial writes; page faults on one file lock; the cost of freeing and unmapping at exit |
 
 **Parse (pass 1).** The log is mapped, followed by 256 zero bytes, so that fixed-size vector
-loads near its end stay inside the mapping. It is cut at line ends into one slice per hardware
-thread; each thread finds its own cut. The timestamp is a fixed 27 bytes, so one 64-byte AVX2
+loads near its end stay inside the mapping. It is cut at line ends into four slices per hardware
+thread, taken in file order from a shared counter, so a thread slowed by a shared CPU parses fewer
+of them; each thread finds the cuts of the slices it takes. The timestamp is a fixed 27 bytes, so one 64-byte AVX2
 window right after it holds the spaces that end the method and the endpoint. Their positions come
 from `tzcnt` on the mask, with no branch on the method's letters or the endpoint's length. The
 endpoint's identity is its bytes zero-padded to 64, loaded and masked straight from the line. All
 threads share one endpoint table: lookups are plain loads, and the rare insert claims its slot by
 compare-and-swap, so there is no merge of tables after the parse. The latency's digits are
-converted by three multiply-add steps. A line becomes one `u32`. Each thread then gives back the
-pages of its slice.
+converted by three multiply-add steps. A line becomes one `u32`, written into one records array
+per thread (allocated zeroed for the worst case, so only written pages get memory). Each thread
+gives back the pages of every slice it parsed.
 
 **Merge.** One set of threads runs both passes: a worker publishes its parse and waits, and the
 main thread does the short serial merge. It sorts the endpoints, sorts all runs by (hour, slice),
@@ -61,15 +66,18 @@ too) and gives back the endpoint keys.
 **Pass 2.** Threads take whole hours from a counter, in blocks of one hour per thread, the largest
 hour of each block first. A thread gathers an hour's runs from every slice and groups the
 latencies by endpoint id with a counting sort whose arrays fit in L1/L2 (an hour is 14K to 73K
-records). Records are given back as soon as no hour still reads them. Each group's p50, p95 and
+records). A part's records are given back by the hour that is the last to read them. Each group's p50, p95 and
 p99 come from three selections; groups of up to 32 values are sorted instead. The thread keeps
 only the statistics (20 bytes per endpoint) and the hour's exact output length, publishes the
 length, and takes the next hour.
 
 **Write.** The output file is sized to a bound and mapped shared. Once the lengths of all earlier
 hours are published, an hour's start is their sum, and the thread holding it formats it straight
-into the mapping. Each line is built backwards in a stack buffer from a two-digit table. The
-program then cuts the file to its length and exits without freeing anything.
+into the mapping. Each line is built backwards in a stack buffer from a two-digit table. A thread
+whose hours are all written sleeps on the lengths it still needs, not in a yield loop. Once every
+thread has written (a barrier), each drops the page-table entries of its share of the output
+mapping, so the exit does not tear down all of them on one core. The program then cuts the file to
+its length and exits without freeing anything.
 
 ## Techniques
 
@@ -80,7 +88,7 @@ One line per technique: what it is, where it is in `src/main.rs`, and why the ou
 1. Memory-mapped input (`main`, mmap): pre-warmed pages are charged to the host. Exact: the dataset is read-only.
 2. Zero pad by an anonymous reservation with the file mapped over it (`MAP_FIXED`, `PAD`): full 64-byte loads at any line. Exact: the pad is zeros and every load is bounded (SAFETY in `parse`).
 3. Transparent huge pages off (`prctl`): a stable memory peak. Exact: no effect on the bytes.
-4. Line-aligned slices, each thread finding its own cuts (`cut`): no serial cut pass. Exact: cuts follow an LF and never decrease.
+4. Line-aligned slices, four per thread, taken from a shared counter (`cut`, `slice`): no serial cut pass, and a slowed thread parses fewer slices. Exact: cuts follow an LF and never decrease.
 5. One thread pool for both passes, handed over through `OnceLock` (`parts`, `merged`, `order`): no join or spawn between the passes. Exact: `OnceLock::wait` orders every parse before the merge.
 6. Hour change from one 8-byte compare of `MM-DDTHH` (`parse`, `last`). Exact: all timestamps lie in one 72-hour span (spec).
 7. Hour key = the timestamp's first 13 bytes as a big-endian number. Exact: fixed width, so byte order is time order, and the bytes are the output label.
@@ -102,17 +110,17 @@ One line per technique: what it is, where it is in `src/main.rs`, and why the ou
 23. SIMD latency parse: LF by compare, digits right-aligned by `pshufb`, then `maddubs`/`madd`/`packus`/`madd` (`parse_digits`). Exact: 1 to 10 digits as two 8-digit halves.
 24. 4-byte records `id << 21 | 5xx << 20 | latency`.
 25. Branch-free escape list: the slot is always written, the cursor moves only for a latency of 2^20 - 1 or more. Exact: read back in order, run by run.
-26. Worst-case pre-sized record arrays written through raw pointers: no capacity checks; untouched pages cost nothing.
+26. Worst-case pre-sized record arrays, one pair per thread (`free`), written through raw pointers: no capacity checks; untouched pages cost nothing.
 27. 5xx from the status's first digit. Exact: a status is 5xx exactly when it starts with 5.
 28. Input pages dropped by each parse thread (`release`, `MADV_DONTNEED`): the exit does not unmap 58,000 pages on one core.
 29. Log unmapped by the idle main thread during pass 2: its page tables are freed off the serial path.
 30. Endpoint keys released after the sort.
 31. Endpoint sort by the first 32 key bytes as two big-endian `u128`, then the name. Exact: byte order, a proper prefix first.
-32. All runs sorted by (hour, slice) and cut with `chunk_by` (`hours_of`).
+32. All runs sorted by (hour, part) and cut into hours with `chunk_by` (the merge in `main`, `same_hour`).
 33. Hours queued in blocks of one per thread, largest first: small hours do not pile up behind a big one.
 34. Per-hour counting sort with count and 5xx count packed in one `u64`: one add per record.
 35. Scatter without bounds checks (SAFETY: the counts are this hour's).
-36. Record pages released as hours consume them: long runs at once, the rest by a per-slice reader count. Exact: released only after the last reader has placed its values.
+36. Record pages released per part once no hour reads it (`readers`): one `madvise` per part, because each call is a round of TLB shootdowns (perf on the test server showed `madvise` at 14.9% of cycles and IPIs at 8.8% with a release per run). Exact: released only after the last reader has placed its values.
 37. p50, p95, p99 by nested `select_nth_unstable`; groups of up to 32 sorted (`percentiles`). Exact: ranks `ceil(p * n / 100)`.
 38. Each percentile read right after its own selection. Exact: the next selection reorders the slice.
 39. Scratch sized once for the largest hour and allocated zeroed.
@@ -121,10 +129,10 @@ One line per technique: what it is, where it is in `src/main.rs`, and why the ou
 42. Output mapped shared at a bound, truncated to the total at the end: no write calls on the tmpfs inode lock.
 43. Out-of-order compute, in-order placement: an hour's start is the sum of the published lengths before it.
 44. Lines built backwards in a stack buffer from a two-digit table (`write`, `PAIRS`).
-45. Exit without teardown (`process::exit`).
+45. Exit without teardown (`process::exit`). Before it, the threads drop the output mapping's page-table entries in parallel after a barrier (`written`, `share`): the pages stay in the file.
 46. Profile-guided build trained on generator seed 7, not the scored seed (Dockerfile).
 47. Atomic profile counters: every build gets the same profile.
-48. Hot loops aligned to 64 bytes (`-align-loops=64`): kept for A: without it A ran 0.0271 s on the box (PERF.md, steps 36 and 37).
+48. Hot loops aligned to 64 bytes (`-align-loops=64`). The one board run without it (step 36) ran 0.0271 s, but A's box times are bimodal (about 0.019 s or 0.022-0.027 s for the same code), so that run does not prove the flag helps; it is kept because C's best run uses it and A is not slower with it.
 49. Fat LTO, one codegen unit, `panic = "abort"` (Cargo.toml).
 50. Static binary (`crt-static`).
 51. `target-cpu=native`, with a `compile_error!` without AVX2.
@@ -145,15 +153,25 @@ stays exact for every seed of the generator.
   up the offsets: the furthest load ends within 256 bytes of a line start). The dataset is mounted
   read-only, so the bytes cannot change under the mapping.
 
-### 2. Line-aligned slices, one per thread
+### 2. Line-aligned slices from a shared counter
 
-- **Bottleneck.** A serial scan for line ends would be a pass over 239 MB on one core.
-- **Design.** Cut `p` is just after the last LF before byte `len * p / threads`. Each thread
-  computes its own two cuts.
+- **Bottleneck.** A serial scan for line ends would be a pass over 239 MB on one core. And with
+  one fixed slice per thread, the scheduler sometimes put two of the 12 threads on one CPU for the
+  whole parse, so the merge waited for that pair: 4 of 30 runs on the test server (dev build)
+  finished the parse 4.9 to 8.0 ms apart and took 18.1-20.8 ms against 14.6-15.6 ms. This is the
+  likely cause of A's bimodal box times (PERF.md, step 38).
+- **Design.** There are `slices = 4 * threads` slices, taken in file order from a shared counter.
+  Cut `p` is just after the last LF before byte `len * p / slices`; a thread computes the two cuts
+  of each slice it takes, so a slowed thread just parses fewer slices. Over 100 interleaved server
+  runs of two builds, the slowest run went from 25.98 / 24.79 ms to 21.69 / 21.99 ms at the same
+  median. Pinning each thread to a CPU made the tail worse (a pinned thread cannot leave a busy
+  CPU), and eight slices per thread cost 0.47 ms (per-slice work, dev build). Each thread keeps
+  one pair of record arrays for all its slices: a pair per slice cost 2.3 ms in `mmap` calls.
 - **Why exact.** Cuts never decrease and always follow an LF, so every line is in exactly one
-  slice. Two cuts in one line give an empty slice, which is harmless. The thread count changes
-  the slices, the runs and the order of endpoint ids, but none of them reaches the output: the
-  output was checked byte for byte at 1 to 16 threads.
+  slice. Two cuts in one line give an empty slice, which is harmless. Parts are indexed by slice,
+  not by thread, so which thread parsed a slice does not matter. The thread count changes the
+  slices, the runs and the order of endpoint ids, but none of them reaches the output: the output
+  was checked byte for byte at 1 to 16 threads.
 
 ### 3. Branch-free AVX2 field ends
 
@@ -182,8 +200,10 @@ stays exact for every seed of the generator.
   equal endpoints. Longer ones (63 of the 1,842 endpoints, on 6.2% of lines) are also compared
   byte by byte. If two threads insert the same endpoint at once, the slot's compare-and-swap
   picks one id, and every record gets that id; the losing id is never in a record, so its groups
-  are empty and print nothing. More than 2,048 ids stops the program. The names are copies, so
-  they stay valid after the log's pages are given back.
+  are empty and print nothing. More than 2,048 ids stops the program. Lost ids use up id space:
+  there are 2,048 - 1,842 = 206 spare ids, and at most 13 were lost in 100 runs of the full seed at
+  12 threads (10 at 16) on the test server. That is a measured margin, not a bound. The names are
+  copies, so they stay valid after the log's pages are given back.
 
 ### 5. 4-byte records with an escape list
 
@@ -258,22 +278,28 @@ stays exact for every seed of the generator.
   pending statistics, all at once.
 - **Design.** Each parse thread drops its slice's pages (`madvise(MADV_DONTNEED)`), in parallel,
   instead of leaving 58,000 pages to the exit on one core. The main thread unmaps the log during
-  pass 2 to free its page tables (about 0.5 MB). Long runs (142 runs, 93% of the records) are
-  dropped as soon as they are placed; a slice's other records go when the last hour that reads
-  them is done. Pending statistics are 20 bytes per endpoint. Transparent huge pages are off, so
+  pass 2 to free its page tables (about 0.5 MB). A part's records go when the last hour that reads
+  them has placed them (parts are a 48th of the log, so this is about as early as a release per
+  run, with 142 fewer calls). Pending statistics are 20 bytes per endpoint. Transparent huge pages are off, so
   that one touched byte cannot fault in 2 MB.
 - **Why exact.** Nothing released is read again. The log's bytes are only read during the parse,
-  and every endpoint name was copied. A slice's records go when the reader count of its hours
+  and every endpoint name was copied. A part's records go when the reader count of its hours
   reaches zero, after the last of them has placed its values. Released input pages would fault
   back in from the page cache if they were read; anonymous pages would read as zeros, but nothing
   reads them.
 
 ### 11. No teardown
 
-- **Bottleneck.** Dropping the tables one free at a time took 4 to 5 ms on the box.
-- **Design.** Once the output is cut to its length, the program calls `exit(0)`.
+- **Bottleneck.** Dropping the tables one free at a time took 4 to 5 ms on the box. And the exit
+  tears down the output mapping's 2,500 page-table entries on one core (about 0.6 ms on the test
+  server, PERF.md step 40).
+- **Design.** After its last write, each thread waits at a barrier, then drops the page-table
+  entries of a page-aligned share of the output mapping (`MADV_DONTNEED`). Dropped while other
+  threads still wrote, they slowed those writes by as much (PERF.md, experiments). Once the output
+  is cut to its length, the program calls `exit(0)`.
 - **Why exact.** The output is complete in the page cache before the exit; the kernel frees the
-  rest.
+  rest. `MADV_DONTNEED` on a shared file mapping drops only the page-table entries: the written
+  pages stay in the file, and nothing touches the mapping afterwards.
 
 ### 12. Build
 
@@ -288,6 +314,30 @@ stays exact for every seed of the generator.
   the box). A `compile_error!` stops a build without AVX2.
 - **Why exact.** The build changes speed only. Each correctness check runs the binary built by this
   directory's Dockerfile.
+
+## Spec edge cases
+
+The spec injects fifteen edge cases into every seed. Each one, and the code that handles it:
+
+| Case | Handled by |
+|---|---|
+| E1: a group of one request | Groups of up to 32 values are sorted; every rank is `(p * 1).div_ceil(100) - 1 = 0` |
+| E2, E7: latency 4294967295 | `parse_digits` reads 10 digits as two 8-digit halves; a latency of `2^20 - 1` or more goes to the escape list as a full `u32` |
+| E2, E6: latency 0 | A value like any other: the escape marker is `2^20 - 1`, not 0 |
+| E3, E8: statuses 499, 500, 599 | 5xx is "first status digit is `5`", so 499 is not an error and 500 and 599 are |
+| E4, E12: an hour boundary, an earlier hour written later | Each line's own `MM-DDTHH` starts a run when it changes; runs are merged by their hour key, with no bound on disorder |
+| E5: the first and last instants of the span | The hour key is the timestamp's first 13 bytes; `MM-DDTHH` is enough to see a change because the span is 72 hours |
+| E9, E10, E11: equal timestamps, duplicate lines | Nothing is keyed by line or by time: every line is one record |
+| E13: all seven methods | Skipped by the first space bit of the mask, whatever their length |
+| E14: `/` and the 125-byte template | The first 64-byte window finds endpoint ends up to byte 91; further 32-byte windows go up to the one at 128; names of 64 bytes or more are also compared byte by byte |
+| E15: 1,842 distinct endpoints | 2,048 ids (11 bits), with the lost-id margin of technique 4 |
+| Empty `requests.log` | `len @ 1..` fails, and the summary created at the start stays empty |
+
+Trusted from the spec and not checked, since a check would be a branch per line: the 27-byte
+timestamp, the 72-hour span, one space between fields, the 3-digit status, and 1 to 10 latency
+digits then LF. A line that breaks them gives wrong output or stops at an assert, never a read
+outside the mapping (SAFETY in `parse`). Checked by an `assert!`, which stops the program: the method and endpoint
+lengths, the 2,048 ids, the room for the records, and each hour's written length.
 
 ## Error handling
 

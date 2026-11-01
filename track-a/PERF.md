@@ -39,7 +39,7 @@ numbers are left out rather than guessed.
 | 21 | d8eeb54 | Endpoints whose space is past byte 92 (7.6% of lines) found by further 32-byte space windows instead of a byte loop: 12-thread user cycles −3% on the server | run-253bf424b270 | 0.0224 | — | — | — |
 | 22 | f200302 | Pass 2 counts and scatters by endpoint id, and visits the groups in name order through one sorted id list: the rank table and its dependent load per record are gone | run-2ddd83b092ac | 0.0237 | 18.49 | — | — |
 | 23 | ab0b4c3 | Names and hours sorted by their first 16 bytes as one big-endian number, so slices are compared only on ties: a shorter serial step between the passes | run-ad6ddaf4d8e4 | 0.019691 | 19.87 | 504 | 83.73 |
-| 24 | 33cac7e (reverted in e6e4d9d) | Parse blocks taken from a shared counter, four per thread, so a slow thread holds up less | run-dee36d077800 | 0.019777 | — | 517 | — |
+| 24 | 33cac7e (reverted in e6e4d9d, reinstated in step 38) | Parse blocks taken from a shared counter, four per thread, so a slow thread holds up less | run-dee36d077800 | 0.019777 | — | 517 | — |
 | 25 | d8e2636 (reverted in 1c8d136) | The endpoint key built inline (rebuilt in the cold insert) so it never spills, the latency shuffle control from one table load: 4% fewer instructions on one thread, the same at 12 threads on the server | run-b68029ac7816 | 0.019916 | — | 514 | — |
 | 26 | f8ccd39 | The same engine in a third fewer lines, one file: the endpoint table allocated zeroed and probed by one function, every endpoint's bytes copied when it is added; all runs sorted by (hour, slice) and cut into hours; an hour's start summed from the published lengths. Hot loops unchanged | run-b5ca2d290934 | 0.019723 | 21.01 | 335 | 84.80 |
 | 27 | a70edf7 | Each parse thread finds its own cuts; tighter imports and digit table. Same engine as step 26 | run-ad02131f83b0 | 0.020038 | — | 327 | 84.68 |
@@ -52,15 +52,26 @@ numbers are left out rather than guessed.
 | 34 | b25326b | Dockerfile only: hot loops aligned to 64 bytes in the profile-use build (`-align-loops=64`). Two more runs of this code were in a DISTURBED and a SLOW BOX dispatch: run-3feab32d2b8f 0.026024 s, run-69d0c9f98c0e 0.026627 s | run-df8ecf640b7e | 0.019217 | 18.06 | 352 | 85.58 |
 | 35 | f8206db (reverted in 51d3674) | apost-1: endpoint sort moved into worker 0, scratch arrays released without `munmap`, output page-table entries dropped in parallel before the exit. The second run was in a dispatch our log calls "a bit slow" | run-7833033c46e9, run-4e7cded1b902 | 0.019312, 0.021607 | 18.52, 18.09 | 360 | 85.34, 84.22 |
 | 36 | fcc1dd3 | Dockerfile only: the loop-alignment flag off again, as a board A/B test of step 34. A ran 0.0271 s while unchanged C ran its normal time in the same dispatch, so the flag went back on | run-8f956a29e3c5 | 0.027124 | 18.55 | 352 | 81.72 |
-| 37 | 16747e3 | Fewer lines in setup and merge (352 → 337) at the same speed on the test server (21.04/21.10 against 21.17/21.11 ms, 2 PGO builds each); loop alignment back on | run-c0c000c115eb | 0.019199 | 18.83 | 337 | 85.55 |
+| 37 | 16747e3 | Fewer lines in setup and merge (352 → 337) at the same speed on the test server (21.04/21.10 against 21.17/21.11 ms, 2 PGO builds each, output on disk for this A/B); loop alignment back on | run-c0c000c115eb, run-faf8de198217, run-62d04587cf21 | 0.019199, 0.018916, 0.01906 | 18.83, 18.77, — | 337 | 85.55, 85.72, 85.69 |
+| 38 | (aspeed3-1, no board run of its own) | Four slices per thread, taken in file order from a shared counter; one records/escapes pair per thread (the stacked-thread fix) | — | — | — | 351 | — |
+| 39 | 067466b (board runs from 5afab2c, 8ee6e49, 6923e1e) | aspeed3-2: records released once per part (142 fewer `madvise` calls); the final wait sleeps on the `OnceLock`s, not in a yield loop. The first run was in a slow dispatch (B's unchanged code 0.129587 s) | run-ad77dae6f7a8, run-f864a17b46cc, run-5e361abae820 | 0.020124, 0.019000, 0.018979 | 19.07, —, — | 346 | 84.90, —, 85.56 |
+| 40 | 51f3e80 (board runs from b9237f3, 2c8ba1c, 1877866) | aspeed3-3: after the last write, a barrier, then each thread drops the page-table entries of a page-aligned share of the output mapping (`MADV_DONTNEED`; the pages stay in the file), so the exit does not do it on one core | run-b273d14e2d15, run-d71d8b7f9981, run-73354c271737 | 0.018743, 0.018716, 0.018676 | 19.12, 19.15, — | 353 | 85.59, 85.60, 85.61 |
+| 41 | (not yet on the board) | qa-1 and qa-2: comments, `unsafe fn` contracts (`parse`, `parse_digits`, `release` on a raw pointer), named constants. The hot loops compile to the same instructions (objdump); test server, 2 Dockerfile builds each, 61 interleaved rounds: 19.95 / 19.75 against 19.78 / 19.77 ms (medians), within build-to-build noise | — | — | — | 372 | — |
 
-The current code is the Track A source of step 33 (bf2aca8, restored by 51d3674 after step 35),
-built by the Dockerfile of step 36. Its best run is step 33's run-6cca232c0f6a, 85.60 points,
-built without the alignment flag. The same source with the flag (step 34's Dockerfile) has these
-runs: run-df8ecf640b7e, 0.019217 s, 18.06 MB, 85.58 (b25326b); run-75fcd84a4c5e, 0.020656 s,
-17.83 MB, 84.85 (51d3674, a dispatch our log calls "box slower than morning"); run-82fce59877db,
-0.0233 s, 18.01 MB (3e7d9a4, SLOW BOX); run-d82e18393e7a, 0.019471 s, 18.94 MB, 85.23 (1f8d96a,
-normal box).
+The current code is step 40's engine with step 41's comments, built by the Dockerfile of step 37
+(loop alignment on). Step 40's three runs above are our fastest Track A times on the board. Two
+more runs of the same code were slower: run-37da6cecde40, 0.020268 s, 84.91 (45c369c, a dispatch
+where B's run is "likely slow dispatch" in our log), and run-56976cca74a9, 0.021599 s (d576688);
+board.py's latest at 08:55Z is run-2d8150565262, 0.020757 s, 18.94 MB, 84.52. The board's
+best-scoring Track A run, run-faf8de198217 (0.018916 s, 85.72 points), is step 37's code: slower
+than step 40's best, but 16 lines shorter.
+
+Same-day A/B of step 39 against step 37 (runs.log 08:10Z, one push each, alternating): step 39
+run-f864a17b46cc 0.019000 s and run-5e361abae820 0.018979 s; step 37 run-110ec4581099 0.019041 s,
+run-82ba58583726 0.019097 s and run-87a54d4680e2 0.020012 s, then run-5d9829328e5e 0.023404 s
+(runs.log 08:12Z). Slow-dispatch samples of step 39: run-4d01e82b4cda 0.019555 s,
+run-1ec0f81604f0 0.022575 s, run-4a1feadd518a 0.023573 s and run-79ff2bdff829 0.022788 s, in
+dispatches where B's unchanged code ran 0.1209-0.1312 s.
 
 ## What each step taught
 
@@ -115,7 +126,7 @@ normal box).
   the same board time as step 23 (0.019777 and 0.019916 s against 0.019691). Neither the balance
   between the fixed chunks nor the instruction count limits the 12-thread parse on the box. Each
   was reverted for its extra lines (+13 and +10). Step 32 later showed why: the parse sits close
-  to the memory floor.
+  to the memory floor. Step 38 brought step 24 back for the tail, not the median.
 - **Steps 26–27** cut 504 → 327 lines (+1.07 points at the same T and M: 83.73 → 84.80, then 84.68
   in a slower run). Speed was checked against step 23 at every stage, over three builds of each
   version, because the multi-threaded PGO training gave every build a different profile: three
@@ -165,6 +176,61 @@ normal box).
   dispatches. Step 36 built A without the flag again, as a board A/B test: 0.0271 s against 0.0192-0.0195 s for the flagged builds in normal dispatches, so the flag is back on from step 37. A's box times are bimodal (about 0.019 s or 0.022-0.027 s for the same code), which a single run cannot separate from a flag effect.
 - **Step 35 (reverted).** −0.70 ms on the test server, not faster on the box in two runs: see the
   next section and the experiments table.
+- **Step 38** found the likely cause of A's bimodal box times. With one fixed slice per thread, the
+  scheduler sometimes puts two of the 12 threads on one CPU at spawn, and they stay there for the
+  whole parse (busy CPUs rebalance rarely, and no CPU goes idle before the parse ends). That pair
+  runs at half speed, and the merge waits for it.
+  - Server probe, dev build, 30 runs: 4 runs ended the parse on 11 distinct CPUs, with a parse
+    spread of 4.9-8.0 ms and a run of 18.1-20.8 ms, against 14.6-15.6 ms for the rest.
+  - Server probe, PGO, 40 runs (exit code = 100 × stacked + spread / 0.25 ms): 6 stacked runs
+    read 121-131 at 22.5-24.5 ms; normal runs read 2-8 at 18.0-19.6 ms.
+  - Fix: slices from a shared counter, so a slowed thread just parses fewer of them. Server, 100
+    interleaved runs, 2 PGO builds each:
+
+    | | median | max | runs above median + 1.5 ms |
+    |---|---|---|---|
+    | before (step 37) | 18.79 / 18.69 ms | 25.98 / 24.79 ms | 12 / 6 |
+    | after (step 38) | 18.78 / 18.73 ms | 21.69 / 21.99 ms | 4 / 8 |
+
+  - One buffer pair per thread, not per slice: with a pair per slice (two `mmap` calls each),
+    8 slices per thread cost 2.3 ms (dev build). Pinning each thread to its own CPU made the tail
+    far worse: half of 40 runs had a 2-10 ms parse spread, because a pinned thread cannot leave a
+    busy CPU. Slices per thread (dev build, 30 runs, median run end): 1: 15.18 ms; 4: 14.92 ms;
+    8: 15.39 ms.
+  - Step 24 measured only the median, where this is invisible. On the box the slow mode still
+    appears in some dispatches (step 39's slow samples), so the fix is not proven there.
+- **Step 39.** perf on the server (10 runs, step 38) showed `madvise` at 14.9% of all cycles and
+  IPIs at 5.2% sent plus 3.6% received (TLB shootdowns), and `sched_yield` at 3.0%. With parts a
+  48th of the log, a release per part frees records about as early as a release per long run, with
+  142 fewer calls. A futex wait (`OnceLock::wait` on the lengths it needs) replaces the yield loop,
+  which spun on the hyperthread siblings of threads still computing. Server, 61 runs: 19.34 / 19.48
+  → 18.86 / 18.84 ms; M 18.08 → 18.39 MB (records of long runs now wait for their part). On the box
+  it came out level with step 37 in the same-day A/B above.
+- **Step 40.** A fork/exec/wait timer split the server run (25 runs, means): exec to `main` 0.59 ms;
+  `main` 14.70 → 14.91 ms (+0.2 ms for the barrier and the zap); `main`'s end to the exit seen by
+  the parent 1.12 → 0.61 ms. A serial zap of the same range on the main thread took 0.63 ms, so the
+  exit spent about 0.6 ms on the output's 2,500 page-table entries. Server medians, 2 PGO builds,
+  three repetitions (61, 81 and 61 runs): 18.45 / 18.43 → 18.00 / 18.13, 18.14 / 18.08 → 17.79 /
+  17.75 and 18.13 / 18.08 → 17.78 / 17.72 ms. M 18.53 → 18.52 MB. On the box, its three normal runs
+  are our fastest A times (0.018676-0.018743 s). This is apost-1's fourth item (step 35), whose
+  two box runs came before the stacked-thread mode was known.
+- **Step 41** changes no instruction in the hot loops (parse, `parse_digits`, pass 2, writer),
+  checked with `objdump` on deterministic builds. Two forms of a checked `OnceLock::set` (with
+  `expect` or an `assert!`) were tried and dropped: each changed the instructions of the parse
+  loop, which shares a function with the slice loop that sets the part.
+
+Where the server time goes (step 39, PGO, 41 interleaved runs, medians; probes, not candidates):
+
+| Run | Median |
+|---|---|
+| Full run | 18.0-18.2 ms |
+| Exit right after the merge (startup, parse and merge) | 13.3 ms |
+| Percentiles made free | −1.26 ms (about 2/3 of it in the 115K groups of 32 values or fewer) |
+| No output writes at all | −2.07 ms (formatting about 0.5 ms; the rest is 2,500 tmpfs page faults, 5.6 µs each with 12 threads, 2.3 µs alone) |
+| No release of the parsed log (the exit zaps 58K page-table entries on one core) | +8.5 ms |
+
+Pass 2 cannot be hidden inside the parse: all 12 CPUs are busy there, so only less total work
+helps.
 
 ## The box versus the test server
 
@@ -226,13 +292,26 @@ The earlier probes behind step 12 used 0.25 ms units; their run IDs are not in o
 | Log-linear histogram selection for groups of 256+, AVX2 rank counting for groups of up to 32 | 13M fewer cycles on one thread, nothing at 12 threads; not worth 120 lines |
 | Removing the endpoint-name copy before the pages are released (9e6ed95) | Box run-87490db73ccd 0.0342 s and a second run at 0.0332 s, against 0.0292–0.0307 with it: restored in 27cf731 (run-f90c7c73ef1b, 0.02924 s) |
 | Three nested selections read at the end | Wrong output: each selection reorders the previous rank's slot. Each value is now read right after its own selection |
-| Parse blocks from a shared counter, four per thread (step 24) | run-dee36d077800, 0.019777 s against 0.019691 s, +13 lines: reverted in e6e4d9d |
+| Parse blocks from a shared counter, four per thread (step 24) | run-dee36d077800, 0.019777 s against 0.019691 s, +13 lines: reverted in e6e4d9d. Reinstated in step 38 for the tail, not the median: it removes the stacked-thread runs (slowest of 100 server runs 25.98 / 24.79 → 21.69 / 21.99 ms) |
 | Fewer instructions per parsed line (step 25) | run-b68029ac7816, 0.019916 s against 0.019691 s, +10 lines: reverted in 1c8d136 |
 | Pass 2 in two phases: every thread computes its hours, waits at a barrier, then writes them | +2 ms on the server. The write phase alone took 2.7 ms: twelve threads faulting in the shared output at once most likely serialise in the kernel |
 | Endpoint table entries as one `OnceLock<(key, name)>` per id | Parse +0.4 ms at 12 threads: the lock's state word sits on a second cache line, read on every lookup |
 | Each line written straight into the output from its known length, without a stack buffer | +14M instructions on one thread (552M → 566M): the length is then computed twice per line |
 | The first digit of every number written as a pair from the table, and the hour label copied as a slice of unknown length | +15M instructions on one thread (540M → 555M) |
 | Only long runs released, not a slice's remaining records once no hour reads them | Memory peak +0.7 MB (20.04 → 20.76 MB, 15 runs each) |
+| Branch-free AVX2 rank counting for groups of up to 8 values, 63% of groups (step 40 work) | Server −0.10 / −0.03 ms for +27 lines. Checked against `sort_unstable` on 10M random groups (ties, 0, `u32::MAX`, every rank). In place, those groups went from 26-28 to 22-23 M TSC cycles |
+| Counting ranks for all groups of up to 32 values, up to four vectors (step 40 work) | Server −0.21 to −0.26 ms (a compact form −0.19 / −0.12 ms) for +22 to +25 lines: about 0 points net at the line rate. Microbenchmark on the groups' real sizes: 58 → 27 ns a group. Checked on 5M groups |
+| Counting-sort buckets in name order, the order the statistics read them (step 40 work) | Server 18.16 / 18.20 against 18.15 / 18.09 ms: neutral, so small groups do not miss the cache on their values |
+| Output written by `pwrite` from a private 64 KB buffer instead of stores into the mapping (step 40 work) | Server +1.4 ms (19.53 / 19.66 against 18.09 / 18.27). perf: `pwrite` 18.8% of cycles, 17.2% waiting on the tmpfs inode rwsem; the copy itself 2.4% |
+| `fallocate` of the output during the parse | Not run: it charges about 10 MB to the memory peak (about −1.9 points), so it would need about −3 ms on the box |
+| `MADV_POPULATE_WRITE` of each hour's output range before formatting (step 40 work) | Server +0.7 ms (18.65 / 18.73 against 17.96 / 17.89) |
+| Output prefaulted by the idle main thread (step 40 work) | Serial before pass 2: +5.7 ms; concurrent with pass 2: +0.3 ms |
+| Pool started as a tree, each new thread starting two more (step 40 work) | Server +0.1 ms median and a worse tail: spawned threads land next to their parent |
+| Guided parse slices, each a 2 × threads-th of what is left and at least 1 MB, about 78 slices (step 40 work) | Server 18.18 / 18.18 against 18.08 / 18.08 ms over 100 runs; tail not better |
+| Threads pinned to CPUs; 8 slices per thread; a buffer pair per slice (step 38 work) | See step 38 |
+| `values` kept mapped to the exit; the log not unmapped (step 39 work) | Server 18.28 / 18.31 and 18.37 / 18.27 against 18.21 / 18.17 ms: neutral or worse |
+| The parsed log released every 2 MB during the parse instead of once per slice (step 39 work) | Release 1.0 → 0.1 ms, but parse +0.5 ms; PGO A/B neutral |
+| Memory variants on step 37: values released on shrink, a shared values pool, long runs released in 64 KB pieces, the 12 smallest hours first, no per-part reader count | Peak unchanged or worse: 18.23, 18.65, 18.24, 18.59 MB and +0.7 MB, against 18.24-18.31. The peak sits at the start of pass 2: the parse plateau is 17.0 MB (probe: exit after the merge), plus about 1.2 MB of values |
 
 ## Lessons
 
@@ -269,3 +348,11 @@ one tested):
   segfault (step 29).
 - **Code check.** `objdump | grep -c vpinsrb` = 0: the bit-by-bit mask rebuild that the inline
   `vpmovmskb` avoids is not in the binary.
+- **Current code (step 41).** The exact Dockerfile image: full seed 1 at `taskset -c 0`, `0-2`,
+  `0-6` and all CPUs (laptop) and at 1, 3, 12 and 16 CPUs (test server, four Dockerfile builds),
+  samples 2-4 and holdout seed 99 byte-equal to the reference, and the empty input giving an empty
+  summary. The gate is a shell loop kept outside the repo (scc would count it as code): build the
+  image with `docker build`, copy `/app/solution` out with `docker create` and `docker cp`, then
+  for each input run `solution <data dir> <out dir>` and compare `summary.txt` with `cmp` or its
+  sha256. The fuzzing of step 29 mutated a sample log 300 times (a tail without LF, a long method,
+  random bytes, a 300-byte endpoint) and checked that each run aborts with a message or exits 0.
