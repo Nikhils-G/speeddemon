@@ -143,7 +143,71 @@ output stays the same.
 | Phrases on their rarest term | Checking 19,000 phrases per document | Each phrase is anchored on its rarest sampled term and checked against the document's token ids while they are in L1 | A phrase match contains its anchor, so every match is checked; a document is counted once |
 | Setup without page faults | Once setup ran in parallel, its threads mostly waited on page faults of fresh, growing vectors: on the test server the setup still spends more CPU time in the kernel than in the program (34.6 of 58 ms) | Compact pre-sized records, grouping by counting sort, a stable counting sort for the term order, `malloc_trim` before the scan | Records reload each key from the same file bytes; counting sorts are permutations, which change the order terms are numbered in, never what a term is |
 | Exit-code probes | Where the box spends its time cannot be profiled | Temporary builds exit with an elapsed time as their status (setup end, scan end, scan end without BOOL evaluation) | Measurement only; never pushed as a scored version |
-| Build | Build-to-build speed spread of 2.5 to 6% (steps 27, 32) | PGO with atomic counters, hot loops aligned to 64 bytes, fat LTO, `crt-static`, `target-cpu=native`; `cmov` and `vpmovmskb` as inline asm where LLVM would branch or rebuild masks bit by bit | Flags and instruction choice only |
+| Build | Build-to-build speed spread of 2.5 to 6% (steps 27, 32) | PGO with atomic counters, fat LTO, `crt-static`, `target-cpu=native`; `cmov` and `vpmovmskb` as inline asm where LLVM would branch or rebuild masks bit by bit. Loop alignment (`-align-loops=64`) is under a board A/B test (PERF.md, step 38) | Flags and instruction choice only |
+
+### Index
+
+One line per technique: what, where in `src/main.rs`, and why the output stays exact. The table
+above groups them by bottleneck.
+
+1. No index: queries read first, all answered in one scan (`main`). Exact: every query is evaluated on every document that can match it.
+2. Memory-mapped files with a 256-byte zero pad (`mmap::map`): full-width loads at any offset. Exact: zero is a separator, never a token byte.
+3. Transparent huge pages off (`mmap::no_huge_pages`): a stable memory peak.
+4. Slices of whole lines, one per thread (`slices`, `line_after`).
+5. Query lines split in parallel into pre-sized 8- and 16-byte records (`split_lines`). Exact: each key is reloaded from its own bytes.
+6. Operator from the low two bits of its first byte (`A`, `N`, `O`; `split_lines`). Exact: the grammar has only these three words.
+7. Stable counting sort `csr` for every grouping (keys by group, term order, entries, anchors). Exact: a permutation.
+8. PTHash-style perfect hash with per-bucket pilots (`Vocab`, `place`): one slot per term.
+9. Two AES rounds as the hash, the seed in the first round key (`hash`): three instructions per token.
+10. Pilots of 1 mod 64, so each of 64 groups owns a table region: a lock-free build on every thread (`Vocab::new`). Exact: no thread writes another's region; the barrier orders the read-back.
+11. Largest buckets placed first, first free pilot taken (`Vocab::new`).
+12. Sort key rotated so the bucket bits lead (`rotate_right(bmask.count_ones())`): sort by bucket, then hash, in one key.
+13. Equal-hash check on the key bytes; a clash or a full bucket re-seeds, every third seed doubles the table. Exact: a failed build never answers.
+14. Terms of 13 to 32 bytes in a cold `HashMap`, with their slots after the hash's (`get_long`). Exact: compared byte for byte; tokens over 32 bytes find nothing.
+15. 16-byte slot: 12 key bytes under a 4-byte info word.
+16. Branch-free probe: one aligned load, XOR, `vptest`, inline-asm `cmov` (`probe`). Exact: the full key is compared; the hash only says where.
+17. Token key from one 16-byte load, OR 0x20 and a sliding `KEEP` mask (`key_at`). Exact: lowercases A to Z, keeps digits, zero padding separates lengths.
+18. AVX2 token and LF bitmaps per 64 bytes, signed compares, letters tested on `v | 0x20` (`masks`).
+19. `vpmovmskb` as inline asm (`movemask`).
+20. Slice end clipped with `bzhi` (`masks`). Exact: bytes past the slice are not tokens here.
+21. Token starts from `mask & !(mask << 1 | carry)`, with a carry across chunks (`Scan::run`).
+22. Token length by `tzcnt` of the inverted, shifted mask, in two shifts so `b = 0` is defined.
+23. Slot computed and prefetched when the token is found; a document's tokens all found before any is probed (`pending`, `look_up`): the misses overlap.
+24. Writes into reserved capacity through raw pointers, no capacity checks (`pending`, `toks`, `work`).
+25. 64-bit presence word per BOOL term per block of 64 documents (`w`).
+26. Branch-free touched list: the slot is always written, kept only when its word was zero (`look_up`).
+27. Non-BOOL tokens all land on one sink slot `nb` (`min(nb)`): no branch on the kind.
+28. Cover sets: a set of terms every match contains, cheapest by sampled frequency (`cover`). Exact: a block without a cover term holds no match.
+29. Cost model `1 - (1 - df / n)^64`: the share of blocks that contain a term (`Plan::new`).
+30. A 1 MB sample spread over the slices for document frequencies (`SAMPLE_BYTES`). Exact: it only decides where a query is evaluated.
+31. `earlier` bits: a block with several cover terms is evaluated by one entry only. Exact: the others add an empty result.
+32. Left-to-right word evaluation with the operator folded into two masks, no branch (`end_block`). Exact: AND, AND NOT and OR as the spec defines them.
+33. Queries padded to six steps with AND of an all-ones word. Exact: AND with all ones changes nothing.
+34. Two-pass block end: ranges gathered and prefetched 16 slots ahead, then words and state 4 ranges ahead (`end_block`). Exact: the second pass evaluates exactly the ranges the first kept.
+35. `cmov` select as inline asm for the empty-range prefetch (`if_zero`).
+36. Common queries per 256-document superblock, four words at once in AVX2 (`end_super`, `ALWAYS`).
+37. Superblock queries sorted by length and operators so the operator branch predicts.
+38. 32-byte aligned rows for aligned AVX2 loads (`Row`).
+39. Terms renumbered by kind and sampled frequency: hot words share cache lines (`Plan::new`). Exact: a bijection.
+40. Answers numbered in the order the scan updates them (`answer_of`, `line_of`). Exact: a bijection.
+41. Count by popcount; id sum as `base * popcount + sum_k 2^k * popcount(w & M_k)` (`Answers::add`). Exact: integer identity.
+42. The six masks `M_k` computed as constants by one expression (`digit`).
+43. AVX2 nibble tables (`pshufb`) for count and position sums of 256 documents, reduced by `maddubs`/`madd` (`count_positions`). Exact: sums stay below 2^15 per lane.
+44. First ids by `tzcnt`, written branch-free and kept only while fewer than ten (`Answers::add`).
+45. Count and id sum packed in one `u64` (`SUM_BITS`), so threads' states add as plain integers. Exact: sums below 2^39, checked by an assert.
+46. Phrases anchored on their rarest sampled term, checked at document end while the ids are in L1 (`end_doc`). Exact: every match contains its anchor.
+47. Per-phrase last-document marker, so a document counts once.
+48. Answer state written at allocation (`written_zeros`, `black_box`): a lazily zeroed page read first would fault twice.
+49. `malloc_trim(0)` before the scan: setup memory back to the system.
+50. Each slice's pages dropped by its own thread (`mmap::release`).
+51. First-id logs mapped back to lines and sorted per thread, merged in slice order. Exact: slices are in document order.
+52. Output formatted in parallel, states read in place through `answer_of` (no 4.5 MB copy).
+53. Exit right after writing, no frees.
+54. Slice edges need no special case. Exact: a document outside a thread's slice has zero bits there.
+55. Profile-guided build trained on generator seed 7, with atomic profile counters (Dockerfile).
+56. Loop alignment (`-align-loops=64`) under a board A/B test (PERF.md, step 38: the current Dockerfile builds without it); fat LTO, one codegen unit, `panic = "abort"`, `crt-static`, `target-cpu=native`, `compile_error!` without AVX2, BMI2 or AES.
+57. Exit-code timing probes on the box (PERF.md, "Timing probes").
+58. No dependencies: libc calls declared by hand.
 
 ## Why the output is exact
 
@@ -192,6 +256,13 @@ output stays the same.
   70, 1-term phrases, empty answers), and four builds that force each failure path of the perfect
   hash.
 
+## Error handling
+
+Errors are panics with a message, and the build aborts on panic, so the exit status is nonzero: a
+missing file or a failed mmap, a docs.txt line without a TAB, an id that is empty, not all digits
+or over 9 digits, document ids that are not 0, 1, 2, ... below 2^20 each before a TAB, and a slice
+whose last id does not meet the next slice's first.
+
 ## Dependencies
 
 None: the Rust standard library only, with `mmap`, `madvise`, `prctl` and glibc's `malloc_trim`
@@ -200,7 +271,8 @@ declared by hand (`dependency_count = 0`). The build needs AVX2, BMI2 and AES-NI
 profile-guided build, trained on data from a byte-identical copy of the organisers' generator
 (`b_index.py`, not counted as code), with LLVM's atomic profile counters
 (`-instrprof-atomic-counter-update-all`: the twelve-thread training run no longer loses counts, so
-the profile is repeatable) and hot loops aligned to 64 bytes (`-align-loops=64`, PERF.md step 35).
+the profile is repeatable). Hot loops aligned to 64 bytes (`-align-loops=64`, PERF.md step 35) are
+not used for B: the board A/B (step 38) ran B faster without the flag, so B builds without it.
 
 ## With another 24 hours
 

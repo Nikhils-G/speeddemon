@@ -51,9 +51,16 @@ numbers are left out rather than guessed.
 | 33 | bf2aca8 | Endpoints sorted on the first 32 bytes of their keys (fewer ties); the log's unmap and the keys' release moved off the serial merge, onto the idle main thread during pass 2 | run-6cca232c0f6a | 0.018935 | 18.66 | 352 | 85.60 |
 | 34 | b25326b | Dockerfile only: hot loops aligned to 64 bytes in the profile-use build (`-align-loops=64`). Two more runs of this code were in a DISTURBED and a SLOW BOX dispatch: run-3feab32d2b8f 0.026024 s, run-69d0c9f98c0e 0.026627 s | run-df8ecf640b7e | 0.019217 | 18.06 | 352 | 85.58 |
 | 35 | f8206db (reverted in 51d3674) | apost-1: endpoint sort moved into worker 0, scratch arrays released without `munmap`, output page-table entries dropped in parallel before the exit. The second run was in a dispatch our log calls "a bit slow" | run-7833033c46e9, run-4e7cded1b902 | 0.019312, 0.021607 | 18.52, 18.09 | 360 | 85.34, 84.22 |
+| 36 | fcc1dd3 | Dockerfile only: the loop-alignment flag off again, as a board A/B test of step 34. A ran 0.0271 s while unchanged C ran its normal time in the same dispatch, so the flag went back on | run-8f956a29e3c5 | 0.027124 | 18.55 | 352 | 81.72 |
+| 37 | 16747e3 | Fewer lines in setup and merge (352 → 337) at the same speed on the test server (21.04/21.10 against 21.17/21.11 ms, 2 PGO builds each); loop alignment back on | run-c0c000c115eb | 0.019199 | 18.83 | 337 | 85.55 |
 
-The current code is step 34: the Track A source of step 33 (bf2aca8, restored by 51d3674 after
-step 35) with the Dockerfile of step 34. Its best run is step 33's run-6cca232c0f6a, 85.60 points.
+The current code is the Track A source of step 33 (bf2aca8, restored by 51d3674 after step 35),
+built by the Dockerfile of step 36. Its best run is step 33's run-6cca232c0f6a, 85.60 points,
+built without the alignment flag. The same source with the flag (step 34's Dockerfile) has these
+runs: run-df8ecf640b7e, 0.019217 s, 18.06 MB, 85.58 (b25326b); run-75fcd84a4c5e, 0.020656 s,
+17.83 MB, 84.85 (51d3674, a dispatch our log calls "box slower than morning"); run-82fce59877db,
+0.0233 s, 18.01 MB (3e7d9a4, SLOW BOX); run-d82e18393e7a, 0.019471 s, 18.94 MB, 85.23 (1f8d96a,
+normal box).
 
 ## What each step taught
 
@@ -76,7 +83,9 @@ step 35) with the Dockerfile of step 34. Its best run is step 33's run-6cca232c0
   directory the same change measured 1.3 ms slower, on tmpfs 1.6 ms faster (pwrite calls
   serialise on the file's lock; page faults on a shared mapping do not).
 - **Step 11** shows the limits of the test server: 36.2 → 29.9 ms there (released pages were
-  faulting back in), and no gain on the box (0.0367 s).
+  faulting back in), and on the box its one run was 4% slower (0.0367 s against 0.03528). It was
+  kept because the copy is what makes releasing the pages safe: removing it later (9e6ed95) gave
+  0.0342 and 0.0332 s against 0.0292–0.0307 with it (experiments table).
 - **Step 12 came from measuring the box itself.** For a few runs the program exited right after a
   phase with the elapsed time as its exit code (0.25 ms units then). They split A on the box:
   parse 17.5 ms, merge 1.25 ms, pass 2 about 8 ms, write about 3.5 ms, then 4–5 ms of drops and
@@ -91,6 +100,8 @@ step 35) with the Dockerfile of step 34. Its best run is step 33's run-6cca232c0
   18.4 ms) and slower on the box in two runs (0.0236 and 0.0244 s against 0.02188). Page faults
   cost much more in the test VM than on the box, so a win that comes from avoiding faults has to be
   confirmed on the box.
+- **Step 18.** One thread: cycles −7% on the server. Its one board run, 0.0227 s against step 15's
+  0.02188, was read as noise (our log); step 19 built on it and ran 0.020053 and 0.019785 s.
 - **Step 19.** With hours taken in order and written in order, a thread that finished a small hour
   waited for the large hour before it. Publishing the length first and writing later took pass 2
   from 6.9 to 5.9 ms on the server, and gave the first board run under 20 ms.
@@ -146,11 +157,12 @@ step 35) with the Dockerfile of step 34. Its best run is step 33's run-6cca232c0
   sort took 0.20 ms of the 0.27 ms serial merge on the server, about 0.1 ms with 32-byte keys.
   The log's unmap (about 0.1 ms) moved from the serial path to the main thread, which is idle
   during pass 2. Server: −0.13 ms. Box: 0.018935 s, the best Track A run, 85.60 points.
-- **Step 34.** Loop alignment is a Dockerfile flag, meant to make the layout of the hot loops
-  depend less on where unrelated code lands. The one normal-box run, 0.019217 s, is within the
-  spread of step 33; its M, 18.06 MB, is the lowest A run. The flag is kept for Tracks A and C (C
-  set its best run with it). The two runs in disturbed dispatches, 0.026 s each, came with the
-  other tracks' unchanged code running slow in the same dispatches.
+- **Steps 34 and 36.** Loop alignment is a Dockerfile flag, meant to make the layout of the hot
+  loops depend less on where unrelated code lands. A's own runs do not show that it helps: the
+  clean runs with it are 0.019217 and 0.019471 s, against 0.018935 s for step 33 without it, all
+  within the box's spread. C set its best run with the flag and keeps it. The two runs in disturbed
+  dispatches, 0.026 s each, came with the other tracks' unchanged code running slow in the same
+  dispatches. Step 36 built A without the flag again, as a board A/B test: 0.0271 s against 0.0192-0.0195 s for the flagged builds in normal dispatches, so the flag is back on from step 37. A's box times are bimodal (about 0.019 s or 0.022-0.027 s for the same code), which a single run cannot separate from a flag effect.
 - **Step 35 (reverted).** −0.70 ms on the test server, not faster on the box in two runs: see the
   next section and the experiments table.
 
@@ -160,7 +172,7 @@ Several steps did well on the test server and did nothing, or worse, on the box:
 
 | Change | Test server | Box |
 |---|---|---|
-| Names copied before release (step 11) | 36.2 → 29.9 ms | 0.0367 s, no gain |
+| Names copied before release (step 11) | 36.2 → 29.9 ms | 0.0367 s against 0.03528, 4% slower |
 | pread through 128 KB buffers (step 16) | −0.9 ms | 0.0236 and 0.0244 s against 0.02188 |
 | apost-1: sort in worker 0, no `munmap` of the scratch, parallel output teardown (step 35) | −0.70 ms (−3.8%) | 0.019312 and 0.021607 s against 0.018935 and 0.019217 |
 
@@ -234,8 +246,8 @@ The earlier probes behind step 12 used 0.25 ms units; their run IDs are not in o
   0.019217 and 0.026627 s (step 34). Where a decision rested on one run, the table says so.
 - **Make the build repeatable before comparing builds.** Until step 28, two builds of one source
   could differ by 0.5 ms, more than most of the steps being measured.
-- **Lines are points.** Steps 20 and 26–27 gained 0.9 and 1.1 points with no change in speed. A
-  change that saves 0.1 ms on the box has to cost fewer than about 10 lines.
+- **Lines are points.** Steps 20 and 26–27 gained 0.86 and 1.07 points with no change in speed.
+  Steps 26–27 cut 177 lines for 1.07 points, about 0.006 points per line.
 
 ## How correctness was verified
 

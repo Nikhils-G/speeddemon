@@ -15,10 +15,10 @@ box, so no decision rests on one run.
 | 4 | 2020832 | SIMD tokenizer, Bloom filter in front of the term table, small hot table | run-11666ac583f0 | 0.396 | 201 | 934 | 56.6 |
 | 5 | 42acaa7 | Profile-guided build | run-acc60580e004 | 0.355 | 203 | 937 | 57.8 |
 | 6 | 5c7b09a | No index at all: every query answered during one scan, BOOL queries per block of 64 documents (see README) | run-de33f090eda0 | 0.267 | 38.4 | 910 | 67.6 |
-| 7 | 20856e2 | Exit right after writing; each slice's pages dropped by its thread | run-cc0e62d06c76 | 0.265 | 39.1 | 922 | 67.6 |
+| 7 | 20856e2 | Exit right after writing; each slice's pages dropped by its thread. Rerun on a4e4404 (B unchanged), run-cc0e62d06c76: 0.2650 s, 67.64 | run-94bcf1f00dfc | 0.2658 | 38.64 | 922 | 67.61 |
 | 8 | 196434d | Queries with common cover terms evaluated once per 256 documents with AVX2; lookups gathered per document with their buckets prefetched; one term table instead of hot table + Bloom filter | run-1a4ed151ee61 | 0.199 | 41.5 | 1,028 | 70.4 |
 | 9 | 15bc6b2 | Leaner tokenizer; branch-free table probe (inline-asm cmov). Rerun run-b33ff9c0bd9c: 0.1716 s, 71.84 | run-a6b773e07cad | 0.1864 | 41.25 | 1,081 | 70.94 |
-| 10 | 68e6990 | Static linking (`crt-static`): less dynamic-loader work before `main`. Its first run, run-6e66fcd85faa (0.252 s), was a disturbed box: A, C and D were slow in the same dispatch | run-058dad4dcdce | 0.1713 | 41.7 | 1,081 | 71.85 |
+| 10 | 68e6990 | Static linking (`crt-static`): less dynamic-loader work before `main`. Its first run, run-6e66fcd85faa (0.252 s), was a disturbed box: A, C and D were slow in the same dispatch | run-058dad4dcdce | 0.1713 | | 1,081 | 71.85 |
 | 11 | 8246f98 | **Reverted** (cf64a47). One worker pool, parallel query parsing, per-block presence bitmaps: test server 118.2 → 109.6 ms, box no faster, 144 more lines. First run run-9be281b6c1b8 (0.241 s) was noise | run-7c5098eab231 | 0.1766 | 38.4 | 1,225 | 71.1 |
 | 12 | 9711c01 | **Reverted** (cf64a47). Step 11 with touched lists again and the presence words set in their own prefetched loop: no box gain either | run-fe77dad5e332 | 0.1789 | | 1,235 | 70.95* |
 | 13 | 0fe0395 | The answer state written when it is allocated (a lazily zeroed page read before it is written faults twice). Box-neutral, kept: 2 lines | run-c33e91b88799 | 0.1792 | | 1,083 | 71.36* |
@@ -27,7 +27,7 @@ box, so no decision rests on one run.
 | 16 | 091e35b | Setup spread over the threads (query lines split and keyed in parallel, the plan's per-line passes in parallel); each token carries its bucket index. Rerun run-5a8826a5f10b: 0.1601 s, 72.43 | run-3682cf4f995c | 0.1619 | 38.3 | 1,134 | 72.31 |
 | 17 | 26b5cb5 | Leaner token lookup: long tokens on a cold path, the bucket probe compares dwords, the scan's probe and the table's `get` share one function that keeps the table in registers, the CRC stays in 32 bits | run-b16e2000c75d | 0.1484 | 38.6 | 1,140 | 73.24 |
 | 18 | e24c58d | Superblock queries evaluated over their real terms only, sorted by term count and operators so the operator branch predicts. A second run, on 33cac7e, took 0.1643 s | run-6820636c30fc | 0.1529 | | 1,142 | 72.91* |
-| 19 | 34dd399 | No bounds checks in the block-end loops (9b7b6f9, which had no board run of its own); then no per-token prefetch of the presence word. First run run-13cc611d4761: 0.1518 s, 72.96* | run-2bc33f24a19f | 0.1478 | 38.54 | 1,151 | 73.26 |
+| 19 | 34dd399 | No bounds checks in the block-end loops (9b7b6f9, which had no board run of its own); then no per-token prefetch of the presence word. First run run-13cc611d4761: 0.1518 s, 72.96* | run-2bc33f24a19f | 0.1478 | | 1,151 | 73.26 |
 | 20 | 8fdef14 | The block end prefetches the entry range of the slot 16 ahead and the entries of the slot 8 ahead (one thread: cycles −5.2%). Rerun run-f0af75ddb8ab: 0.1416 s | run-4b9ff571a190 | 0.1404 | 38.46 | 1,162 | 73.78 |
 | 21 | 831097c | Same engine in fewer lines; hot loops unchanged. First run run-bb8fc84e151e: 0.1466 s, M 39.68, 73.81, in a dispatch where A was slow too | run-72157fe9a7e1 | 0.1435 | 39.51 | 998 | 74.04 |
 | 22 | a3a700b | Fewer lines again, hot code reformatted with the same operations; SAFETY arguments for every prefetch and unchecked load | run-1ed2ef15f7af | 0.1459 | 38.54 | 854 | 74.37 |
@@ -40,19 +40,25 @@ box, so no decision rests on one run.
 | 29 | 7fc8af9 | Fewer lines with the hot loops unchanged (Rust 864 → 778 code lines, the token and LF masks from one load; test server −1.3%), and the PGO training run with LLVM's atomic profile counters (fb34663, all tracks) | run-59b2e0a8fdd5 | 0.1353 | | 789 | 75.44 |
 | 30 | 31cbd48 | Query parsing relies on the spec's query grammar (2.3) instead of re-checking it; malformed lines still abort on a slice bound. Neutral on the test server | run-ff1d9b72da23 | 0.1338 | 39.21 | 781 | 75.60 |
 | 31 | 776e1dc | A perfect hash of the query terms instead of the 4-way bucket table (README, design 2): two AES rounds as the hash, one 16-byte slot per term, a branch-free probe, built on 12 threads. Test server −8.4%, 12-thread cycles −11%; box −10.4%. | run-4a28a650e9ac | 0.1199 | 39.62 | 818 | 76.64 |
-| 32 | bdf6d27 | Fewer lines in cold code only: the hot functions compile to the same instructions as step 31's. Test server: two PGO builds 84.96 and 85.28 ms (median of 31 runs, mean of 3 interleaved rounds) against step 31's three builds 85.98, 85.25 and 85.96. Rerun on bbdb79e (B unchanged), run-a361a4d1c316: 0.1189 s, 40.13 MB, 76.82, the best B run | run-0741f63811ab | 0.1205 | 39.67 | 796 | 76.67 |
+| 32 | bdf6d27 | Fewer lines in cold code only: the hot functions compile to the same instructions as step 31's. Test server: two PGO builds 84.96 and 85.28 ms (median of 31 runs, mean of 3 interleaved rounds) against step 31's three builds 85.98, 85.25 and 85.96. Rerun on bbdb79e (B unchanged), run-a361a4d1c316: 0.1189 s, 40.13 MB (M from the board's best-B record, `board.py`), 76.82, the best B run | run-0741f63811ab | 0.1205 | 39.67 | 796 | 76.67 |
 | 33 | ecc8c7d | Setup in compact pre-sized records (README, design 1): 8- and 16-byte split records that never grow, grouped by `csr`; the long-term map asked only about terms over 12 bytes; the plan's kind bits, term order and renumbering in parallel or by counting sort; `malloc_trim` before the scan. Test server 86.8/87.2 → 83.8/83.8 ms (21 interleaved runs, two rounds), setup 16.8 → 11.6 ms. C ran slow in the same dispatch (0.0252 s against 0.0217 to 0.0221) | run-c9888b108142 | 0.1252 | 41.48 | 847 | 76.06 |
 | 34 | c43ef66 | A 1 MB sample instead of 2 MB. Test server 84.0/83.7/84.0 → 82.5/82.2/82.9 ms (3 × 21 interleaved runs); 512 KB planned worse (87.1 and 87.2 ms against 83.4 and 83.0 for 1 MB in the same rounds) | run-ffe904556c9a | 0.1174 | 41.76 | 847 | 76.75 |
 | 35 | b25326b | Hot loops aligned to 64 bytes (`-C llvm-args=-align-loops=64`) in the profile-use build of A, B and C; B's code unchanged. B slower than step 34's 0.1174, so B's Dockerfile dropped the flag in step 36 | run-178d358d9dc4 | 0.1206 | | 847 | 76.47* |
 | 36 | 250436c | Fewer lines in setup and the plan only (S 847 → 817), without loop alignment. A slow-box dispatch: A, unchanged, ran 0.0260 s against its best 0.0189 | run-39e2a79a78c4 | 0.1479 | | 817 | 74.36* |
 | 37 | a02cacb | Step 36 with loop alignment back on (test server: with the flag, step 36 times the same as step 34; without it, 1.5 to 2.5 ms slower). A slow-box dispatch again: A, unchanged, ran 0.0266 s. Rerun on f8206db (B unchanged), run-00e91f7a4d7b: 0.1203 s, 42.16 MB, 76.60 | run-b2ce4f101146 | 0.1313 | | 817 | 75.66* |
+| 38 | fcc1dd3 | Dockerfile only: the loop-alignment flag off again, as a board A/B test of step 37 (same source as steps 36 and 37). Best B run so far; a second run (16747e3, run-36074c771c0e) gave 0.119467 s, 41.17 MB, 76.68 | run-a77b19c6bb15 | 0.116583 | 41.82 | 817 | 76.95 |
 
-Step 37 is the current code. S is the harness's `static_axes.py` count, which matches the board for
+Step 37's source is the current code, built by step 38's Dockerfile. Later runs of step 37's
+binary (with the flag): run-d97dcca08b7d, 0.12489 s, 40.61 MB, 76.20 (5d6d235, a dispatch our log
+calls "a bit slow"); run-7bbf842f335a, 0.121849 s, 41.73 MB, 76.47 (51d3674, "box slower than
+morning"); run-8addd6917ec9, 0.121414 s, 42.24 MB, 76.51 (3e7d9a4, SLOW BOX); run-749fda72c1d3,
+0.118445 s, 41.5 MB, 76.78 (1f8d96a, normal box). S is the harness's `static_axes.py` count, which matches the board for
 every run where the board's S was logged. M is blank where it was not logged. Points marked * are
 computed from T and S with the board's formula: every M logged since step 6 is under the 44 MB cap
-(26.8 to 41.7 MB) except step 26's 44.09 MB, which costs 0.01 points, and the formula reproduces every
+(26.8 to 43.8 MB) except step 26's 44.09 MB, which costs 0.01 points, and the formula reproduces every
 logged point value to within 0.01. M is blank for steps 29 and 35 to 37 because runs.log did not
-record it; steps 33 to 37 are at 41.5 to 42.2 MB wherever it was logged.
+record it, and for steps 10 and 19 because the values once written there are not in runs.log;
+steps 33 to 37 are at 40.6 to 42.2 MB wherever it was logged.
 Steps 24 and 27 are the round's reverted experiments; step 23 was
 kept because its server gain was clear and the box did not show it slower than step 22 once
 step 24 ran without the disturbance.
@@ -174,7 +180,9 @@ step 24 ran without the disturbance.
   runs: step 34 82.2, 83.1 and 82.3 ms; step 36 82.2, 82.2 and 82.8). On the box the picture is not
   settled: step 35 (flag on, code of step 34) ran 0.1206 s against 0.1174 without, and steps 36 and 37
   fell on slow-box dispatches (A, unchanged, 37 to 41% over its best); the clean rerun of step 37
-  gave 0.1203 s.
+  gave 0.1203 s. Four later runs of step 37's binary gave 0.118445 s in a normal dispatch and
+  0.121414 to 0.12489 s in dispatches our log calls slower. Step 38 builds B without the flag
+  again, as a board A/B test. Result: 0.116583 and 0.119467 s without the flag against 0.1184-0.1218 s with it, so B builds without the flag.
 - **Steps 36–37: lines from setup and the plan.** S 847 → 817 with no hot function touched: an
   operator lookup from the low bits of its first byte (`A`, `N`, `O` end in binary 01, 10, 11), split
   types rustfmt keeps on one line, a shorter grouping and key-length expression, a u32 counting-sort

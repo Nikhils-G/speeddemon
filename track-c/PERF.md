@@ -48,15 +48,16 @@ their own, or their run is not in the log; their numbers are left out rather tha
 | 30 | 84c8677 | The amount's minus sign from the 32-byte tail compare already loaded, not from a byte load (second run of the same C code from a later push) | run-2bd88ce6fc49, run-43d3b02bb832 | 0.021739, 0.021609 | 12.68, 12.74 | 422 | 80.74, 80.79 |
 | 31 | bddc535 | Memory: 64 runs per thread in release blocks of 8; one shared pool of empty pair buffers; buffers sized mean + 2 sd + 4, a grown one dropped once emptied; totals summed as each thread finishes (a third run, run-d210144850cf, 0.0266 s, was noisy) | run-649a95479a7d, run-0d8cb30b558e | 0.021915, 0.021661 | 10.63, 10.92 | 430 | 81.36, 81.37 |
 | 32 | b25326b | Dockerfile only: hot loops aligned to 64 bytes in the profile-use build (`-align-loops=64`) | run-1ef2cedeac0a, run-4b1180e734e2 | 0.02147, 0.021807 | 10.59, 11.6 | 430 | 81.60, 81.04 |
-| 33 | 5d6d235 | 32-bit name-table keys in buckets of 8 slots; 15 check bits of the hash in the name's row (word 3, bits 48..62, the bits of groups that never exist); more than 240 countries aborts. Both runs were in dispatches where unchanged Track A code was also slower than its best (box slower in the afternoon); memory 10.56 and 10.78 MB against 10.59-11.6 MB for step 32 | run-852c8d9d0f10, run-fde147f55fbc | 0.022314, 0.022147 | 10.56, 10.78 | 436 | 81.15, 81.14 |
-| 34 | 3e7d9a4 | Fewer lines in cold code (merged `use` lines and two `let` pairs; empty groups skipped in the output loop header); the hot functions compile to the same instructions as step 33's. Run in a SLOW BOX dispatch (unchanged Track A at 0.0233 s against its best 0.0189 s) | run-37ca5d6651ae | 0.024684 | 10.99 | 430 | 79.93 |
+| 33 | 5d6d235 | 32-bit name-table keys in buckets of 8 slots; 15 check bits of the hash in the name's row (word 3, bits 48..62, the bits of groups that never exist); more than 240 countries aborts. Two runs, run-852c8d9d0f10 (0.022314 s, 10.56 MB) and run-fde147f55fbc (0.022147 s, 10.78 MB), both in dispatches our log marks as a slower box | run-852c8d9d0f10, run-fde147f55fbc | 0.022314, 0.022147 | 10.56, 10.78 | 436 | 81.15, 81.14 |
+| 34 | 3e7d9a4 | Fewer lines in cold code (merged `use` lines and two `let` pairs; empty groups skipped in the output loop header); the hot functions compile to the same instructions as step 33's. The first run was in a SLOW BOX dispatch (unchanged Track A at 0.0233 s against its best 0.0189 s); the second, run-085364b6513f, in a normal one | run-37ca5d6651ae, run-085364b6513f | 0.024684, 0.022277 | 10.99, 10.39 | 430 | 79.93, 81.28 |
 
 Two more runs of step 32's code were in a DISTURBED and a SLOW BOX dispatch: run-87e294d71310
 (0.022429 s) and run-dc9ee4598ca3 (0.021796 s, 11.28 MB).
 
-The current code is step 33. Its single board run (81.15 points) is below step 32's best
-(81.60), in a dispatch where B's unchanged code was slow as well; if the next samples do not
-improve on step 32, it goes back.
+The current code is step 34: step 33's hot code with 3e7d9a4's cold-code cuts. Its runs are
+run-37ca5d6651ae (0.024684 s, SLOW BOX) and run-085364b6513f (0.022277 s, 10.39 MB, 81.28 points,
+normal box). The best C run is still step 32's run-1ef2cedeac0a (81.60 points); the 32-bit keys
+of step 33 stay for now.
 
 ## What each step taught
 
@@ -210,6 +211,7 @@ improve on step 32, it goes back.
   less on unrelated code. Box: run-1ef2cedeac0a 0.02147 s, 10.59 MB, the best C run (81.60), and
   run-4b1180e734e2 0.021807 s in a normal dispatch. Against step 31's 0.021661–0.021915 s, the
   speed is within the spread; it was kept because the best run came with it and it costs no lines.
+  Tracks A and B are now under a board A/B test without the flag (fcc1dd3); C keeps it.
 - **Step 33.** The keys of step 31 were 64-bit, 1.57 MB over 48 tables. 32-bit keys in 8-slot
   buckets halve that, and one AVX2 compare still covers a whole bucket. A 32-bit key cannot hold
   as many hash bits, so 15 of them moved into the name's row, into the bits of groups 240..254,
@@ -218,7 +220,10 @@ improve on step 32, it goes back.
   Time +0.12 ms (+0.6%) over 25 and 31 interleaved runs; single-thread instructions 818.2M →
   857.2M, cycles 306.5M → 305.3M, branch misses 0.555M → 0.496M. S 430 → 436. The identity bits
   went from 50 to 49.6 at 12 threads (4.4e-6 → 5.9e-6 per dataset) and from 54 to 46 on one thread
-  (2.8e-7 → 7.1e-5). Box, one run in a slow dispatch: 0.022314 s, 10.56 MB, 81.15 points.
+  (2.8e-7 → 7.1e-5). Box: Two runs, run-852c8d9d0f10 (0.022314 s, 10.56 MB) and run-fde147f55fbc (0.022147 s, 10.78 MB), both in dispatches our log marks as a slower box (81.15 and 81.14 points).
+- **Step 34.** Cold code only, S 436 → 430; the hot functions compile to the same instructions.
+  Its normal-box run, 0.022277 s and 10.39 MB, is the lowest C memory peak in our log, and 0.32
+  points under step 32's best run.
 
 ## Box probes
 
