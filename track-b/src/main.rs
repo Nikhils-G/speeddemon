@@ -64,9 +64,10 @@ const OR: u32 = 3;
 /// first (smallest) FIRST_IDS ids.
 const FIRST_IDS: u64 = 10;
 /// Corpus bytes sampled (spread over the slices) to estimate term frequencies:
-/// about 1,030 documents on seed 1. (2 MB planned no better and took 1.4 ms more;
-/// 512 KB planned worse.)
-const SAMPLE_BYTES: usize = 1 << 20;
+/// about 2,600 documents on seed 1. The better plan pays for the longer sample:
+/// against 1 MB (b-stack-15 + be-2, replica), 2.5 MB ran 0.4-0.7 ms faster on
+/// seeds 1 and 99, 1.5 MB the same, 768 KB 0.4-0.8 ms slower, 512 KB 2 ms slower.
+const SAMPLE_BYTES: usize = 5 << 19;
 /// A query whose cover terms are expected in more 64-document blocks than this
 /// (as a share, summed over the terms) is evaluated in every superblock instead
 /// of per document. Chosen on the box: an in-process probe of the per-document
@@ -1116,7 +1117,7 @@ impl<'a> Scan<'a> {
             plan,
             df,
             // 3 bytes more: `trigger` gathers 4 bytes from a stamp.
-            lastdoc: vec![EMPTY; plan.map_or(0, |_| vocab.count as usize + 5)],
+            lastdoc: vec![EMPTY; vocab.count as usize + 5],
             stamp: 0,
             trig: Vec::new(),
             evals: vec![0; plan.map_or(0, |p| p.entries.len())],
@@ -1354,12 +1355,13 @@ impl<'a> Scan<'a> {
                 }
             }
         } else {
-            // The sample: count the document's distinct terms (the table has no
-            // flags yet, so the info words are the ids).
-            self.toks.sort_unstable();
-            self.toks.dedup();
+            // The sample: count the document's distinct terms, each at its first
+            // token, the one that finds its stamp older (the table has no flags
+            // yet, so the info words are the ids).
             for &t in self.toks.iter().filter(|&&t| t != self.vocab.count) {
-                self.df[t as usize].fetch_add(1, Relaxed);
+                if replace(&mut self.lastdoc[t as usize], self.stamp) != self.stamp {
+                    self.df[t as usize].fetch_add(1, Relaxed);
+                }
             }
         }
         self.toks.clear();
