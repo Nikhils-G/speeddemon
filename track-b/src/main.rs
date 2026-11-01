@@ -58,6 +58,7 @@ const SUPER: u32 = 256;
 const SUM_BITS: u32 = 40;
 
 fn main() {
+    let t0 = std::time::Instant::now();
     let mut args = std::env::args().skip(1);
     let data_dir = args.next().unwrap_or_else(|| "/data".into());
     let out_dir = args.next().unwrap_or_else(|| "/out".into());
@@ -80,6 +81,10 @@ fn main() {
     let df: Vec<u32> = df.into_iter().map(AtomicU32::into_inner).collect();
     let plan = Plan::new(queries, &df, sampled.iter().sum::<u32>().max(1), threads);
     vocab.finish(&plan);
+    // PROBE: the setup's end time in units of 100 us as the exit status, on the full corpus only.
+    if docs.len() > 100 << 20 {
+        std::process::exit((t0.elapsed().as_micros() / 100).min(255) as i32);
+    }
 
     let results = par(slices.len(), &|i| {
         let (start, end, first) = slices[i];
