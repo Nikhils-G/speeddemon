@@ -197,10 +197,10 @@ fn main() {
         // by the full bytes on ties.
         let parts: Vec<&Part> = parts.iter().map(OnceLock::wait).collect();
         // PROBE: exit with the parse's wall time (main start to all parts in) in 0.1 ms units.
-        // Only on the full dataset: the PGO training run on the sample must exit 0.
-        if len > 100_000_000 {
-            std::process::exit((t0.elapsed().as_micros() / 100).min(255) as i32);
-        }
+        // Only on the full dataset: the PGO training run on the sample must exit 0
+        // (this probe parses nothing, so it stops here in both cases).
+        let code = if len > 100_000_000 { (t0.elapsed().as_micros() / 100).min(255) } else { 0 };
+        std::process::exit(code as i32);
         // SAFETY: the parse is over, so nothing writes the table any more.
         let count = table.count.load(Relaxed);
         let names = table.names[..count].iter().map(|n| unsafe { &**n.get() });
@@ -341,7 +341,8 @@ fn parse(chunk: &[u8], table: &Interner) -> Part {
         // previous line's hour. Its bytes "MM-DDTHH" decide: every timestamp lies in
         // one 72-hour span (the spec), so lines that share them share the year.
         let mut last = u64::MAX;
-        while line < stop {
+        // PROBE: touch one byte per 64 and nothing else (the floor: DRAM, faults, release).
+        while line < stop { std::hint::black_box(line.read_volatile()); line = line.add(64); continue;
             // Bytes 5..13 of the timestamp, "MM-DDTHH", as one word.
             let hour = line.add(5).cast::<u64>().read_unaligned();
             if hour != last {
