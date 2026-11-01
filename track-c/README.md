@@ -104,8 +104,9 @@ in its inbox. No thread waits for another one until the very end. The earlier ve
 barrier after each of 8 rounds, and one CPU shared with a busy loop made it take twice as long (42
 ms instead of 22 on the test server); now it takes 25. If an inbox grows past a bound because its
 thread fell behind, whoever files into it takes over its tables, so that memory stays bounded too.
-Claims go round the file's stripes, one per thread, so that runs parsed at the same time never
-share a page table, whose lock their page faults would otherwise contend on. The last thread to
+Claims go round the file's stripes (one per thread, about 17 MB each at 12 threads), so runs
+claimed at the same time lie a stripe apart and rarely share a page-table page, whose lock their
+page faults would otherwise contend on. The last thread to
 parse a run of a block of 8 drops the block's input pages (`madvise(MADV_DONTNEED)`, about 2 MB per
 call), in parallel instead of in one unmap at exit. Each thread's totals are added to one shared
 sum as it finishes, and the last thread to finish writes the output and exits.
@@ -181,7 +182,7 @@ are exact; the distinct-name count rests on a hash (technique 6 below).
 36. Buffers sized at a run's mean share plus 2 standard deviations plus 4.
 37. An inbox past 16 x threads buffers is taken over by its filer: memory stays bounded.
 38. Runs claimed one at a time, 64 per thread: no barriers; a slow thread parses fewer.
-39. Claims round the file's stripes: concurrent runs never share a page-table page.
+39. Claims round the file's stripes: concurrent runs rarely share a page-table page.
 40. Spin, then yield, in the two waits (`wait`).
 41. 32-bit keys in 8-slot buckets, compared by one AVX2 compare (`add`).
 42. The name's row + 1 inside its key: no second load after a hit.
@@ -274,7 +275,8 @@ exact. The distinct-name count rests on a hash; its odds are stated in technique
   `"`, and the empty name is empty quoted or not), so they get equal hashes. Different names are
   counted as one only if their hashes agree on all 49.6 compared bits at 12 threads (46 on one
   thread): about 5.9e-6 per dataset at 12 threads and 7.1e-5 on one, for the generator's 100,000
-  names. It is not a proof. Step 33 moved from 64-bit to 32-bit keys for 0.56 MB (server median):
+  names. These are upper bounds: two names taken for one change the output only if both occur in
+  the same country, and then only that country's names_distinct, by 1. It is not a proof. Step 33 moved from 64-bit to 32-bit keys for 0.56 MB (server median):
   50 → 49.6 bits at 12 threads, 54 → 46 on one thread. The output matched the reference on every seed tried (PERF.md,
   "How correctness was verified"). More names than the tables hold, or more than 240 countries,
   stops the program.
@@ -306,8 +308,9 @@ exact. The distinct-name count rests on a hash; its odds are stated in technique
 ### 9. Build
 
 - **Design.** Profile-guided, trained on data from a byte-identical copy of the organisers'
-  generator, with atomic profile counters so that the 12-thread training run gives the same
-  profile on every build. Loops aligned to 64 bytes in the final build. Fat LTO, one codegen unit,
+  generator, with atomic profile counters, so that no count is lost while 12 threads train at once.
+  The layout is still not bit-reproducible: six rebuilds of one source placed 0-14 instructions of
+  `parse_run` differently, because the training threads' order varies. Loops aligned to 64 bytes in the final build. Fat LTO, one codegen unit,
   `panic = "abort"`, a static binary, `target-cpu=native`. `#[inline(never)]` on `parse_run` and
   `add`, so that edits to the worker cannot change how their loops are compiled.
 - **Why exact.** The build changes speed only; each check runs the Dockerfile's binary.
@@ -320,8 +323,15 @@ without them a `compile_error!` stops it.
 
 ## With another 24 hours
 
-- Find where the box spends the remaining time. The test server's profile (about 60% parsing, 15%
-  deduplication, 15% kernel page faults and releases) does not transfer reliably to the box.
+- Find where the box spends the remaining time. Probes that exit with the in-process time (PERF.md,
+  "Box probes") measured the unmodified code at 24.7 ms (run-de1523b1571f), 21.6 ms without the
+  region lookup (run-39f6f9b9a951), 21.0 ms with the region table cut to 512 KB
+  (run-333f2f901d71), and 15.1 ms and 8.39 MB without deduplication (run-81f53eabfc7a). Each came
+  from a different dispatch, and the box state differed between them (Track B's unchanged code
+  took 0.1211-0.1312 s), so no 5% call can be made from them. Within one process, a dedupe that
+  prefetches the rows of 32 pairs at a time was only 0.4 ms faster (run-6e94feab4883,
+  run-63ccad95bdb6). The open question is where the rest of the deduplication's share goes:
+  filing and handing pairs between cores, or the table lookups.
 - The region-table lookup is the largest single stall: with a 16 KB table, the run would be about
   10% faster. A compact rank/select table needs two dependent loads and was slower. A structure with
   one load into less than 512 KB is the open question.

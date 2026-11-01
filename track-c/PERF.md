@@ -48,16 +48,24 @@ their own, or their run is not in the log; their numbers are left out rather tha
 | 30 | 84c8677 | The amount's minus sign from the 32-byte tail compare already loaded, not from a byte load (second run of the same C code from a later push) | run-2bd88ce6fc49, run-43d3b02bb832 | 0.021739, 0.021609 | 12.68, 12.74 | 422 | 80.74, 80.79 |
 | 31 | bddc535 | Memory: 64 runs per thread in release blocks of 8; one shared pool of empty pair buffers; buffers sized mean + 2 sd + 4, a grown one dropped once emptied; totals summed as each thread finishes (a third run, run-d210144850cf, 0.0266 s, was noisy) | run-649a95479a7d, run-0d8cb30b558e | 0.021915, 0.021661 | 10.63, 10.92 | 430 | 81.36, 81.37 |
 | 32 | b25326b | Dockerfile only: hot loops aligned to 64 bytes in the profile-use build (`-align-loops=64`) | run-1ef2cedeac0a, run-4b1180e734e2 | 0.02147, 0.021807 | 10.59, 11.6 | 430 | 81.60, 81.04 |
-| 33 | 5d6d235 | 32-bit name-table keys in buckets of 8 slots; 15 check bits of the hash in the name's row (word 3, bits 48..62, the bits of groups that never exist); more than 240 countries aborts. Two runs, run-852c8d9d0f10 (0.022314 s, 10.56 MB) and run-fde147f55fbc (0.022147 s, 10.78 MB), both in dispatches our log marks as a slower box | run-852c8d9d0f10, run-fde147f55fbc | 0.022314, 0.022147 | 10.56, 10.78 | 436 | 81.15, 81.14 |
-| 34 | 3e7d9a4 | Fewer lines in cold code (merged `use` lines and two `let` pairs; empty groups skipped in the output loop header); the hot functions compile to the same instructions as step 33's. The first run was in a SLOW BOX dispatch (unchanged Track A at 0.0233 s against its best 0.0189 s); the second, run-085364b6513f, in a normal one | run-37ca5d6651ae, run-085364b6513f | 0.024684, 0.022277 | 10.99, 10.39 | 430 | 79.93, 81.28 |
+| 33 | 5d6d235 | 32-bit name-table keys in buckets of 8 slots; 15 check bits of the hash in the name's row (word 3, bits 48..62, the bits of groups that never exist); more than 240 countries aborts. Both runs were in dispatches our log marks as a slower box | run-852c8d9d0f10, run-fde147f55fbc | 0.022314, 0.022147 | 10.56, 10.78 | 436 | 81.15, 81.14 |
+| 34 | 3e7d9a4 | Fewer lines in cold code (merged `use` lines and two `let` pairs; empty groups skipped in the output loop header); the hot functions compile to the same instructions as step 33's. The first run was in a SLOW BOX dispatch (unchanged Track A at 0.0233 s against its best 0.0189 s); the second, run-085364b6513f, in a normal one (nine board runs of this code in all: see below) | run-37ca5d6651ae, run-085364b6513f | 0.024684, 0.022277 | 10.99, 10.39 | 430 | 79.93, 81.28 |
+| 35 | 2c8ba1c | Output lines written into one string (`write!` into a String, `money()` gone) | run-a9ee2ce7006d, run-b0a4d0918d2a, run-6a13aed936f1 | 0.021639, 0.022423, 0.021718 | 10.63, 10.44, 10.65 | 429 | 81.51, 81.20, 81.46 |
+| 36 | | Code-quality pass: comments, names and SAFETY arguments; named `Record`, `Field` and column consts; `fill`, `merge` and `drop_pages` as functions; the hot functions compile to the same instructions as step 35's in a build without the profile. No board run yet | | | | 469 | |
 
 Two more runs of step 32's code were in a DISTURBED and a SLOW BOX dispatch: run-87e294d71310
 (0.022429 s) and run-dc9ee4598ca3 (0.021796 s, 11.28 MB).
 
-The current code is step 34: step 33's hot code with 3e7d9a4's cold-code cuts. Its runs are
-run-37ca5d6651ae (0.024684 s, SLOW BOX) and run-085364b6513f (0.022277 s, 10.39 MB, 81.28 points,
-normal box). The best C run is still step 32's run-1ef2cedeac0a (81.60 points); the 32-bit keys
-of step 33 stay for now.
+This file ships with step 36's code, which has no board run yet; its hot code is step 35's. The
+code on the board is step 35: step 34 with the output lines written into one String. Its runs are
+run-a9ee2ce7006d (0.021639 s, 10.63 MB, 81.51 points), run-b0a4d0918d2a (0.022423 s, 81.20),
+run-6a13aed936f1 (0.021718 s, 81.46), run-718519297500 (0.021659 s, 81.59) and run-5514f073467f
+(0.021643 s, 10.8 MB, 81.43), plus one at 0.024088 s in a slow dispatch whose run ID is not in our
+log. Step 34's code had nine board runs: run-b52eb817e73d 0.022131, run-085364b6513f 0.022277,
+run-c22dfd35468d 0.022346, run-ea147e35f6ca 0.022517, run-bd2e07eba1e1 0.022515,
+run-92c59d19bd2f 0.022606, run-005966bd2a44 0.022879, run-37ca5d6651ae 0.024684 (SLOW BOX) and
+run-4e8d1ce215a3 0.025734 s; median 0.022517 s. The best C run is still step 32's
+run-1ef2cedeac0a (81.60 points); the 32-bit keys of step 33 stay for now.
 
 ## What each step taught
 
@@ -220,17 +228,38 @@ of step 33 stay for now.
   Time +0.12 ms (+0.6%) over 25 and 31 interleaved runs; single-thread instructions 818.2M →
   857.2M, cycles 306.5M → 305.3M, branch misses 0.555M → 0.496M. S 430 → 436. The identity bits
   went from 50 to 49.6 at 12 threads (4.4e-6 → 5.9e-6 per dataset) and from 54 to 46 on one thread
-  (2.8e-7 → 7.1e-5). Box: Two runs, run-852c8d9d0f10 (0.022314 s, 10.56 MB) and run-fde147f55fbc (0.022147 s, 10.78 MB), both in dispatches our log marks as a slower box (81.15 and 81.14 points).
+  (2.8e-7 → 7.1e-5). Box: 81.15 and 81.14 points, both in dispatches our log marks as a slower box.
 - **Step 34.** Cold code only, S 436 → 430; the hot functions compile to the same instructions.
   Its normal-box run, 0.022277 s and 10.39 MB, is the lowest C memory peak in our log, and 0.32
   points under step 32's best run.
+- **Step 35.** The output was a String per line and per amount (`format!` and `money()`); one
+  String written into with `write!` takes the output from 0.2 to 0.1 ms on the server, at the end,
+  when no other thread has work left. S 430 → 429. Box: run-a9ee2ce7006d, 0.021639 s, 81.51 points.
 
 ## Box probes
 
-The board reports only T, M and S of a correct run, and the exit code of a failed one. The probes
-behind step 14 (b881f34, 60e1955, 43b3419, b56f58d, each reverted by the next commit) exited with
-a phase's elapsed time as their status, so the board lists them as "✗ correctness". They were
-measurements, not failures of the solution. Their run IDs are not in our log.
+The board reports only T, M and S of a correct run, and the exit code of a failed one. A probe
+exits with a measurement as its status, so the board lists it as "✗ correctness": these were
+measurements, not failures of the solution. Each probe commit was reverted by the next one. The
+probes behind step 14 (b881f34, 60e1955, 43b3419, b56f58d) timed phases; their run IDs are not
+in our log.
+
+Step 34's code was probed again. The phase probes exit with the time from `main` to the written
+output in 0.1 ms units. The A/B probes run the whole parse once as a warm-up and then 8 times in
+one process, ABBA ABBA between mode 0 (the shipped code) and mode 1, and exit with 100 + (mean
+mode-0 pass − mean mode-1 pass) in 0.1 ms units.
+
+| Probe | Commit | Run ID | Exit | Reading |
+|---|---|---|---|---|
+| Phase: unmodified | 2baa984 | run-de1523b1571f | 247 | 24.7 ms (a slow dispatch: Track B 0.1312 s) |
+| Phase: no region lookup | 5afab2c | run-39f6f9b9a951 | 216 | 21.6 ms (Track B 0.1296 s, slow) |
+| Phase: region table cut to its first 512 KB | e3a71bc | run-333f2f901d71 | 210 | 21.0 ms (Track B 0.1211 s) |
+| Phase: no deduplication | 55af820 | run-81f53eabfc7a | 151 | 15.1 ms, M 8.39 MB (Track B 0.1243 s) |
+| A/B: full region table, mode 1 its first 512 KB | 8ee6e49, 6923e1e | run-d915ef465a1b, run-cb37e117cec4 | 105, 106 | the full table 0.5 and 0.6 ms slower |
+| A/B: `add`, mode 1 a dedupe that prefetches the rows of 32 pairs at a time | 41cf8a0, d04fc28 | run-6e94feab4883, run-63ccad95bdb6 | 104, 104 | the batched dedupe 0.4 ms faster, both times |
+
+The phase probes ran in four dispatches whose box state differed (Track B's unchanged code took
+0.1211–0.1312 s), so they are too noisy for a 5% call; the A/B probes compare within one process.
 
 ## Experiments that did not make it (measured, reverted)
 
@@ -241,6 +270,9 @@ measurements, not failures of the solution. Their run IDs are not in our log.
 | Region table on one 2 MB huge page, with the first name tables in its spare megabyte (a392274, bf3a2c0) | board run-bbf744abd1a4 | 0.024972 s, S 583, 77.81 points against 77.88 for step 24b (server −0.55 ms): reverted in 2515d02 |
 | Step 26's regions fill and merged own-inbox take | board run-5b165ed65fa8, run-cb0af101a699 | 0.0252–0.0253 s against 0.022853: reverted, see steps 26–27 |
 | Name tables at 3/4 load instead of 5/8 | server | −0.33 MB, +0.8% time and worse collision odds |
+| Rows by slot in a 7/8-full table (no row in the key) | server | 23% less table memory, +0.8M branch misses |
+| Compact region table, judged by its upper bound: the region table cut to its first 512 KB, in-process box A/B | board run-d915ef465a1b, run-cb37e117cec4 | at most 0.5 / 0.6 ms to gain, and a compact table adds a dependent load (the 32-id-block row below: parse 16.2 vs 12.8 ms on the server): dropped |
+| Batched dedupe (rows of 32 pairs prefetched together), in-process box A/B | board run-6e94feab4883, run-63ccad95bdb6 | −0.4 ms both times, but S 430 → 462 (+32): about −0.23 points against +0.21: dropped |
 | `munmap` of a block's input pages instead of `madvise(MADV_DONTNEED)` | not built | The cut search and the walker can read past a block's end into its neighbour; after `munmap` that read would crash |
 | Waiters sleep (20 µs) instead of yielding, so the kernel can move the slowed thread | server, one CPU loaded | 33.9 vs 33.1 ms |
 | A pool of pair sets with a publish log (e1) | server | 22.7 / 30.8 ms (unloaded / loaded): one preempted partition holder stalls the pool |
@@ -288,8 +320,24 @@ measurements, not failures of the solution. Their run IDs are not in our log.
 
 ## How correctness was verified
 
-Since step 25 (trusting spec 2.2), on the exact docker-built binary. For step 33 (cmem2-1) the
-set was:
+Since step 25 (trusting spec 2.2), on the exact docker-built binary. For the shipped code (step
+36), built by the Dockerfile on the 16-vCPU test server:
+- **Seed hashes.** Full seed 1, d8088b1cd42b…, at 1, 2, 3, 5, 7, 12 and 16 CPUs (`taskset`), and
+  three repeated runs at 12 CPUs; sample seed 1, 9035fed36823….
+- **Samples and holdout.** Sample seeds 2–4 byte-identical to the reference output at 1, 3 and 12
+  CPUs; the holdout-like seed 99 at 1, 5 and 12.
+- **Earlier gate seeds.** Tiny 11–14 and sample 21–23 at 1, 3, 12 and 16 CPUs, all identical.
+- **Spec fixtures.** The WORKED fixtures give the expected output at 1 and 12 CPUs. The RULES
+  fixtures (and their 300-times repeats) abort with exit 134, as step 35's code does, never a
+  segfault; a records.csv with no records gives the same output as step 35's.
+- **Code check.** `objdump | grep -c vpinsrb` = 0. Built without the profile, `parse_run`, its
+  closure and `walk_record` are instruction for instruction step 35's, and `add` differs in one
+  immediate (the length of its panic message). The profile-guided builds are not reproducible
+  (the training threads' order varies): two builds of step 35 differ from each other by 6 lines of
+  `parse_run`, and the two builds of step 36 from them by 4–10, all of one kind (two min/max
+  store blocks placed differently).
+
+For step 33 (cmem2-1) the set was:
 - **Seed hashes.** Full seed 1, d8088b1cd42b…, at 1, 3, 7, 12 and 16 CPUs (`taskset`), and three
   repeated runs at 3 and 12 CPUs; sample seed 1, 9035fed36823….
 - **Samples.** Sample seeds 2–4 byte-identical to the reference output at 1 and 12 threads.
