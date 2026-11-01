@@ -82,6 +82,11 @@ const SUM_BITS: u32 = 40;
 /// Document ids must be below this: a thread's sum of ids is then below
 /// MAX_DOCS^2 / 2 = 2^39, which fits in SUM_BITS.
 const MAX_DOCS: u32 = 1 << 20;
+/// A first-id log entry is `answer << 16 | id`, the id's low 16 bits, so an answer
+/// is below 2^16 (the spec has 50,000 queries) and a slice holds fewer than 2^16
+/// documents: the corpus is cut into at least this many slices (run in turns on
+/// fewer threads), about 31,000 documents each at the spec's 250,000.
+const MIN_SLICES: usize = 8;
 /// How far ahead `end_doc` prefetches the state that the first entry of a
 /// trigger term's range updates, in ranges (1 and 4 measured the same).
 const RANGES_AHEAD: usize = 2;
@@ -101,7 +106,7 @@ fn main() {
     let text = &docs[..docs.len() - mmap::PAD];
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
     let (queries, mut vocab) = parse_queries(open("queries.txt"), threads);
-    let slices = slices(text, threads);
+    let slices = slices(text, threads.max(MIN_SLICES));
 
     // Sample the start of every slice for each term's document frequency.
     let df: Vec<AtomicU32> = (0..vocab.count).map(|_| AtomicU32::new(0)).collect();
@@ -137,8 +142,10 @@ fn main() {
         unsafe { mmap::release(&docs[start..end]) };
         // The ids go on in the next slice, and stay below MAX_DOCS.
         let next = slices.get(i + 1).map_or(doc + 1, |s| s.2);
-        let ok = slices[0].2 == 0 && next == doc + 1 && doc < MAX_DOCS;
-        assert!(ok, "docs.txt: ids must be 0, 1, 2, ... below 2^20");
+        // A slice's ids, and the queries, also fit the first-id log (see MIN_SLICES).
+        let fits = doc - first < 1 << 16 && plan.line_of.len() <= 1 << 16;
+        let ok = slices[0].2 == 0 && next == doc + 1 && doc < MAX_DOCS && fits;
+        assert!(ok, "ids 0, 1, ... below 2^20, 2^16 a slice; 2^16 queries");
         if i == 0 {
             let is_full = |&s: &u64| s >> SUM_BITS >= FIRST_IDS;
             full.get_or_init(|| state.iter().map(is_full).collect::<Vec<_>>());
@@ -156,9 +163,10 @@ fn main() {
         let mut at: Vec<u32> = plan.answer_of.iter().map(place).collect();
         let mut firsts = vec![0; n as usize];
         for &e in &log[..logged] {
-            let line = plan.line_of[(e >> 32) as usize] as usize;
-            if keep((e >> 32) as u32) == 1 {
-                firsts[at[line] as usize] = e as u32;
+            let line = plan.line_of[(e >> 16) as usize] as usize;
+            if keep(e >> 16) == 1 {
+                // The id: the slice's first, plus the low 16 bits of the difference.
+                firsts[at[line] as usize] = first + (e.wrapping_sub(first) & 0xFFFF);
                 at[line] += 1;
             }
         }
@@ -202,11 +210,6 @@ fn format_part(plan: &Plan, results: &[Results], p: usize, parts: usize) -> Vec<
     // About 32 output bytes per line: a capacity only.
     let (mut out, mut row) = (Vec::with_capacity(lines.len() * 32), Vec::new());
     for line in lines {
-        // The threads' states of the line 8 ahead: they are random reads.
-        let ahead = plan.answer_of.get(line + 8).map_or(0, |&a| a as usize);
-        results
-            .iter()
-            .for_each(|r| prefetch(r.state.as_ptr(), ahead));
         let answer = plan.answer_of[line] as usize;
         let s: u64 = results.iter().map(|r| r.state[answer]).sum();
         // The row: count, sum, then every thread's first ids, in slice order. Slices are
@@ -304,13 +307,15 @@ type Span = (u32, u32, bool);
 /// Splits `chunk`, whole lines of `padded` (the file and mmap::PAD zero bytes),
 /// into its lines, as in `Queries` but from 0, and their terms: each as its
 /// offset in `padded` and its length | op << 30 (in a BOOL query). Also the
-/// hashes (with `seed`) of the terms' table keys (the zero key for a long term)
-/// with their offsets and key lengths, grouped by hash & 63 (`starts`), and the
-/// long terms. (The long terms' zero key gets an id that no term uses.) The
+/// hashes (attempt `seed`'s: see SEEDS) of the terms' table keys (the zero key
+/// for a long term) with their offsets and key lengths, grouped by hash & 63
+/// (`starts`), and the long terms. (The long terms' zero key gets an id that no
+/// term uses.) The
 /// vectors are sized for the most terms a chunk can hold (a 1-byte term and its
 /// space: len / 2) and the most lines (a line is at least "BOOL a" and LF, 7
 /// bytes, under most / 3), so they never grow: their untouched pages cost nothing.
 fn split_lines(chunk: &'static [u8], padded: &'static [u8], seed: u64) -> Split {
+    let seed = seed.wrapping_mul(SEEDS);
     let most = chunk.len() / 2 + 1;
     let (mut lines, mut long) = (Vec::with_capacity(most / 3), Vec::new());
     let (mut terms, mut keys) = (Vec::with_capacity(most), Vec::with_capacity(most));
@@ -387,7 +392,8 @@ fn parse_queries(padded: &'static [u8], threads: usize) -> (Queries, Vocab) {
     // Ends with probability 1: each seed gives unrelated hashes (two keys clash
     // with probability about 2^-64), and every third seed halves the load
     // (Vocab::new), so the pilot search finds free slots. Seed 0 succeeds on
-    // the full seed-1, holdout seed-99 and sample seed 1 to 4 inputs.
+    // the full seed-1, holdout seed-99, sample seed 1 to 4 and 18 fresh full
+    // inputs; over 300 seeds on each of those 24, none needed a second seed.
     let (vocab, ids, splits) = (0..).find_map(|s| Vocab::new(split(s), s, padded)).unwrap();
     // The spec's 50,000 queries, about 155,000 terms on seed 1: capacities only.
     let (mut lines, mut terms) = (Vec::with_capacity(50_000), Vec::with_capacity(160_000));
@@ -460,8 +466,8 @@ fn key_of(file: Long, e: Key) -> u128 {
 /// Two AES rounds of the key, its low 64 bits as the hash. AESENC does
 /// ShiftRows, SubBytes and MixColumns, then XORs the round key: after two rounds
 /// every output byte depends on every key byte, non-linearly, and a different
-/// first round key (the seed) gives an unrelated hash. Three instructions, one
-/// cycle of throughput each. The round keys are digits of pi; a loop that
+/// first round key (the seed: see SEEDS) gives an unrelated hash. Three
+/// instructions, one cycle of throughput each. The round keys are digits of pi; a loop that
 /// hashes keeps them in registers.
 #[inline(always)]
 fn hash(key: __m128i, seed: u64) -> u64 {
@@ -472,6 +478,12 @@ fn hash(key: __m128i, seed: u64) -> u64 {
     // SAFETY: AES-NI and SSE2 are enabled for the whole build (checked above).
     unsafe { _mm_cvtsi128_si64(_mm_aesenc_si128(_mm_aesenc_si128(key, a), b)) as u64 }
 }
+
+/// Attempt a's hash seed is a * SEEDS (an odd constant), which changes all 8 bytes
+/// it is XORed into. (With the seed a, only bytes 0 and 1 changed, and the second
+/// AES round carries them into hash bits 0-31 alone: bits 32-63, which decide the
+/// slots a key can reach, stayed the same at every attempt.)
+const SEEDS: u64 = 0x9e37_79b9_7f4a_7c15;
 
 /// A window into it at 16 - len keeps the first len bytes of 16.
 static KEEP: [[u8; 16]; 2] = [[0xFF; 16], [0; 16]];
@@ -572,7 +584,7 @@ fn find_pilot(bucket: &[Key], mut set: impl FnMut(&Key, u64, bool) -> bool) -> O
 }
 
 impl Vocab {
-    /// The vocabulary of the query terms in `splits`, with the hash of `seed`,
+    /// The vocabulary of the query terms in `splits`, with attempt `seed`'s hash,
     /// the term words of each split with their ids, and `splits`; or None when
     /// the build needs another seed: two different keys with one hash, or a
     /// bucket that finds no pilot. Every third seed also doubles the table
@@ -608,6 +620,7 @@ impl Vocab {
         (distinct..count).for_each(|id| table[slots + id - distinct] = (id as u128) << 96);
         table[slots + long.len()] = (count as u128) << 96;
         let pilot: &[_] = Vec::leak((0..=bmask).map(|_| AtomicU16::new(0)).collect());
+        let seed = seed.wrapping_mul(SEEDS);
         let phf = Phf { seed, pilot, shift };
         // The table's address as a usize, so that the closure is Sync; each thread
         // writes only its own regions (below).
@@ -618,28 +631,37 @@ impl Vocab {
             // all free (`find_pilot`). `taken` covers this thread's regions, from
             // `base`. Thread q numbers its keys from the number of keys before
             // its groups.
-            let base = part(GROUPS, q, n).start << region;
-            let mut taken = vec![false; part(GROUPS, q, n).len() << region];
-            let mut next = groups[..q].iter().map(Vec::len).sum::<usize>() as u128;
+            let regions = part(GROUPS, q, n);
+            let (base, len) = (regions.start << region, regions.len() << region);
+            let first = groups[..q].iter().map(Vec::len).sum::<usize>() as u128;
             let same_bucket = |a: &Key, b: &Key| (a.hash ^ b.hash) & bmask == 0;
             let mut order: Vec<_> = groups[q].chunk_by(same_bucket).collect();
             order.sort_unstable_by_key(|b| Reverse(b.len()));
             let slot = |e: &Key, pilot| place(e.hash, pilot, shift) - base;
-            let mut set = |e: &Key, pilot, v| replace(&mut taken[slot(e, pilot)], v);
-            let placed = order.iter().all(|bucket| {
-                let fits = find_pilot(bucket, &mut set);
-                let Some(pilot) = fits else { return false };
-                phf.pilot[(bucket[0].hash & bmask) as usize].store(pilot as u16, Relaxed);
-                for e in *bucket {
-                    let value = key_of(file, *e) | next << 96;
-                    // SAFETY: set() indexed taken[slot] with a bounds check above,
-                    // and taken covers exactly this thread's regions of the table,
-                    // which no other thread writes: base + slot(e, pilot) =
-                    // place(..) < slots < table.len().
-                    unsafe { *table.add(base + slot(e, pilot)) = value };
-                    next += 1;
-                }
-                true
+            // A key can reach few slots (find_pilot's candidates move it by one
+            // fixed step each), which may all be taken: its bucket then goes first
+            // in another attempt. (A failed attempt's keys left in the table are
+            // harmless: a token only looks up the final slot of its own term.)
+            let placed = (0..4).any(|_| {
+                let (mut taken, mut next) = (vec![false; len], first);
+                let mut set = |e: &Key, pilot, v| replace(&mut taken[slot(e, pilot)], v);
+                let failed = order.iter().position(|bucket| {
+                    let Some(pilot) = find_pilot(bucket, &mut set) else {
+                        return true;
+                    };
+                    phf.pilot[(bucket[0].hash & bmask) as usize].store(pilot as u16, Relaxed);
+                    for e in *bucket {
+                        let value = key_of(file, *e) | next << 96;
+                        // SAFETY: set() indexed taken[slot] with a bounds check above,
+                        // and taken covers exactly this thread's regions of the table,
+                        // which no other thread writes: base + slot(e, pilot) =
+                        // place(..) < slots < table.len().
+                        unsafe { *table.add(base + slot(e, pilot)) = value };
+                        next += 1;
+                    }
+                    false
+                });
+                failed.inspect(|&i| order[..=i].rotate_right(1)).is_none()
             });
             // The ids need every thread's pilots and slots.
             barrier.wait();
@@ -1387,9 +1409,10 @@ fn written_zeros(len: usize) -> Vec<u64> {
 struct Answers {
     /// Per answer: count << SUM_BITS | sum of the matching ids.
     state: Vec<u64>,
-    /// `answer << 32 | id` for the first FIRST_IDS matches of each answer, in
-    /// `log[..logged]`. Its zero pages cost no memory until they are written.
-    log: Vec<u64>,
+    /// `answer << 16 | id & 0xFFFF` for the first FIRST_IDS matches of each answer
+    /// (see MIN_SLICES), in `log[..logged]`. Its zero pages cost no memory until
+    /// they are written.
+    log: Vec<u32>,
     logged: usize,
 }
 
@@ -1405,7 +1428,7 @@ impl Answers {
         let s = unsafe { &mut *self.state.as_mut_ptr().add(answer as usize) };
         let log = self.log.as_mut_ptr();
         let count = *s >> SUM_BITS;
-        let entry = |bits: u64| (answer as u64) << 32 | (base + bits.trailing_zeros()) as u64;
+        let entry = |bits: u64| answer << 16 | (base + bits.trailing_zeros()) & 0xFFFF;
         // The first id without a branch: always written, kept only if wanted.
         // SAFETY: as above.
         unsafe { *log.add(self.logged) = entry(hits) };
@@ -1435,7 +1458,7 @@ impl Answers {
         // SAFETY: as in `add`.
         unsafe {
             let s = &mut *self.state.as_mut_ptr().add(answer as usize);
-            *self.log.as_mut_ptr().add(self.logged) = (answer as u64) << 32 | doc as u64;
+            *self.log.as_mut_ptr().add(self.logged) = answer << 16 | doc & 0xFFFF;
             self.logged += (hit != 0 && *s >> SUM_BITS < FIRST_IDS) as usize;
             *s += hit as u64 * (1 << SUM_BITS | doc as u64);
         }
