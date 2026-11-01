@@ -8,8 +8,8 @@
 //! 2. A BOOL query is evaluated when a document ends, from a truth table over
 //!    the presence of its terms in the document, made when the queries are
 //!    planned: AND, OR and NOT, strictly left to right, are then one table
-//!    lookup. Each term keeps a one-byte stamp of its last document (see
-//!    STAMPS), so presence is one compare.
+//!    lookup, done for 8 entries at once in AVX2 (`trigger`). Each term keeps a
+//!    one-byte stamp of its last document (see STAMPS), so presence is one compare.
 //! 3. A query is evaluated only in documents that contain one of its cover
 //!    terms, a set of terms every match contains (see `cover`), chosen to be rare
 //!    from the sample. Queries with common covers are evaluated in every
@@ -47,7 +47,8 @@ const ID: u32 = TRIG - 1;
 /// A document's stamp is its id modulo STAMPS, and each term keeps the stamp of
 /// its last document (`Scan::lastdoc`): one byte per term, a quarter of a u32.
 /// The bytes are reset to EMPTY every STAMPS documents, so an equal stamp is
-/// always this document's. DONE marks a trigger term that `end_doc` has taken.
+/// always this document's. DONE marks a trigger term whose entries `trigger` has
+/// already listed for this document.
 const STAMPS: u32 = 127;
 const EMPTY: u8 = 0xFF;
 const DONE: u8 = 0x80;
@@ -240,7 +241,8 @@ fn format_part<'a>(plan: &Plan, results: &'a [Results], p: usize, parts: usize) 
 /// made by the first call (parts beyond it run on this thread). Between calls the
 /// workers wait (`wait`): a call spawns no thread, each worker keeps its heap
 /// arena, and its CPU stays out of the deep idle states that take up to 1 ms to
-/// wake from.
+/// wake from. A panic in a job aborts the process (panic = "abort" in Cargo.toml),
+/// so no call waits on a worker that died.
 fn par<T: Send + Sync>(n: usize, f: &(impl Fn(usize) -> T + Sync)) -> Vec<T> {
     // One call at a time: the job slot and the counters below serve one job, so an
     // overlapping call (from another thread, or from a job) would mix two jobs' counts
@@ -354,10 +356,10 @@ type Span = (u32, u32, bool);
 /// hashes (attempt `seed`'s: see SEEDS) of the terms' table keys (the zero key
 /// for a long term) with their offsets and key lengths, grouped by hash & 63
 /// (`starts`), and the long terms. (The long terms' zero key gets an id that no
-/// term uses.) The
-/// vectors are sized for the most terms a chunk can hold (a 1-byte term and its
-/// space: len / 2) and the most lines (a line is at least "BOOL a" and LF, 7
-/// bytes, under most / 3), so they never grow: their untouched pages cost nothing.
+/// term uses.) The vectors are sized for the most terms a chunk can hold (a
+/// 1-byte term and its space: len / 2) and the most lines (a line is at least
+/// "BOOL a" and LF, 7 bytes, under most / 3), so they never grow: their untouched
+/// pages cost nothing.
 fn split_lines(chunk: &'static [u8], padded: &'static [u8], seed: u64) -> Split {
     let seed = seed.wrapping_mul(SEEDS);
     let most = chunk.len() / 2 + 1;
@@ -784,8 +786,10 @@ struct Entry {
 /// query's other distinct terms, padded with a term no document has, and its
 /// truth table over their presence (c being present). The table is zero where
 /// a cover term before c is present: that term's entry counts the document.
-/// Seven u32 words in this order, in 32 bytes (repr(C)): `trigger` gathers them.
-/// The eighth, in what would be padding, is c: Plan::new groups the entries by it.
+/// Eight u32 words in this order, 32 bytes (repr(C, align(32))): `trigger` gathers
+/// word 8i + k of the entries as word k of entry i (the truth table is word 5), so
+/// this layout is part of its bounds argument; 32 bytes also keep each entry in one
+/// cache line. The eighth word, c, is what Plan::new groups the entries by.
 #[derive(Clone, Copy, Default)]
 #[repr(C, align(32))]
 struct DocEntry {
@@ -847,7 +851,8 @@ struct Phrase {
 /// What the scan does with each query, decided from the sample.
 #[derive(Default)]
 struct Plan {
-    /// BOOL entries triggered by term t: `entries[group[t]..group[t + 1]]`.
+    /// BOOL entries triggered by term t: `entries[group[t]..group[t + 1]]`; then 8
+    /// padding entries that never match (truth 0), for `trigger`'s spare lanes.
     group: Vec<u32>,
     entries: Vec<DocEntry>,
     /// BOOL entries evaluated in every superblock, on rows of `Scan::wide`.
@@ -1381,11 +1386,12 @@ impl<'a> Scan<'a> {
         let (evals, hits) = (self.evals.as_mut_ptr(), self.hits.as_mut_ptr());
         let (group, lastdoc) = (plan.group.as_ptr(), self.lastdoc.as_mut_ptr());
         let mut n = 0;
-        // SAFETY: trigger terms are below bool_terms, and group has bool_terms + 2
-        // entries. Fresh terms are distinct, so their ranges are disjoint, and n
-        // stays at most the number of real entries, entries.len() - 8: a store of
-        // 8 indices from n + j (j < the range's length; 0 for a repeat) ends inside
-        // evals, which is as long as the entries. AVX2 is enabled for the build.
+        // SAFETY: trigger terms are below bool_terms <= count, so t indexes lastdoc
+        // (count + 5 bytes), and group has bool_terms + 2 entries. Fresh terms are
+        // distinct, so their ranges are disjoint, and n stays at most the number of
+        // real entries, entries.len() - 8: a store of 8 indices from n + j (j < the
+        // range's length; 0 for a repeat) ends inside evals, which is as long as the
+        // entries. AVX2 is enabled for the build.
         unsafe {
             let lane = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
             for t in self.trig.iter().map(|&info| (info & ID) as usize) {
@@ -1415,12 +1421,15 @@ impl<'a> Scan<'a> {
         let mut nh = 0;
         for b in (0..n).step_by(8) {
             // SAFETY: AVX2 and BMI2 are enabled for the whole build. evals[b..b + 8]
-            // (b < n) were written above, with indices below entries.len() (a range's
-            // spare ones are at most 7 past it, among the padding), so the words 8i
-            // to 8i + 5 gathered are inside entries. Entry terms are below count + 2,
-            // and lastdoc has 3 bytes more, so the 4 bytes gathered from each stamp
-            // are inside it. nh <= b < n, so the 8 lanes stored at hits[nh..] are
-            // inside hits, as long as evals.
+            // (b < n) were written above: lanes below n by the ranges' stores (a
+            // store's spare lanes are overwritten by the next), the rest by the
+            // padding store, so every index i is below entries.len(). The words 8i to
+            // 8i + 5 gathered are inside entries (32 bytes each, see DocEntry), and
+            // 8i + 5 fits the gathers' signed 32-bit offsets (at most 6 entries per
+            // query, so below 2^28 for any queries.txt under 300 MB). Entry terms are
+            // below count + 2, and lastdoc has 3 bytes more, so the 4 bytes gathered
+            // from each stamp are inside it. nh <= b < n, so the 8 lanes stored at
+            // hits[nh..] are inside hits, as long as evals.
             unsafe {
                 let idx = _mm256_loadu_si256(evals.add(b).cast());
                 let word = |k| _mm256_add_epi32(_mm256_slli_epi32::<3>(idx), _mm256_set1_epi32(k));
