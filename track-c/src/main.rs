@@ -95,10 +95,7 @@ unsafe extern "C" {
 
 /// Errors (a missing file, input outside spec 2.2) are panics: the build aborts on
 /// panic, so the message is printed and the exit status is nonzero.
-/// PROBE: elapsed time since main, in 0.1 ms units, as the exit code (input > 100 MB only).
-static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 fn main() {
-    START.set(std::time::Instant::now()).unwrap();
     // SAFETY: plain libc calls; failure only keeps the defaults.
     // - M_TOP_PAD (-2), 32 MB: a worker thread's first allocations get their own
     //   heap, which otherwise grows a few pages per mprotect, and each mprotect
@@ -315,9 +312,6 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
         *done += 1;
         if *done == threads {
             write_output(out_dir, sums, &keys.lock().unwrap());
-            if text.len() > 100 << 20 {
-                std::process::exit((START.get().unwrap().elapsed().as_micros() / 100).min(255) as i32);
-            }
             std::process::exit(0);
         }
     };
