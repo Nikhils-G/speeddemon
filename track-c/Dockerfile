@@ -5,6 +5,9 @@ COPY . .
 # makes training data (there is no /data at build time), an instrumented build runs
 # on it, and the final build is laid out by the recorded profile. Build time is not
 # scored. target-cpu=native makes the board build this track on the scoring box.
+# The profile counters are atomic because the training run is threaded (plain
+# counters lose increments); -align-loops=64 makes the hot loops' layout depend
+# less on unrelated code (PERF.md, step 32).
 RUN python3 c_join.py --seed 7 --scale sample --out /tmp/train > /dev/null \
  && RUSTFLAGS="-C target-cpu=native -C target-feature=+crt-static -C profile-generate=/tmp/pgo -C llvm-args=-instrprof-atomic-counter-update-all" cargo build --release --offline \
  && mkdir /tmp/out && target/release/solution /tmp/train /tmp/out \

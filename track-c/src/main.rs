@@ -4,7 +4,8 @@
 //! The parser relies on spec section 2.2 (what the generator writes, for every seed
 //! and scale), not only on the general grammar of 2.1, and does not check all of it.
 //! Input that breaks 2.2 and moves a record boundary (tested: a lone quote, a lost
-//! LF) stops the process with a nonzero exit: an assert, or an index out of bounds.
+//! LF) nearly always stops the process with a nonzero exit (a tripwire, not a
+//! proof): an assert, or an index out of bounds.
 //! A record that breaks 2.2 but keeps its LF in place is answered as parsed, with
 //! exit 0, where the reference may give another answer or reject the file (tested: a
 //! wrong field count, a quoted id or region id, a stray CR or BOM, a second dot, a
@@ -24,10 +25,11 @@
 //!    "inside quotes" mask. What is left are exactly the field separators, and
 //!    counting quote bits gives each text field's unescaped length (each `""` is
 //!    one byte) without looking at its bytes. The common record takes one such
-//!    window of 64 bytes at its start, one 32-byte compare for the region's comma
-//!    and the amount's dot, and one AVX2 pass that converts its three numbers. A
-//!    record whose name or note runs past the windows, or one near the end of the
-//!    file, goes to a byte-by-byte walker.
+//!    window of 64 bytes at its start, one 32-byte load after the note whose
+//!    compares give the region's comma, the amount's dot and the terminator's LF,
+//!    and one AVX2 pass that converts its three numbers. A record whose name is
+//!    longer than 32 bytes or whose note runs past the windows, or one near the end
+//!    of the file, goes to a byte-by-byte walker.
 //! 4. Distinct names per country. A name's identity is its raw bytes inside the
 //!    quotes: there, `""` maps one to one to the unescaped value, and the empty name
 //!    is empty whether quoted or not. Parsing hashes those bytes and files a
@@ -65,7 +67,8 @@ const GROUPS: usize = 256;
 /// 240 countries), so word 3's bits 49..64 hold 15 more bits of the name's hash.
 const WORDS: usize = GROUPS / 64;
 /// Entries of the join table, one per region id: listed ids are below 1,000,000
-/// (spec 2.3), and every id above them reads the last entry, which no listed id sets.
+/// (spec 2.3), and every id past the table is clamped to its last entry, which no
+/// listed id sets (`fill` panics on a listed id that large).
 const REGION_IDS: usize = 1 << 20;
 /// regions.csv is entered in this many parts, which threads claim as they start,
 /// so the ones that start first do more of it.
@@ -183,9 +186,10 @@ fn wait(count: &AtomicUsize, n: usize) {
     }
 }
 
-/// Errors (a missing file, input outside spec 2.2) are panics: the build aborts on
-/// panic, so the message is printed and the exit status is nonzero. (For the same
-/// reason no lock is ever poisoned: `lock().unwrap()` cannot fail.)
+/// Errors (a missing file, input that trips one of the checks named at the top of
+/// the file) are panics: the build aborts on panic, so the message is printed and
+/// the exit status is nonzero. (For the same reason no lock is ever poisoned:
+/// `lock().unwrap()` cannot fail.)
 fn main() {
     // M_TOP_PAD, 32 MB: a worker thread's first allocations get their own heap, which
     // otherwise grows a few pages per mprotect, and each mprotect stalls every other
@@ -202,6 +206,54 @@ fn main() {
     run(&dir(1, "/data"), &dir(2, "/out"))
 }
 
+/// What the worker threads share: the input and the sizes `run` derives from it,
+/// the join table, the claim counters, each thread's name table and inbox, the pool
+/// of emptied buffers and the sums. (`parse_run` takes the join table by itself, not
+/// through this struct: see its doc.)
+struct Shared<'a> {
+    /// records.csv, and where its first record starts, past the header.
+    text: &'a [u8],
+    body_start: usize,
+    /// regions.csv, past its header.
+    lines: &'a [u8],
+    out_dir: &'a str,
+    threads: usize,
+    /// The runs records.csv is cut into (`RUNS_PER_THREAD` per thread).
+    runs: usize,
+    /// The key slots of each name table, and the pairs a buffer has room for.
+    slots: usize,
+    capacity: usize,
+    /// The join table, dense by region id: the group, or 0 (`_UNMATCHED`) for ids it
+    /// does not contain.
+    group_of: &'a [AtomicU8; REGION_IDS],
+    /// By country code index (26^3 of them): its group, or 0 while not seen; and the
+    /// group keys in group order (see `fill`): `_UNMATCHED`, then the country codes.
+    codes: [AtomicU8; 26 * 26 * 26],
+    countries: Mutex<Vec<Vec<u8>>>,
+    /// regions.csv chunks claimed and entered, runs claimed, threads done filing
+    /// pairs, and threads that have added their totals.
+    next_chunk: AtomicUsize,
+    chunks_done: AtomicUsize,
+    next_run: AtomicUsize,
+    flushed: AtomicUsize,
+    merged: AtomicUsize,
+    /// The CPUs the threads found themselves on after regions.csv, a bit each, and
+    /// the ones they may use (CPUs 0 to 63; none if there are more, or the call fails).
+    on: AtomicU64,
+    allowed: u64,
+    /// Each thread's table (its partition), and its inbox: buffers of pairs filed
+    /// under it that it has not taken yet. Buffers are handed over, not copied
+    /// (copying them: +1.2 ms). Emptied buffers go to one pool that every filer draws
+    /// from (with a pool per owner, buffers sat idle in one while a filer made new
+    /// ones for another: 0.3 MB more, up to 2 MB when a thread fell behind).
+    tables: Vec<Mutex<Table>>,
+    inboxes: Vec<Mutex<Vec<Vec<u64>>>>,
+    empties: Mutex<Vec<Vec<u64>>>,
+    /// The threads' totals, summed as each one finishes (kept one per thread, with
+    /// the Vec's regrowth: 0.2 MB more).
+    sums: Mutex<[Totals; GROUPS]>,
+}
+
 /// Builds the join table from regions.csv, then parses and aggregates every run,
 /// and writes the output. One set of threads does all of it, this one included, as
 /// worker 0, which writes the output and exits the process.
@@ -215,10 +267,11 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
     let threads = thread::available_parallelism().map_or(1, |n| n.get());
     // Names are split by their top hash bits into one partition per thread, which
     // takes their pairs, so that its table stays in its cache (4 smaller ones per
-    // thread: +0.8 ms on the server). The generator's pool has 100,000 names (and 4
-    // more per block of edge cases). A table may fill to 5/8: room for its share (at
-    // least one name, so at least 16 slots), plus 8 standard deviations, a power of
-    // two. More names than that is an error.
+    // thread: 0.5 ms slower a parse pass on the box, PERF.md steps 43-46). The
+    // generator's pool has 100,000 names (and 4 more per block of edge cases). A
+    // table may fill to 5/8: room for its share (at least one name, so at least 16
+    // slots), plus 8 standard deviations, a power of two. More names than that is an
+    // error.
     let names = (101_000 / threads).max(1);
     let slots = ((names + 8 * names.isqrt()) * 8 / 5).next_power_of_two();
     // Pairs per partition in one run (records are about 60 bytes), and 2 standard
@@ -227,160 +280,180 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
     let runs = threads * RUNS_PER_THREAD;
     let mean = text.len() / (runs * 60 * threads);
     let capacity = mean + 2 * mean.isqrt() + 4;
-    // The next of `n` items from a shared counter, or None once all are claimed.
-    let claim = |next: &AtomicUsize, n: usize| Some(next.fetch_add(1, Relaxed)).filter(|&k| k < n);
-    // The join table, dense by region id: the group, or 0 (`_UNMATCHED`) for ids it
-    // does not contain. Zeroed by calloc, so the pages fault in on the threads that
+    // The join table: zeroed by calloc, so the pages fault in on the threads that
     // fill them (an id's page only if a listed id is on it).
     // SAFETY: all zero bits are a valid AtomicU8 (0).
     let group_of: Box<[AtomicU8; REGION_IDS]> = unsafe { Box::new_zeroed().assume_init() };
-    // The entries a listed id may have: one at or past the last is outside spec 2.3,
-    // and its index panics in `fill`.
-    let listed = &group_of[..REGION_IDS - 1];
-    // By country code index (26^3 of them): its group, or 0 while not seen; and the
-    // group keys in group order (see `fill`): `_UNMATCHED`, then the country codes.
-    let codes = [const { AtomicU8::new(0) }; 26 * 26 * 26];
-    let countries = Mutex::new(vec![b"_UNMATCHED".to_vec()]);
-    // regions.csv chunks claimed and entered, runs claimed, threads done filing pairs.
-    let [next_chunk, chunks_done, next_run, flushed]: [AtomicUsize; 4] = Default::default();
-    // The CPUs the threads found themselves on after regions.csv, a bit each, and the
-    // ones they may use (CPUs 0 to 63; none if there are more, or the call fails).
-    let (on, mut allowed) = (AtomicU64::new(0), 0);
+    let mut allowed = 0;
     // SAFETY: a system call that writes the 8 bytes of `allowed`.
     unsafe { sched_getaffinity(0, 8, &mut allowed) };
-    // Each thread's table (its partition), and its inbox: buffers of pairs filed
-    // under it that it has not taken yet. Buffers are handed over, not copied (copying
-    // them: +1.2 ms). Emptied buffers go to one pool that every filer draws from
-    // (with a pool per owner, buffers sat idle in one while a filer made new ones
-    // for another: 0.3 MB more, up to 2 MB when a thread fell behind).
-    let tables: Vec<Mutex<Table>> = (0..threads).map(|_| Default::default()).collect();
-    let inboxes: Vec<Mutex<Vec<Vec<u64>>>> = (0..threads).map(|_| Default::default()).collect();
-    let empties = Mutex::new(Vec::new());
-    // The threads' totals, summed as each one finishes (kept one per thread, with
-    // the Vec's regrowth: 0.2 MB more), and how many have added theirs.
-    let (sums, merged) = (Mutex::new([EMPTY; GROUPS]), AtomicUsize::new(0));
-    let worker = &|w: usize| {
-        let mut totals = [EMPTY; GROUPS];
-        // This thread's table and pair buffers: made here, so they are in its cache.
-        // Room for a row of WORDS words per name the table can hold (5/8 of its slots).
-        *tables[w].lock().unwrap() = (vec![0; slots], Vec::with_capacity(slots / 8 * 5 * WORDS));
-        let mut pairs: Vec<_> = (0..threads).map(|_| Vec::with_capacity(capacity)).collect();
-        // Thread t's table takes the pairs in its inbox, and gives the buffers back
-        // empty: unless another thread holds the table, or its thread has not made it
-        // yet (it has not started).
-        let (mut taken, mut spare) = (Vec::new(), Vec::new());
-        let mut take = |t: usize, totals: &mut _| {
-            // table.0: its keys, empty until its thread makes the table.
-            if let Ok(mut table) = tables[t].try_lock()
-                && !table.0.is_empty()
-            {
-                std::mem::swap(&mut taken, &mut inboxes[t].lock().unwrap());
-                for buffer in taken.iter_mut() {
-                    // SAFETY: every table is made above (its slots a power of two, at
-                    // least 16) and changed by nothing but `add`.
-                    unsafe { add(&mut table, buffer, totals) };
-                    buffer.clear();
-                }
-                // A buffer that grew (the empty name's partition overflows) is dropped,
-                // so that the shared pool's buffers stay small.
-                taken.retain(|buffer| buffer.capacity() == capacity);
-                empties.lock().unwrap().append(&mut taken);
-            }
-        };
-        // regions.csv first, in REGION_CHUNKS equal parts. Every LF in it is followed
-        // by a digit or the end, so `run_start` cuts it into whole lines.
-        while let Some(k) = claim(&next_chunk, REGION_CHUNKS) {
-            let cut = |k| run_start(lines, 0, k, REGION_CHUNKS);
-            fill(&lines[cut(k)..cut(k + 1)], listed, &codes, &countries);
-            chunks_done.fetch_add(1, Release);
-        }
-        wait(&chunks_done, REGION_CHUNKS);
-        move_off_shared_cpu(&on, allowed);
-        // Runs are claimed one at a time, so a thread slowed down parses fewer of
-        // them, and no thread waits for another one until the end.
-        while let Some(nth) = claim(&next_run, runs) {
-            // Claims go round the file's `threads` stripes, so that runs claimed at
-            // the same time lie a stripe apart and rarely share a page-table page
-            // (whose lock their page faults and releases contended on: -0.5 ms).
-            let run_index = nth % threads * RUNS_PER_THREAD + nth / threads;
-            // Each thread finds its own cuts, so their pages fault in in parallel.
-            let cut = |k| run_start(text, body_start, k, runs);
-            let span = (cut(run_index), cut(run_index + 1));
-            parse_run(text, span, &group_of, &mut totals, &mut pairs);
-            // Empty buffers for the next run's pairs, all at once.
-            let mut pool = empties.lock().unwrap();
-            let n = pool.len().saturating_sub(threads);
-            spare.extend(pool.drain(n..));
-            drop(pool);
-            for (t, buffer) in pairs.iter_mut().enumerate() {
-                let fresh = spare.pop().unwrap_or_else(|| Vec::with_capacity(capacity));
-                let mut inbox = inboxes[t].lock().unwrap();
-                inbox.push(std::mem::replace(buffer, fresh));
-                // A thread that falls behind (it lost its core) would let its inbox,
-                // and the memory peak, grow: past a bound, the filer takes it over.
-                // (Normally an inbox holds a few buffers.) If the owner holds its table
-                // but lost its core to this thread (two threads on one CPU, in about 2%
-                // of runs), yielding gives the core back. Replica, 200 runs: memory
-                // peaks up to 12.0 MB without the yield, 10.9 MB with it.
-                if inbox.len() > 4 * threads {
-                    drop(inbox);
-                    take(t, &mut totals);
-                    thread::yield_now();
-                }
-            }
-            // This thread's table, unless another thread holds it.
-            take(w, &mut totals);
-        }
-        // Once no thread files pairs any more, every thread's table takes its inbox,
-        // this thread's first. A table that another thread holds is being emptied by
-        // it, which ends before that thread counts itself done below.
-        flushed.fetch_add(1, Release);
-        wait(&flushed, threads);
-        // No thread reads the input any more. Its pages are dropped in two parts, each
-        // thread's slice in one call: the first two thirds now, the last third (below)
-        // while thread 0 writes the output. (Replica, against all of it now, 201 pairs
-        // over 3 x 3 builds: -0.26% to -0.60%, mean -0.45%; in single-build probes, a
-        // half, three fifths and three quarters gained less than two thirds. Each 8
-        // runs' pages as they were parsed: 96 calls, each a round of TLB-shootdown
-        // interrupts to every other thread.)
-        // The k-th of `of` equal parts of 0..n.
-        let part = |n: usize, k: usize, of: usize| n * k / of..n * (k + 1) / of;
-        let early = body_start + (text.len() - body_start) * 2 / 3;
-        // SAFETY: `text` is `map`'s: a private mapping that is never written.
-        unsafe { drop_pages(&text[body_start..early][part(early - body_start, w, threads)]) };
-        (0..threads).for_each(|t| take((w + t) % threads, &mut totals));
-        merge(&mut sums.lock().unwrap(), &totals);
-        merged.fetch_add(1, Release);
-        wait(&merged, threads);
-        // Once every thread has added its totals, only the output is read again. This
-        // thread 0, the main one, writes it and exits, without dropping anything. The
-        // others meanwhile drop their table's pages and their share of the join
-        // table's, of regions.csv's and of the input's last third, which exit would
-        // otherwise free one by one on one core, and end. (Replica: their tables, the
-        // join table and regions.csv: -0.45% to -0.94% over 3 builds; the join table's
-        // slices dropped before the takes instead: +0.3%.)
-        if w == 0 {
-            write_output(out_dir, &sums.lock().unwrap(), &countries.lock().unwrap());
-            std::process::exit(0);
-        }
-        let (keys, rows) = &*tables[w].lock().unwrap();
-        // This thread's share of 0..n, one of threads - 1.
-        let share = |n| part(n, w - 1, threads - 1);
-        // SAFETY: no thread reads the tables, the join table or regions.csv again
-        // (above), and the input is `map`'s.
-        unsafe { drop_pages(&keys[..]) };
-        unsafe { drop_pages(&rows[..]) };
-        unsafe { drop_pages(&group_of[share(REGION_IDS)]) };
-        unsafe { drop_pages(&lines[share(lines.len())]) };
-        unsafe { drop_pages(&text[early..][share(text.len() - early)]) };
+    let shared = Shared {
+        text,
+        body_start,
+        lines,
+        out_dir,
+        threads,
+        runs,
+        slots,
+        capacity,
+        group_of: &group_of,
+        codes: [const { AtomicU8::new(0) }; 26 * 26 * 26],
+        countries: Mutex::new(vec![b"_UNMATCHED".to_vec()]),
+        next_chunk: AtomicUsize::new(0),
+        chunks_done: AtomicUsize::new(0),
+        next_run: AtomicUsize::new(0),
+        flushed: AtomicUsize::new(0),
+        merged: AtomicUsize::new(0),
+        on: AtomicU64::new(0),
+        allowed,
+        tables: (0..threads).map(|_| Default::default()).collect(),
+        inboxes: (0..threads).map(|_| Default::default()).collect(),
+        empties: Mutex::new(Vec::new()),
+        sums: Mutex::new([EMPTY; GROUPS]),
     };
-    thread::scope(|s| {
+    let s = &shared;
+    thread::scope(|scope| {
         // The handles are not needed: worker 0, on this thread, writes the output and
         // exits the process, so the scope never ends.
-        (1..threads).for_each(|w| drop(s.spawn(move || worker(w))));
-        worker(0);
+        (1..threads).for_each(|w| drop(scope.spawn(move || worker(s, w))));
+        worker(s, 0);
     });
     unreachable!("worker 0 exits the process")
+}
+
+/// Worker `w`: its name table, its share of regions.csv, then runs claimed one at a
+/// time, each one's pairs handed to the threads that own their partitions; then
+/// `finish`.
+fn worker(s: &Shared, w: usize) {
+    let (text, body_start, lines, threads) = (s.text, s.body_start, s.lines, s.threads);
+    let (runs, slots, capacity) = (s.runs, s.slots, s.capacity);
+    // The next of `n` items from a shared counter, or None once all are claimed.
+    let claim = |next: &AtomicUsize, n: usize| Some(next.fetch_add(1, Relaxed)).filter(|&k| k < n);
+    let mut totals = [EMPTY; GROUPS];
+    // This thread's table and pair buffers: made here, so they are in its cache.
+    // Room for a row of WORDS words per name the table can hold (5/8 of its slots).
+    *s.tables[w].lock().unwrap() = (vec![0; slots], Vec::with_capacity(slots / 8 * 5 * WORDS));
+    let mut pairs: Vec<_> = (0..threads).map(|_| Vec::with_capacity(capacity)).collect();
+    // Buffers taken from an inbox (see `take`), and empty ones for the next run.
+    let (mut taken, mut spare) = (Vec::new(), Vec::new());
+    // regions.csv first, in REGION_CHUNKS equal parts. Every LF in it is followed
+    // by a digit or the end, so `run_start` cuts it into whole lines. The entries a
+    // listed id may have: one at or past the last is outside spec 2.3, and its index
+    // panics in `fill`.
+    let listed = &s.group_of[..REGION_IDS - 1];
+    while let Some(k) = claim(&s.next_chunk, REGION_CHUNKS) {
+        let cut = |k| run_start(lines, 0, k, REGION_CHUNKS);
+        fill(&lines[cut(k)..cut(k + 1)], listed, &s.codes, &s.countries);
+        s.chunks_done.fetch_add(1, Release);
+    }
+    wait(&s.chunks_done, REGION_CHUNKS);
+    move_off_shared_cpu(&s.on, s.allowed);
+    // Runs are claimed one at a time, so a thread slowed down parses fewer of
+    // them, and no thread waits for another one until the end.
+    while let Some(nth) = claim(&s.next_run, runs) {
+        // Claims go round the file's `threads` stripes, so that runs claimed at
+        // the same time lie a stripe apart and rarely share a page-table page
+        // (whose lock their page faults and releases contended on: -0.5 ms).
+        let run_index = nth % threads * RUNS_PER_THREAD + nth / threads;
+        // Each thread finds its own cuts, so their pages fault in in parallel.
+        let cut = |k| run_start(text, body_start, k, runs);
+        let span = (cut(run_index), cut(run_index + 1));
+        parse_run(text, span, s.group_of, &mut totals, &mut pairs);
+        // Empty buffers for the next run's pairs, all at once.
+        let mut pool = s.empties.lock().unwrap();
+        let n = pool.len().saturating_sub(threads);
+        spare.extend(pool.drain(n..));
+        drop(pool);
+        for (t, buffer) in pairs.iter_mut().enumerate() {
+            let fresh = spare.pop().unwrap_or_else(|| Vec::with_capacity(capacity));
+            let mut inbox = s.inboxes[t].lock().unwrap();
+            inbox.push(std::mem::replace(buffer, fresh));
+            // A thread that falls behind (it lost its core) would let its inbox,
+            // and the memory peak, grow: past a bound, the filer takes it over.
+            // (Normally an inbox holds a few buffers.) If the owner holds its table
+            // but lost its core to this thread (two threads on one CPU, in about 2%
+            // of runs), yielding gives the core back. Replica, 200 runs: memory
+            // peaks up to 12.0 MB without the yield, 10.9 MB with it.
+            if inbox.len() > 4 * threads {
+                drop(inbox);
+                take(s, t, &mut taken, &mut totals);
+                thread::yield_now();
+            }
+        }
+        // This thread's table, unless another thread holds it.
+        take(s, w, &mut taken, &mut totals);
+    }
+    finish(s, w, &mut taken, &mut totals)
+}
+
+/// Thread t's table takes the pairs in its inbox, and gives the buffers back empty:
+/// unless another thread holds the table, or its thread has not made it yet (it has
+/// not started). `taken` holds them meanwhile, so that its room is reused.
+fn take(s: &Shared, t: usize, taken: &mut Vec<Vec<u64>>, totals: &mut [Totals; GROUPS]) {
+    // table.0: its keys, empty until its thread makes the table.
+    if let Ok(mut table) = s.tables[t].try_lock()
+        && !table.0.is_empty()
+    {
+        std::mem::swap(taken, &mut s.inboxes[t].lock().unwrap());
+        for buffer in taken.iter_mut() {
+            // SAFETY: every table is made by `worker` (its slots a power of two, at
+            // least 16) and changed by nothing but `add`.
+            unsafe { add(&mut table, buffer, totals) };
+            buffer.clear();
+        }
+        // A buffer that grew (the empty name's partition overflows) is dropped,
+        // so that the shared pool's buffers stay small.
+        taken.retain(|buffer| buffer.capacity() == s.capacity);
+        s.empties.lock().unwrap().append(taken);
+    }
+}
+
+/// Worker `w` after its last run: once no thread files pairs any more, every table
+/// takes its inbox and every thread adds its totals to the sums; then thread 0
+/// writes the output and exits, while the others drop pages that exit would
+/// otherwise free one by one on one core, and end.
+fn finish(s: &Shared, w: usize, taken: &mut Vec<Vec<u64>>, totals: &mut [Totals; GROUPS]) {
+    let (text, body_start, lines, threads) = (s.text, s.body_start, s.lines, s.threads);
+    // Every thread's table takes its inbox (below), this thread's first. A table that
+    // another thread holds is being emptied by it, which ends before that thread
+    // counts itself done below.
+    s.flushed.fetch_add(1, Release);
+    wait(&s.flushed, threads);
+    // No thread reads the input any more. Its pages are dropped in two parts, each
+    // thread's slice in one call (every call is a round of TLB-shootdown interrupts
+    // to every other thread): the first two thirds now, and the last third (below)
+    // while thread 0 writes the output, when the other threads would idle. (The
+    // measured split points: PERF.md, step 52.)
+    // The k-th of `of` equal parts of 0..n.
+    let part = |n: usize, k: usize, of: usize| n * k / of..n * (k + 1) / of;
+    let early = body_start + (text.len() - body_start) * 2 / 3;
+    // SAFETY: `text` is `map`'s: a private mapping that is never written.
+    unsafe { drop_pages(&text[body_start..early][part(early - body_start, w, threads)]) };
+    (0..threads).for_each(|t| take(s, (w + t) % threads, taken, totals));
+    merge(&mut s.sums.lock().unwrap(), totals);
+    s.merged.fetch_add(1, Release);
+    wait(&s.merged, threads);
+    // Once every thread has added its totals, only the output is read again. This
+    // thread 0, the main one, writes it and exits, without dropping anything. The
+    // others meanwhile drop their table's pages and their share of the join
+    // table's, of regions.csv's and of the input's last third, which exit would
+    // otherwise free one by one on one core, and end. (About 1% faster on the
+    // replica: PERF.md, steps 51 and 52.)
+    if w == 0 {
+        let sums = s.sums.lock().unwrap();
+        write_output(s.out_dir, &sums, &s.countries.lock().unwrap());
+        std::process::exit(0);
+    }
+    let (keys, rows) = &*s.tables[w].lock().unwrap();
+    // This thread's share of 0..n, one of threads - 1.
+    let share = |n| part(n, w - 1, threads - 1);
+    // SAFETY: no thread reads the tables, the join table or regions.csv again
+    // (above), and the input is `map`'s.
+    unsafe { drop_pages(&keys[..]) };
+    unsafe { drop_pages(&rows[..]) };
+    unsafe { drop_pages(&s.group_of[share(REGION_IDS)]) };
+    unsafe { drop_pages(&lines[share(lines.len())]) };
+    unsafe { drop_pages(&text[early..][share(text.len() - early)]) };
 }
 
 /// Two threads can start on one CPU while another one idles, and the scheduler then
@@ -476,9 +549,9 @@ fn write_output(dir: &str, totals: &[Totals; GROUPS], countries: &[Vec<u8>]) {
 ///
 /// # Safety
 /// `table` must have been made empty with a power-of-two number of key slots, at
-/// least 8 (one bucket; `table()` makes at least 16), and changed since by nothing
-/// but `add`: then every key that is not 0 holds the row + 1 of a row that `seen`
-/// has.
+/// least 8 (one bucket; `run` sizes every table at 16 or more), and changed since
+/// by nothing but `add`: then every key that is not 0 holds the row + 1 of a row
+/// that `seen` has.
 #[inline(never)]
 unsafe fn add(table: &mut Table, pairs: &[u64], totals: &mut [Totals; GROUPS]) {
     // Fields as locals: no store through them can change the others.
@@ -594,8 +667,9 @@ fn run_start(text: &[u8], from: usize, k: usize, parts: usize) -> usize {
 /// region id is known, and which then has a record's parse to arrive; the count's
 /// load also needs no value still being computed. Counted right after the parse,
 /// the instruction after that load took 19% of this function's cycles on the box's
-/// CPU (i5-13500). (PERF.md has the measured alternatives: counting each record or
-/// each pair at once, no prefetch, three cursors, cursors in arrays.)
+/// CPU (i5-13500). (PERF.md, steps 47-48, has the measured alternatives: counting
+/// each record at once or each pair one pass later, no prefetch, three cursors,
+/// cursors in arrays.)
 ///
 /// The second half starts at a cut found like the runs' cuts, so the first half
 /// must end exactly there. Every total, the min and max, and the set of pairs do
@@ -654,7 +728,7 @@ fn parse_run(
     let (mut i, mut j) = (start, mid);
     // Bounded by fast_end too, so that fast_record's own test of it is known true.
     // The second half's record parsed in the previous pass, counted in this one
-    // after the first half's (see above).
+    // once this pass's first-half record is parsed (see above).
     let mut last = None;
     while i < mid.min(fast_end) && j < fast_end {
         let a = record(i);
@@ -669,8 +743,9 @@ fn parse_run(
     if let Some(b) = last {
         count(&b);
     }
-    // The rest of the longer half, one record at a time; each half must end exactly
-    // at its end (for the first, the cut in the middle).
+    // The rest of each half, one record at a time (the walker takes the records in
+    // the file's last FAST_MARGIN bytes); each half must end exactly at its end (for
+    // the first, the cut in the middle).
     for (mut i, end) in [(i, mid), (j, end)] {
         while i < end {
             let r = record(i);
@@ -688,8 +763,9 @@ fn ensure(ok: bool) -> Option<()> {
 
 /// A record, `id,name,note,region_id,amount` and a terminator, whose name and note
 /// are empty or quoted (spec 2.2), from the bitmaps of the 64 bytes at `i` (rarely
-/// 128) and of 32 bytes after the note. None if the name or the note runs past
-/// them, or if `i` is not below `fast_end`.
+/// 128) and of 32 bytes after the note. None if the name runs past the first 64
+/// bytes or is longer than 32, if the note runs past 128, or if `i` is not below
+/// `fast_end`.
 ///
 /// # Safety
 /// `i` must be at least 8, and `fast_end` at most `text.len() - FAST_MARGIN`, or 0.
@@ -703,10 +779,11 @@ unsafe fn fast_record(text: &[u8], i: usize, fast_end: usize) -> Option<Record> 
     // - the windows, 0..64, and 64..128 for a long note;
     // - the hash's, from the name in the first window to 32 bytes past it: by 96;
     // - the tail's 32 bytes, from note_end + 1 <= 128: by 160;
-    // - at(0), and load(k), the 8 bytes before k, and at(k), the byte at k, for
-    //   k = id_end (< 64), region_end and amount_end. region_len and dot are below
-    //   32, or 64 if their byte is missing, so region_end = note_end + 1 +
-    //   region_len <= 192 and amount_end = note_end + 4 + dot <= 195.
+    // - load(k), the 8 bytes before k, for k = id_end (< 64), region_end and
+    //   amount_end, and at(region_end + 1), the byte after the region's comma (the
+    //   only call of `at`). region_len and dot are below 32, or 64 if their byte is
+    //   missing, so region_end = note_end + 1 + region_len <= 192, region_end + 1 <=
+    //   193 and amount_end = note_end + 4 + dot <= 195.
     // SAFETY: i < text.len() (above).
     let p = unsafe { text.as_ptr().add(i) };
     // SAFETY: k <= 195 at every call (above).
