@@ -316,34 +316,42 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
         // it, which ends before that thread counts itself done below.
         flushed.fetch_add(1, Release);
         wait(&flushed, threads);
-        // No thread reads the input any more: each drops one slice of its pages, in
-        // one call. (Each 8 runs' pages as they were parsed: 96 calls, each a round
-        // of TLB-shootdown interrupts to every other thread.)
-        let slice = |k| body_start + (text.len() - body_start) * k / threads;
+        // No thread reads the input any more. Its pages are dropped in two parts, each
+        // thread's slice in one call: the first two thirds now, the last third (below)
+        // while thread 0 writes the output. (Replica, against all of it now: two thirds
+        // -0.8% to -1.0%, a half -0.6%, three fifths -0.7%, three quarters -0.4%. Each 8
+        // runs' pages as they were parsed: 96 calls, each a round of TLB-shootdown
+        // interrupts to every other thread.)
+        // The k-th of `of` equal parts of 0..n.
+        let part = |n: usize, k: usize, of: usize| n * k / of..n * (k + 1) / of;
+        let early = body_start + (text.len() - body_start) * 2 / 3;
         // SAFETY: `text` is `map`'s: a private mapping that is never written.
-        unsafe { drop_pages(&text[slice(w)..slice(w + 1)]) };
+        unsafe { drop_pages(&text[body_start..early][part(early - body_start, w, threads)]) };
         (0..threads).for_each(|t| take((w + t) % threads, &mut totals));
-        // The last thread to add its totals writes the output and exits, without
-        // waiting for the others to exit and without dropping anything.
         merge(&mut sums.lock().unwrap(), &totals);
-        if merged.fetch_add(1, AcqRel) == threads - 1 {
+        merged.fetch_add(1, Release);
+        wait(&merged, threads);
+        // Once every thread has added its totals, only the output is read again. This
+        // thread 0, the main one, writes it and exits, without dropping anything. The
+        // others meanwhile drop their table's pages and their share of the join
+        // table's, of regions.csv's and of the input's last third, which exit would
+        // otherwise free one by one on one core, and end. (Replica: their tables, the
+        // join table and regions.csv: -0.6% to -0.9%; the join table's slices dropped
+        // before the takes instead: +0.3%.)
+        if w == 0 {
             write_output(out_dir, &sums.lock().unwrap(), &countries.lock().unwrap());
             std::process::exit(0);
         }
-        // Once every thread has added its totals, only the output is read again: while
-        // the last one writes, the others drop their table's pages and a slice of the
-        // join table's and of regions.csv's, which exit would otherwise free one by one
-        // on one core. (Replica: -0.9%; their tables alone: -0.6%; the join table's
-        // slices dropped before the takes instead: +0.3%.)
-        wait(&merged, threads);
         let (keys, rows) = &*tables[w].lock().unwrap();
-        let part = |n: usize, k: usize| n * k / threads;
+        // This thread's share of 0..n, one of threads - 1.
+        let share = |n| part(n, w - 1, threads - 1);
         // SAFETY: no thread reads the tables, the join table or regions.csv again
-        // (above).
+        // (above), and the input is `map`'s.
         unsafe { drop_pages(keys) };
         unsafe { drop_pages(rows) };
-        unsafe { drop_pages(&group_of[part(REGION_IDS, w)..part(REGION_IDS, w + 1)]) };
-        unsafe { drop_pages(&lines[part(lines.len(), w)..part(lines.len(), w + 1)]) };
+        unsafe { drop_pages(&group_of[share(REGION_IDS)]) };
+        unsafe { drop_pages(&lines[share(lines.len())]) };
+        unsafe { drop_pages(&text[early..][share(text.len() - early)]) };
     };
     thread::scope(|s| {
         // The handles are not needed: the scope joins the threads, and the last
