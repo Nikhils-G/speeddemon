@@ -91,17 +91,16 @@ fn main() {
     // cut is the end of the log, which ends with an LF). Cuts never decrease, so the
     // slices hold every line once; two cuts in one line give an empty slice.
     let threads = thread::available_parallelism().map_or(1, |n| n.get());
-    // Two pairs of slices per thread, taken in file order from a shared counter.
+    // Four pairs of slices per thread, taken in file order from a shared counter.
     // With one slice each, the scheduler sometimes put two threads on one CPU and
     // they kept it for the whole parse (4 of 30 runs on the test server, dev build):
     // the last thread finished its parse 4.9 to 8.0 ms after the first, and the run
     // took 18.1-20.8 ms against 14.6-15.6 ms (PERF.md, step 38). Now a slowed thread
-    // just parses fewer slices. (Four pairs a thread: 0.3 ms slower on the test
-    // server, 61 interleaved runs, from the per-slice work, mostly each slice's
-    // release; pinning each thread to a CPU instead: worse, a pinned thread cannot
+    // just parses fewer slices. (Eight slices: 0.47 ms slower, from the per-slice
+    // work; pinning each thread to a CPU instead: worse, a pinned thread cannot
     // leave a CPU that something else is using.) A pair is parsed side by side (see
     // `parse`); the count is even, so a pair's second slice always exists.
-    let slices = threads * 4;
+    let slices = threads * 8;
     // cut(p) may read the end of slice p - 1 after its pages were released: they
     // fault back in from the page cache unchanged (see release).
     let lf = |p| log[..len * p / slices].iter().rposition(|&b| b == b'\n');
