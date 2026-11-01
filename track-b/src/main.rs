@@ -63,7 +63,7 @@ const SUPER: u32 = 256;
 const SUM_BITS: u32 = 40;
 
 /// Box probe level (see the probe NOTES).
-const LVL: u32 = 4;
+const LVL: u32 = 1;
 static PROBE_END: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn main() {
