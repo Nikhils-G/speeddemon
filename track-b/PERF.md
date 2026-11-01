@@ -220,6 +220,17 @@ Board-measured reverts are in the table above (steps 11, 12, 14, 24 and 27). The
 | `Vocab::finish` in parallel | slower: the spawn costs more than the 0.4 ms loop |
 | Results written with `pwrite` from every formatting thread, and states, logs and scan tables released in parallel before exit | within noise |
 | Entries aligned to 32 bytes (no entry across two cache lines) | step 34's build 84.7 ms against 82.4 without |
+| Trigger-id band: the cover terms of block queries renumbered into one id range, so the block end loads entry ranges only for touched slots inside it | test server (beval-3 base, 12 threads, 3 copies × 4 rounds × 21 runs): 82.03 ms against 82.13, S +15: no gain |
+| Trigger bitmap: one bit per term (whether it triggers entries) filters the touched slots before their entry ranges are loaded, without renumbering | test server 82.01 ms against 82.13 (an earlier session: 81.79 against 82.51), S +6: within noise |
+| Bitmap filter plus a 2-term precheck: per entry the two rarest terms every match must contain; entries whose two words share no document are dropped branch-free before evaluation (1.37M of 4.26M block evaluations on seed 1) | test server 80.97 ms against 82.13 (earlier session 80.88 against 82.51): −1.4 to −2% elapsed, though cycles fell 4.7% (2.825G → 2.69G) and instructions 5.25G → 5.07G; M +0.5 MB, S +34. Not pushed: the time is worth about as much as the lines cost |
+| Touched slots visited in ascending order (a bitmap of touched trigger slots, scanned word by word) | test server +1.5 to +3.5 ms: the scan and its branch misses cost more than the forward reads save |
+| THP for the setup tables (`no_huge_pages` moved to after the plan is built) | test server, beval-1 base without the align flag: neutral (80.72 against 80.35 ms) |
+| `ALWAYS` at 0.35 and 0.5, on top of the bitmap filter | test server, beval-1 base without the align flag: 82.18 and 84.44 ms against 80.35 at 0.25 |
+| `add_wide` with one branch (count_positions always computed, branch only for an unsaturated answer with hits) | test server +1.3 ms |
+| `always` term words packed into one stream (`row * 32 \| op`) with runs of equal length | test server about −0.6 ms (about −0.9% cycles) for S +15: break-even, not kept |
+| `always` entries sorted by their term ids after length and operators, for row locality | test server +1.2 to +1.5 ms |
+
+- **Byte-identical copies of one binary ran up to 2.5% apart on the test server** (for example 83.1 against 84.4 ms, the same sha256), so every comparison here averages several copies of each binary.
 
 ## Correctness checks run before every push
 
