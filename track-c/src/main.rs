@@ -455,53 +455,60 @@ unsafe fn add(table: &mut Table, pairs: &[u64], totals: &mut [Totals; GROUPS]) {
     // that spilled into the next bucket, about 1% of them at 12 threads, is also
     // compared with that bucket's names, which raises the odds by under 2%.)
     let rows_mask = keys.len() as u32 - 1;
+    let bucket_mask = buckets - 1;
+    // The keys' address in a register: the slice does not change size.
+    let keys = keys.as_mut_slice();
+    // SAFETY: AVX2 is enabled for this build (see the compile_error); no memory.
+    let (mask, zero) = unsafe { (_mm256_set1_epi32(!rows_mask as i32), _mm256_setzero_si256()) };
     for &pair in pairs {
-        let group = (pair & 0xFF) as usize;
-        let (key, check) = ((pair >> 24) as u32 & !rows_mask, pair >> 21 & 0x7FFF);
+        let group = pair as u8 as usize;
+        let (key, check) = ((pair >> 24) as u32 & !rows_mask, (pair >> 21) as u32 & 0x7FFF);
         // The top hash bits picked the partition; the bits above the group pick a
         // bucket of 8 slots, compared at once. Slots fill in order and are never
-        // emptied, so the first slot that holds the name or is empty is the name's.
-        let mut bucket = (pair >> 8) as usize & (buckets - 1);
+        // emptied, so a name is in the first bucket of its probe that has a free slot,
+        // or in one before it.
+        let mut bucket = (pair >> 8) as usize & bucket_mask;
         // SAFETY:
         // - buckets is a power of two (the caller's contract), so the mask keeps
-        //   `bucket` below it: the 8 keys loaded at bucket * 8 are in `keys`, and a
-        //   slot is one of them (`hits` has 8 bits);
+        //   `bucket` below it: the 8 keys at `at` are in `keys`, and a slot is one of
+        //   them (`hits` and `free` have 8 bits);
         // - a key that is not 0 holds the row + 1 of a row whose WORDS words are in
-        //   `seen`: a new key's row is pushed right after it, and the assert keeps
-        //   every row + 1 at or below 5/8 of the slots, inside the bits of rows_mask;
+        //   `seen` (so r * WORDS - 1 is that row's word 3): a new key's row is pushed
+        //   right after it, and the assert keeps every row + 1 at or below 5/8 of the
+        //   slots, inside the bits of rows_mask;
         // - group / 64 < WORDS, since group < 256;
         // - AVX2 is enabled for this build (see the compile_error).
         // The loop ends: the assert keeps the table at most 5/8 full, so some bucket
         // has a free slot.
         unsafe {
             let wanted = _mm256_set1_epi32(key as i32);
-            let mask = _mm256_set1_epi32(!rows_mask as i32);
             let row = 'found: loop {
-                let v = _mm256_loadu_si256(keys.as_ptr().add(bucket * 8).cast());
-                let free = _mm256_cmpeq_epi32(v, _mm256_setzero_si256());
+                let at = keys.as_mut_ptr().add(bucket * 8);
+                let v = _mm256_loadu_si256(at.cast());
                 let hit = _mm256_cmpeq_epi32(_mm256_and_si256(v, mask), wanted);
-                let hit = _mm256_or_si256(hit, free);
-                // Slots whose hash bits match, or empty, in order: a match whose
-                // check bits differ is another name.
-                let mut hits = _mm256_movemask_ps(_mm256_castsi256_ps(hit));
+                let mut hits = _mm256_movemask_ps(_mm256_castsi256_ps(hit)) as u32;
+                // Slots whose hash bits match, in order; an empty one (its key bits are 0
+                // when the name's are) ends the bucket's names.
                 while hits != 0 {
-                    let slot = keys.get_unchecked_mut(bucket * 8 + hits.trailing_zeros() as usize);
-                    if *slot == 0 {
-                        assert!(seen.len() < full, "records.csv: too many distinct names");
-                        *slot = key | (seen.len() / WORDS + 1) as u32;
-                        // A new row: WORDS (4) words, the check bits in word 3's
-                        // bits 48..62.
-                        seen.extend_from_slice(&[0, 0, 0, check << 48]);
-                        break 'found seen.len() / WORDS - 1;
+                    let r = (*at.add(hits.trailing_zeros() as usize) & rows_mask) as usize;
+                    if r == 0 {
+                        break;
                     }
-                    let row = (*slot & rows_mask) as usize - 1;
-                    // Word 3's bits 48..62, without bit 63 (`_UNMATCHED`).
-                    if seen.get_unchecked(row * WORDS + 3) << 1 >> 49 == check {
-                        break 'found row;
+                    // Word 3's bits 48..62 (bit 63 is `_UNMATCHED`).
+                    if (*seen.get_unchecked(r * WORDS - 1) >> 48) as u32 & 0x7FFF == check {
+                        break 'found r - 1;
                     }
                     hits &= hits - 1;
                 }
-                bucket = (bucket + 1) & (buckets - 1);
+                let free = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(v, zero)));
+                if free != 0 {
+                    assert!(seen.len() < full, "records.csv: too many distinct names");
+                    *at.add(free.trailing_zeros() as usize) = key | (seen.len() / WORDS + 1) as u32;
+                    // A new row: WORDS (4) words, the check bits in word 3's bits 48..62.
+                    seen.extend_from_slice(&[0, 0, 0, (check as u64) << 48]);
+                    break 'found seen.len() / WORDS - 1;
+                }
+                bucket = (bucket + 1) & bucket_mask;
             };
             let word = seen.get_unchecked_mut(row * WORDS + group / 64);
             let bit = 1 << (group % 64);
@@ -624,10 +631,10 @@ unsafe fn fast_record(text: &[u8], i: usize, fast_end: usize) -> Option<Record> 
     // - the windows, 0..64, and 64..128 for a long note;
     // - the hash's, from the name in the first window to 32 bytes past it: by 96;
     // - the tail's 32 bytes, from note_end + 1 <= 128: by 160;
-    // - load(k), the 8 bytes before k, and at(k), the byte at k, for k = 3, id_end
-    //   (< 64), region_end and amount_end. region_len and dot are below 32, or 64
-    //   if their byte is missing, so region_end = note_end + 1 + region_len <= 192
-    //   and amount_end = note_end + 4 + dot <= 195.
+    // - at(0), and load(k), the 8 bytes before k, and at(k), the byte at k, for
+    //   k = id_end (< 64), region_end and amount_end. region_len and dot are below
+    //   32, or 64 if their byte is missing, so region_end = note_end + 1 +
+    //   region_len <= 192 and amount_end = note_end + 4 + dot <= 195.
     // SAFETY: i < text.len() (above).
     let p = unsafe { text.as_ptr().add(i) };
     // SAFETY: k <= 195 at every call (above).
@@ -635,7 +642,7 @@ unsafe fn fast_record(text: &[u8], i: usize, fast_end: usize) -> Option<Record> 
     // SAFETY: k <= 195 at every call, and i >= 8 (above).
     let load = |k: usize| unsafe { p.add(k).sub(8).cast::<u64>().read_unaligned() }; // ends at k
     // SAFETY: the 64 bytes at i are inside the text (above).
-    let (quotes, commas, inside) = masks(unsafe { &*p.cast() });
+    let (_, commas, inside) = masks(unsafe { &*p.cast() });
     let mut out = commas & !inside;
     let id_end = out.trailing_zeros() as usize;
     out &= out.wrapping_sub(1);
@@ -645,34 +652,35 @@ unsafe fn fast_record(text: &[u8], i: usize, fast_end: usize) -> Option<Record> 
     // Empty, or quoted with every inner quote half of a `""` pair (spec 2.2). (A
     // one-byte field counts as unquoted, so that the hash's range is never negative.)
     let name_quoted = (name_end > id_end + 2) as usize;
-    let name_quotes = (quotes & !(u64::MAX << name_end)).count_ones() as usize;
-    let name_bytes = name_end - id_end - 1 - name_quoted - name_quotes / 2;
+    // Inside quotes are a quoted field's opening quote, its bytes and one quote of each
+    // `""` (the other flips the state back), so its unescaped length is its count of
+    // inside bits less one. The id and the commas are outside.
+    let name_inside = (inside & !(u64::MAX << name_end)).count_ones() as usize;
+    let name_bytes = name_inside - name_quoted;
     let (s, e) = (i + id_end + 1 + name_quoted, i + name_end - name_quoted);
     // SAFETY: s <= e < i + 64, and the text goes on to i + 256 at least (above).
     let hash = unsafe { hash_words(text, s, e) };
-    let (note_end, quotes_to_note) = if out != 0 {
+    let (note_end, inside_to_note) = if out != 0 {
         let e = out.trailing_zeros() as usize;
-        (e, (quotes & !(u64::MAX << e)).count_ones())
+        (e, (inside & !(u64::MAX << e)).count_ones())
     } else {
         // The note runs past the first 64 bytes: the next 64, carrying the quote state.
         // SAFETY: the 64 bytes at i + 64 are inside the text (above).
-        let (quotes2, commas2, inside2) = masks(unsafe { &*p.add(64).cast() });
-        let out2 = commas2 & !(inside2 ^ ((inside as i64) >> 63) as u64);
-        let e = out2.trailing_zeros() as usize; // 64 if none
-        let before = quotes.count_ones() + (quotes2 & !(u64::MAX << (e & 63))).count_ones();
-        (64 + e, before)
+        let (_, commas2, inside2) = masks(unsafe { &*p.add(64).cast() });
+        let inside2 = inside2 ^ ((inside as i64) >> 63) as u64;
+        let e = (commas2 & !inside2).trailing_zeros() as usize; // 64 if none
+        (64 + e, inside.count_ones() + (inside2 & !(u64::MAX << (e & 63))).count_ones())
     };
     (note_end < 128).then_some(())?;
     let note_quoted = (note_end > name_end + 1) as usize;
-    let note_quotes = quotes_to_note as usize - name_quotes;
-    let note_bytes = note_end - name_end - 1 - note_quoted - note_quotes / 2;
+    let note_bytes = inside_to_note as usize - name_inside - note_quoted;
     // The tail, `region_id,amount`: its first comma and dot, from its 32 bytes.
     // SAFETY: note_end < 128, so the 32 bytes end by i + 160 (above).
     let tail = unsafe { _mm256_loadu_si256(p.add(note_end + 1).cast()) };
     let region_len = bytes_eq(tail, b',').trailing_zeros() as usize;
     let dot = bytes_eq(tail, b'.').trailing_zeros() as usize;
-    // load(3) >> 40 is the record's first 3 bytes: a BOM there is not part of the id.
-    let id_len = id_end - if load(3) >> 40 == 0xBF_BBEF { 3 } else { 0 };
+    // A record starts with a BOM or an id digit (spec 2.2): a BOM is not part of the id.
+    let id_len = id_end - if at(0) == 0xEF { 3 } else { 0 };
     let negative = bytes_eq(tail, b'-') >> (region_len + 1) & 1 != 0; // a mask bit: no byte load
     // The amount ends two digits after its dot (spec 2.2).
     let (region_end, amount_end) = (note_end + 1 + region_len, note_end + 4 + dot);
@@ -792,8 +800,9 @@ fn numbers(words: [u64; 3], lens: [usize; 3]) -> [u64; 3] {
         let same = 0x0F0E_0D0C_0B0A_0908;
         let squeeze = _mm256_set_epi64x(same, 0x0706_0403_0201_0080, same, 0x0706_0504_0302_0100);
         let v = _mm256_shuffle_epi8(v, squeeze);
-        // Each word's last n bytes are its digits: keep those (n is 1 to 8).
-        let [x, y, z] = lens.map(|n| (u64::MAX << (64 - 8 * n)) as i64);
+        // Each word's last n bytes are its digits: keep those (n is 1 to 8), by a
+        // table load instead of a shift count computed per number.
+        let [x, y, z] = lens.map(|n| DIGITS[n & 127] as i64);
         let v = _mm256_and_si256(v, _mm256_set_epi64x(0, z, y, x));
         // Pairs of digits (x10 + 1), then pairs of those (x100 + 1), packed to
         // 16 bits, then pairs again (x10000 + 1): one number per 64-bit lane.
@@ -805,6 +814,18 @@ fn numbers(words: [u64; 3], lens: [usize; 3]) -> [u64; 3] {
         [v[0], v[1], v[4]].map(u64::from)
     }
 }
+
+/// DIGITS[n] keeps a word's last n bytes (n is 0 to 8; the rest, only met outside
+/// spec 2.2, keep all 8), indexed by n & 127 so that no input reads past it.
+static DIGITS: [u64; 128] = {
+    let mut t = [u64::MAX; 128];
+    let mut n = 0;
+    while n < 8 {
+        t[n] = !(u64::MAX >> (8 * n));
+        n += 1;
+    }
+    t
+};
 
 /// A 64-bit hash of `text[s..e]`, 32 bytes at a time: each block masked to the
 /// field (`KEEP`), without a branch on the length, goes through three AES rounds
