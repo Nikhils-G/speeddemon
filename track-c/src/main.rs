@@ -43,10 +43,8 @@ compile_error!("track-c needs AVX2 and PCLMULQDQ: build with RUSTFLAGS=\"-C targ
 #[cfg(not(target_feature = "aes"))]
 compile_error!("track-c needs AES (the name hash): build with RUSTFLAGS=\"-C target-cpu=native\"");
 
-use std::arch::x86_64::*;
-use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering::*};
-use std::{sync::Mutex, thread};
+use std::{arch::x86_64::*, os::fd::AsRawFd, sync::Mutex, thread};
 
 /// Each thread parses this many runs, on average: they are claimed as threads go,
 /// so a thread slowed down (another process on its core) parses fewer of them.
@@ -62,7 +60,7 @@ const PARTITIONS_PER_THREAD: usize = 4;
 /// Group indices are bytes, so that tables indexed by a group need no bounds
 /// checks: countries in the order they are first seen, `_UNMATCHED` the last one.
 const GROUPS: usize = 256;
-/// Words of group bits per name. Groups 240..255 are never used (spec 2.3: at most
+/// Words of group bits per name. Groups 240..254 are never used (spec 2.3: at most
 /// 240 countries), so word 3's bits 48..62 hold 15 more bits of the name's hash.
 const WORDS: usize = GROUPS / 64;
 /// regions.csv is entered in this many parts, which threads claim as they start,
@@ -184,8 +182,7 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
         let mut at = run_start(lines, 0, k, REGION_CHUNKS);
         let end = run_start(lines, 0, k + 1, REGION_CHUNKS);
         while at < end {
-            let slot = &group_of[digits(lines, &mut at) as usize];
-            let comma = at;
+            let (slot, comma) = (&group_of[digits(lines, &mut at) as usize], at);
             let [a, b, c] = [1, 2, 3].map(|k| (lines[comma + k] - b'A') as usize);
             let group = &codes[a * 676 + b * 26 + c];
             if group.load(Relaxed) == 0 {
@@ -325,20 +322,18 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
     unreachable!("the last worker exits the process")
 }
 
-/// Writes each group's line.
+/// Writes the line of each group that has records (spec section 3).
 fn write_output(dir: &str, totals: &[Totals; GROUPS], codes: &[Vec<u8>]) {
     // Keys sorted bytewise: the codes, then `_UNMATCHED` ("_" > "Z").
     let mut keys: Vec<_> = codes.iter().cloned().zip(0..).collect();
     keys.push((b"_UNMATCHED".to_vec(), GROUPS - 1));
     keys.sort();
     let mut out = String::new();
-    for (key, group) in keys {
+    for (key, group) in keys.into_iter().filter(|&(_, group)| totals[group][0] > 0) {
         let [count, ids, sum, min, max, names, bytes] = totals[group];
         let ([sum, min, max], key) = ([sum, min, max].map(money), String::from_utf8_lossy(&key));
         let (nb, tb) = (bytes >> 32, bytes & 0xFFFF_FFFF); // name and note bytes
-        if count > 0 {
-            out += &format!("{key} {count} {ids} {sum} {min} {max} {names} {nb} {tb}\n");
-        }
+        out += &format!("{key} {count} {ids} {sum} {min} {max} {names} {nb} {tb}\n");
     }
     let path = format!("{dir}/aggregates.txt");
     std::fs::write(&path, out).unwrap_or_else(|e| panic!("write {path}: {e}"));
@@ -358,14 +353,14 @@ fn add(table: &mut Table, pairs: &[u64], totals: &mut [Totals; GROUPS]) {
     // Fields as locals: no store through them can change the others.
     let (keys, seen) = table;
     let (buckets, full) = (keys.len() / 8, keys.len() / 8 * 5 * WORDS);
-    // A key's low bits hold its row + 1 (below the slot count), the bits above them
-    // the pair's bits 24.. above as many: 20 hash bits (16 on one thread; a table has
-    // 4096 slots at 12 threads, 65,536 on one). The row's check bits hold hash bits
-    // 21..36. With
-    // the bucket's bits (9 at 12 threads, 13 on one) and the partition's (log2 of 48
-    // or of 4, from the top bits), that tells names apart by 49.6 bits at 12 threads,
-    // 46 on one: with the generator's 100,000 names, two share them all with odds of
-    // about C(100000, 2) / 2^49.6 = 5.9e-6 per dataset at 12 threads, 7.1e-5 on one.
+    // A key holds the name's row + 1 in its low bits (rows < slots, so it fits) and,
+    // above them, the pair's bits up to 56: 20 hash bits, 36..56, at 12 threads (4096
+    // slots per table), 16 on one (65,536 slots). The row's check bits hold hash bits
+    // 21..36. With the bucket's bits (9 at 12 threads, 13 on one) and the
+    // partition's (log2 of 48 or of 4, from the top bits), that tells names apart by
+    // 49.6 bits at 12 threads, 46 on one: with the generator's 100,000 names, two
+    // share them all with odds of about C(100000, 2) / 2^49.6 = 5.9e-6 per dataset
+    // at 12 threads, C(100000, 2) / 2^46 = 7.1e-5 on one.
     let rows_mask = keys.len() as u32 - 1;
     for &pair in pairs {
         let group = (pair & 0xFF) as usize;
@@ -615,8 +610,7 @@ fn masks(block: &[u8; 64]) -> (u64, u64, u64) {
     let [lo, hi] = [0, 32].map(|k| unsafe { _mm256_loadu_si256(block.as_ptr().add(k).cast()) });
     let bits = |byte| bytes_eq(lo, byte) | bytes_eq(hi, byte) << 32;
     // A carry-less multiply by all ones XORs every lower bit into each bit.
-    let quotes = bits(b'"');
-    let ones = unsafe { _mm_set1_epi8(-1) };
+    let (quotes, ones) = (bits(b'"'), unsafe { _mm_set1_epi8(-1) });
     let product = unsafe { _mm_clmulepi64_si128(_mm_set_epi64x(0, quotes as i64), ones, 0) };
     let inside = unsafe { _mm_cvtsi128_si64(product) } as u64;
     (quotes, bits(b','), inside)
