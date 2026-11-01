@@ -113,7 +113,7 @@ fn main() {
     // the merge below (done on this thread once every part is in) and goes on with
     // pass 2, so no thread is joined or started between the passes.
     let parts: Vec<OnceLock<Part>> = (0..slices).map(|_| OnceLock::new()).collect();
-    let (merged, order): (OnceLock<Merged>, OnceLock<Order>) = Default::default();
+    let merged: OnceLock<Merged> = OnceLock::new();
     // How many hours still read each part's records: the hour that brings its
     // part's count to zero gives the rest of them back.
     let readers: Vec<AtomicUsize> = parts.iter().map(|_| AtomicUsize::new(0)).collect();
@@ -121,9 +121,7 @@ fn main() {
     let (written, share) = (std::sync::Barrier::new(threads), AtomicUsize::new(0));
     thread::scope(|s| {
         for _ in 0..threads {
-            let (parts, merged, order, readers) = (&parts, &merged, &order, &readers);
-            let (slice, next, written, share) = (&slice, &next, &written, &share);
-            s.spawn(move || {
+            s.spawn(|| {
                 // This thread's records, each part taking the start of what is left.
                 // Room for every line of the log, allocated zeroed: only the pages
                 // written are ever backed by memory. One mapping per thread, not per
@@ -146,7 +144,7 @@ fn main() {
                     // loop above.)
                     let _ = (parts[p].set(a), parts[p + 1].set(b));
                 }
-                let ((hours, file, lens), endpoints) = (merged.wait(), order.wait());
+                let (hours, file, lens, endpoints) = merged.wait();
                 // Where an hour's output starts, once the lengths of all earlier hours are known.
                 let offset = |hour| lens[..hour].iter().try_fold(0, |at, n| Some(at + n.get()?));
                 // Writes the pending hours whose start is known.
@@ -237,10 +235,12 @@ fn main() {
                     let (mut groups, mut len) = (Vec::with_capacity(endpoints.len()), 0);
                     for &(id, name) in endpoints {
                         let group = &mut values[start[id] as usize..start[id + 1] as usize];
-                        let mut stat = [0; 5]; // a count of 0: no line
+                        let mut stat = [0; 6]; // a count of 0: no line
                         if !group.is_empty() {
                             let [p50, p95, p99] = percentiles(group);
-                            stat = [group.len() as u32, p50, p95, p99, (counts[id] >> 32) as u32];
+                            let (n, errors) = (group.len() as u32, (counts[id] >> 32) as u32);
+                            let rate = (errors as u64 * 1_000_000 / n as u64) as u32; // in integers
+                            stat = [n, p50, p95, p99, errors, rate];
                             len += line_len(name, &stat);
                         }
                         groups.push(stat);
@@ -318,9 +318,7 @@ fn main() {
         // which each write only their own hours' bytes.
         let file = map(std::ptr::null_mut(), bound, 3, 1, output.as_raw_fd()) as usize; // READ | WRITE; SHARED
         let lens = hours.iter().map(|_| OnceLock::new()).collect();
-        order.set(endpoints).ok();
-        merged.set((hours, file, lens)).ok();
-        // (Both set once, here, so neither set can fail; the workers wait for both.)
+        merged.set((hours, file, lens, endpoints)).ok(); // set once, here: it cannot fail
 
         // Off the critical path, while pass 2 runs: the parse threads gave back the
         // log's pages, but not the page tables that mapped them (0.5 MB, charged to
@@ -340,22 +338,16 @@ fn main() {
     std::process::exit(0)
 }
 
-/// What a group's line needs: count (0: no line), p50, p95, p99 and errors. All fit 32 bits:
-/// latencies are unsigned 32-bit numbers (the spec). An hour keeps these until it
-/// is written, so they are kept as small as possible (20 bytes per endpoint).
-type Stats = [u32; 5];
-
-/// The six numbers of a group's line: its statistics, then the error rate in
-/// parts per million (`errors * 1000000 / count` in integers). The count is not 0.
-fn numbers([n, p50, p95, p99, errors]: Stats) -> [u32; 6] {
-    let rate = (errors as u64 * 1_000_000 / n as u64) as u32;
-    [n, p50, p95, p99, errors, rate]
-}
+/// The six numbers of a group's line: count (0: no line), p50, p95, p99, errors and
+/// the error rate in parts per million. All fit 32 bits: latencies are unsigned
+/// 32-bit numbers (the spec). An hour keeps these until it is written (24 bytes per
+/// endpoint).
+type Stats = [u32; 6];
 
 /// "YYYY-MM-DDTHH:00:00Z endpoint" then the numbers, each after a space, and LF.
 fn line_len(name: &[u8], stat: &Stats) -> usize {
     let digits = |v: u32| v.checked_ilog10().map_or(1, |d| d as usize + 1);
-    21 + name.len() + numbers(*stat).iter().map(|&v| 1 + digits(v)).sum::<usize>() + 1
+    21 + name.len() + stat.iter().map(|&v| 1 + digits(v)).sum::<usize>() + 1
 }
 
 /// The line is put together from its end in a stack buffer, so no number's
@@ -363,7 +355,7 @@ fn line_len(name: &[u8], stat: &Stats) -> usize {
 fn write(head: &[u8; 16], name: &[u8], stat: Stats, out: &mut [u8]) -> usize {
     let mut line = [b'\n'; 256]; // 21 + 125 + 6 * 11 + 1 = 213 at most; it ends with LF
     let mut at = line.len() - 1;
-    for mut value in numbers(stat).into_iter().rev() {
+    for mut value in stat.into_iter().rev() {
         // Two digits at a time from the end, then the first digit of an odd-length
         // number (or the only one).
         let end = at;
@@ -405,10 +397,10 @@ type Part = (&'static [u32], Vec<u32>, Vec<(u128, usize, usize)>);
 /// `run.2 - run.0.1` its record count.
 type Run = ((u128, usize, usize), usize, usize);
 
-/// What the merge between the passes hands to pass 2 besides the endpoint order:
-/// the runs in order of hour then part, cut into hours; the output mapping's
-/// address; and each hour's output length once known.
-type Merged<'a> = (Vec<&'a [Run]>, usize, Vec<OnceLock<usize>>);
+/// What the merge between the passes hands to pass 2: the runs in order of hour
+/// then part, cut into hours; the output mapping's address; each hour's output
+/// length once known; and the endpoints in byte order of their names.
+type Merged<'a> = (Vec<&'a [Run]>, usize, Vec<OnceLock<usize>>, Order<'a>);
 
 /// (id, name) of every endpoint, in byte order of the names.
 type Order<'a> = Vec<(usize, &'a [u8])>;
@@ -434,10 +426,8 @@ unsafe fn parse(chunks: [&[u8]; 2], table: &Interner, free: &mut &'static mut [u
     let (first, second) = std::mem::take(free).split_at_mut(most[0]);
     // Each slice's next line and its end, its records' start and next place, the
     // previous line's hour bytes, the latencies that do not fit a record, its runs.
-    let (mut line, stop) = (
-        chunks.map(|c| c.as_ptr()),
-        chunks.map(|c| c.as_ptr_range().end),
-    );
+    let mut line = chunks.map(|c| c.as_ptr());
+    let stop = chunks.map(|c| c.as_ptr_range().end);
     let start = [first.as_mut_ptr(), second.as_mut_ptr()];
     let mut record = start;
     let (mut last, mut escapes, mut runs) = ([u64::MAX; 2], [vec![], vec![]], [vec![], vec![]]);
@@ -470,11 +460,8 @@ unsafe fn parse(chunks: [&[u8]; 2], table: &Interner, free: &mut &'static mut [u
         if hour != last[k] {
             last[k] = hour;
             let key = u128::from_be_bytes(*line.cast()) >> 24; // the first 13 bytes
-            runs[k].push((
-                key,
-                record[k].offset_from_unsigned(start[k]),
-                escapes[k].len(),
-            ));
+            let at = record[k].offset_from_unsigned(start[k]);
+            runs[k].push((key, at, escapes[k].len()));
         }
         // One 64-byte window after the timestamp: its first two spaces end the
         // method and the endpoint (no branch on the method or the length). Byte 27
@@ -538,15 +525,11 @@ unsafe fn parse(chunks: [&[u8]; 2], table: &Interner, free: &mut &'static mut [u
     let lines = [0, 1].map(|k| unsafe { record[k].offset_from_unsigned(start[k]) });
     let (second, rest) = second.split_at_mut(lines[1]);
     *free = rest;
-    let records: [&'static [u32]; 2] = [&first[..lines[0]], second];
-    [0, 1].map(|k| {
-        let (mut runs, escapes) = (
-            std::mem::take(&mut runs[k]),
-            std::mem::take(&mut escapes[k]),
-        );
-        runs.push((u128::MAX, records[k].len(), escapes.len())); // the end marker
-        (records[k], escapes, runs)
-    })
+    for k in 0..2 {
+        runs[k].push((u128::MAX, lines[k], escapes[k].len())); // the end markers
+    }
+    let ([escapes0, escapes1], [runs0, runs1]) = (escapes, runs);
+    [(&first[..lines[0]], escapes0, runs0), (second, escapes1, runs1)]
 }
 
 /// 128 bytes of 0xFF then 128 zeros: the 128 bytes from `128 - len` keep the first `len`.
@@ -711,13 +694,8 @@ impl Interner {
             let key: Key =
                 std::array::from_fn(|i| _mm256_and_si256(bytes[i], load(keep.add(32 * i))));
             // The same bytes as `find` hashes, from 8 bytes up (under 8 it never finds one).
-            let at = |i: usize| {
-                key.as_ptr()
-                    .cast::<u8>()
-                    .add(i)
-                    .cast::<u64>()
-                    .read_unaligned()
-            };
+            let bytes = key.as_ptr().cast::<u8>();
+            let at = |i: usize| bytes.add(i).cast::<u64>().read_unaligned();
             let mut i = Self::home(len, at(0), at(len.max(8) - 8));
             loop {
                 let id = match self.slots[i].load(Acquire) {
@@ -813,7 +791,8 @@ fn small_ranks<const V: usize>(values: &[u32], ranks: [usize; 3]) -> [u32; 3] {
             let rank = _mm256_set1_epi32(rank as i32 + 1);
             let held = (0..V).map(|k| _mm256_and_si256(_mm256_cmpgt_epi32(rank, below[k]), v[k]));
             let most = held.reduce(|a, b| _mm256_max_epu32(a, b)).unwrap();
-            std::mem::transmute::<_, [u32; 8]>(most).into_iter().max().unwrap()
+            let lanes: [u32; 8] = std::mem::transmute(most);
+            lanes.into_iter().max().unwrap()
         })
     }
 }
