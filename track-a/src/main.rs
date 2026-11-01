@@ -210,22 +210,15 @@ fn main() {
         }
 
         // (id, name) of every endpoint, in byte order of the names: first by the first
-        // 16 bytes as one number, so few comparisons need the bytes themselves, then
-        // by the full bytes on ties.
+        // 32 bytes of the zero-padded keys as two big-endian numbers, so few
+        // comparisons need the names, then by the full bytes on ties.
         let parts: Vec<&Part> = parts.iter().map(OnceLock::wait).collect();
-        // The parse threads gave back the log's pages, but not the page tables that
-        // mapped them (0.5 MB, charged to us): unmapping frees those too. A failure
-        // would only keep them.
-        // SAFETY: every part is in, so nothing reads the log any more: every
-        // endpoint's bytes and key were copied, and `log` is not used again.
-        unsafe { munmap(base, len + PAD) };
-        // Keys are only looked up during the parse; names are kept.
-        release(&table.keys[..]);
         // SAFETY: the parse is over, so nothing writes the table any more.
         let count = table.count.load(Relaxed);
         let names = table.names[..count].iter().map(|n| unsafe { &**n.get() });
+        let key = |id: usize| unsafe { *table.keys[id].get().cast::<[[u8; 16]; 2]>() };
         let mut endpoints: Vec<_> = names.enumerate().collect();
-        endpoints.sort_by_cached_key(|&(_, name)| (sort_key(name), name));
+        endpoints.sort_unstable_by_key(|&(id, name)| (key(id).map(u128::from_be_bytes), name));
 
         // Every part's runs, in order of hour then part.
         let mut runs = Vec::new();
@@ -251,6 +244,15 @@ fn main() {
         let lens = (0..hours).map(|_| OnceLock::new()).collect();
         order.set(endpoints).ok();
         merged.set((runs, file, lens)).ok();
+
+        // Off the critical path, while pass 2 runs: the parse threads gave back the
+        // log's pages, but not the page tables that mapped them (0.5 MB, charged to
+        // us): unmapping frees those too. A failure would only keep them.
+        // SAFETY: every part is in, so nothing reads the log any more: every
+        // endpoint's bytes and key were copied, and `log` is not used again.
+        unsafe { munmap(base, len + PAD) };
+        // Keys are only looked up during the parse (and the sort above); names are kept.
+        release(&table.keys[..]);
     });
     let lens = &merged.get().unwrap().2;
     let total: usize = lens.iter().map(|len| len.get().unwrap()).sum();
@@ -258,13 +260,6 @@ fn main() {
     // The output is complete in the page cache. Exit now: dropping the tables
     // above, one free at a time, took a few milliseconds on the scoring box.
     std::process::exit(0)
-}
-
-/// Up to the first 16 bytes, zero-padded, as a number that sorts like them: big
-/// endian, so the first byte is the most significant.
-fn sort_key(bytes: &[u8]) -> u128 {
-    let padded = bytes.iter().chain(&[0; 16]);
-    padded.take(16).fold(0, |key, &b| key << 8 | b as u128)
 }
 
 /// What a group's line needs: count, p50, p95, p99 and errors. All fit 32 bits:
