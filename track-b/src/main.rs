@@ -57,7 +57,7 @@ const SAMPLE_BYTES: usize = 1 << 20;
 /// A query whose cover terms are expected in more blocks than this (as a share,
 /// summed over the terms) is evaluated in every superblock: one evaluation then
 /// covers four blocks. (0.125 and 0.5 were measured slower.)
-const ALWAYS: f64 = 0.30;
+const ALWAYS: f64 = 0.25;
 /// Documents per superblock: four blocks of 64.
 const SUPER: u32 = 256;
 /// A thread's sum of matching ids is packed under its count in one u64.
@@ -68,7 +68,7 @@ const MAX_DOCS: u32 = 1 << 20;
 /// How far ahead the block end prefetches: the entry range of the touched slot
 /// SLOTS_AHEAD on, and the words and state that the range RANGES_AHEAD on reads
 /// first (PERF.md, steps 20 and 28).
-const SLOTS_AHEAD: usize = 16;
+const SLOTS_AHEAD: usize = 32;
 const RANGES_AHEAD: usize = 4;
 /// Hash groups: a key's group is the low 6 bits of its hash (hash & 63). A pilot
 /// is 1 mod GROUPS, so each group owns a region of the table, and the threads
