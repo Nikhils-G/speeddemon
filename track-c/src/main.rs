@@ -2,9 +2,12 @@
 //! through regions.csv, and write per-country aggregates.
 //!
 //! The parser relies on spec section 2.2 (what the generator writes, for every seed
-//! and scale), not only on the general grammar of 2.1. Where 2.2 is relied on, a
-//! wrong assumption stops the process with a nonzero exit (an assert, or an index
-//! out of bounds) rather than writing a wrong answer.
+//! and scale), not only on the general grammar of 2.1, and does not check all of it.
+//! Input that breaks 2.2 and moves a record boundary (tested: a lone quote, a lost
+//! LF) stops the process with a nonzero exit: an assert, or an index out of bounds.
+//! A record that breaks 2.2 but keeps its LF in place is answered as parsed (tested:
+//! a wrong field count, a quoted id or region id, an unquoted name, a stray CR or BOM,
+//! a second dot, a one-decimal amount).
 //!
 //! How it is fast, and why it is still exact:
 //! 1. Both files are mmap'd (pre-warmed page cache: no memory charge, no copy).
@@ -29,9 +32,9 @@
 //!    picked by the hash. After each run it parses, a thread hands its buffers of
 //!    pairs to their owners' inboxes, and its own table takes what waits in its
 //!    inbox: a table of names with a bit per group, which stays in its cache. The
-//!    tables compare 47.6 of the hash's bits at 12 threads and 44 on one (see
+//!    tables compare 47.6 of the hash's bits at 12 threads and 42 on one (see
 //!    `add`): with the generator's 100,000 names, two of them agree on all those
-//!    bits with odds of about 2.4e-5 per dataset at 12 threads, 2.8e-4 on one.
+//!    bits with odds of about 2.4e-5 per dataset at 12 threads, 1.1e-3 on one.
 //! 5. No thread waits for a given other one until the end: runs are claimed one at
 //!    a time, so a thread slowed down (another process sharing its core) parses
 //!    fewer of them, and its partition's pairs wait in its inbox. (With a
@@ -56,11 +59,10 @@ const RUNS_PER_THREAD: usize = 64;
 /// are first seen.
 const GROUPS: usize = 256;
 /// Words of group bits per name. Groups 241..255 are never used (spec 2.3: at most
-/// 240 countries), so word 3's bits 49..63 hold 15 more bits
-/// of the name's hash.
+/// 240 countries), so word 3's bits 49..64 hold 15 more bits of the name's hash.
 const WORDS: usize = GROUPS / 64;
 /// Entries of the join table, one per region id: listed ids are below 1,000,000
-/// (spec 2.3), and every id above them reads the last entry, which none is.
+/// (spec 2.3), and every id above them reads the last entry, which no listed id sets.
 const REGION_IDS: usize = 1 << 20;
 /// regions.csv is entered in this many parts, which threads claim as they start,
 /// so the ones that start first do more of it.
@@ -94,6 +96,8 @@ type Table = (Vec<u32>, Vec<u64>);
 /// One parsed record.
 struct Record {
     id: u64,
+    /// The region id; `parse_run` clamps it to the join table's last entry, so that
+    /// the count can index the table unchecked.
     region_id: u64,
     /// The amount in cents.
     cents: i64,
@@ -105,8 +109,7 @@ struct Record {
     next: usize,
 }
 
-// libc, declared by hand so that the crate has no dependencies. Their constants, from
-// the Linux and glibc headers, are named where they are passed.
+// libc, declared by hand so that the crate has no dependencies.
 // SAFETY: glibc's signatures on x86-64 Linux; prctl is declared variadic, as in C.
 unsafe extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, at: i64) -> *mut u8;
@@ -115,6 +118,15 @@ unsafe extern "C" {
     fn prctl(option: i32, ...) -> i32;
 }
 
+// Their constants, from the Linux and glibc headers.
+const PROT_READ: i32 = 1;
+const MAP_PRIVATE: i32 = 2;
+const MADV_DONTNEED: i32 = 4;
+const M_TOP_PAD: i32 = -2;
+const PR_SET_THP_DISABLE: i32 = 41;
+/// x86-64's base page size: madvise takes page-aligned bounds.
+const PAGE: usize = 4096;
+
 /// Maps a whole file read-only for the rest of the process. It is never unmapped:
 /// the process exits right after using it, and exit unmaps everything.
 fn map(path: &str) -> &'static [u8] {
@@ -122,8 +134,7 @@ fn map(path: &str) -> &'static [u8] {
     let len = file.metadata().expect(path).len() as usize; // the panic names the file
     // SAFETY: a fresh read-only private mapping of `len` bytes where the kernel
     // chooses; the dataset is mounted read-only, so the bytes cannot change under us.
-    // 1 is PROT_READ, 2 is MAP_PRIVATE.
-    let ptr = unsafe { mmap(null_mut(), len, 1, 2, file.as_raw_fd(), 0) };
+    let ptr = unsafe { mmap(null_mut(), len, PROT_READ, MAP_PRIVATE, file.as_raw_fd(), 0) };
     assert_ne!(ptr as isize, -1, "mmap {path}");
     // SAFETY: the mapping succeeded (above), is valid for `len` bytes, and is never
     // written or unmapped (closing the file does not unmap it), so the slice can
@@ -141,12 +152,11 @@ fn map(path: &str) -> &'static [u8] {
 /// are: a dropped page then faults back in from the page cache with the same bytes.
 /// (Anonymous or written memory would read back as zeros.)
 unsafe fn drop_pages(bytes: &[u8]) {
-    // madvise needs page-aligned bounds; x86-64 pages are 4096 bytes.
-    let start = (bytes.as_ptr() as usize).next_multiple_of(4096);
-    let end = (bytes.as_ptr() as usize + bytes.len()) / 4096 * 4096;
+    let start = (bytes.as_ptr() as usize).next_multiple_of(PAGE);
+    let end = (bytes.as_ptr() as usize + bytes.len()) / PAGE * PAGE;
     // SAFETY: MADV_DONTNEED on the whole pages inside `bytes` (none if it holds no
     // whole page), which read back the same by the caller's contract.
-    unsafe { madvise(start as *mut u8, end.saturating_sub(start), 4) }; // 4 is MADV_DONTNEED
+    unsafe { madvise(start as *mut u8, end.saturating_sub(start), MADV_DONTNEED) };
 }
 
 /// Spins for a while, then yields the core between checks, until `count` reaches
@@ -170,12 +180,12 @@ fn main() {
     // thread's page faults (800 of them per run: -2.8 ms). Reserved but untouched
     // pages cost no memory.
     // SAFETY: a libc call that touches no memory of ours; a failure keeps the default.
-    unsafe { mallopt(-2, 32 << 20) }; // -2 is M_TOP_PAD
+    unsafe { mallopt(M_TOP_PAD, 32 << 20) };
     // PR_SET_THP_DISABLE: with transparent huge pages, touching one byte of a sparse
     // table can fault in a whole 2 MB page, so the memory peak would depend on how
     // fragmented the host is (13 to 24 MB between runs).
     // SAFETY: a system call that touches no memory of ours; a failure keeps the default.
-    unsafe { prctl(41, 1u64, 0u64, 0u64, 0u64) }; // 41 is PR_SET_THP_DISABLE
+    unsafe { prctl(PR_SET_THP_DISABLE, 1u64, 0u64, 0u64, 0u64) };
     let dir = |k: usize, or: &str| std::env::args().nth(k).unwrap_or(or.into());
     run(&dir(1, "/data"), &dir(2, "/out"))
 }
@@ -413,15 +423,16 @@ unsafe fn add(table: &mut Table, pairs: &[u64], totals: &mut [Totals; GROUPS]) {
     // threads (16,384 slots per table) and, in parentheses, on one (262,144):
     // - 0..8: the group;
     // - 8..19 (8..23): the bucket, 11 bits (15);
-    // - 21..36: 15 check bits, stored in the name's row (word 3, bits 49..64);
+    // - 21..36: 15 check bits, stored in the name's row (word 3, bits 49..64); on
+    //   one thread, 21..23 are also bucket bits;
     // - 24..56: the key, whose low 14 bits (18) hold the row + 1 instead, so that
     //   keys compare bits 38..56, 18 bits (42..56, 14 bits);
     // - the top bits picked the partition (`parse_run`): log2(12) = 3.6 bits
     //   (none on one thread).
     // Two names are taken for one only if all of those agree: 11 + 15 + 18 + 3.6
-    // = 47.6 bits at 12 threads, 15 + 15 + 14 = 44 on one. With the generator's
+    // = 47.6 bits at 12 threads, 15 + 13 + 14 = 42 on one. With the generator's
     // 100,000 names, that happens with odds of about C(100000, 2) / 2^47.6 = 2.4e-5
-    // per dataset at 12 threads, and C(100000, 2) / 2^44 = 2.8e-4 on one. (A name
+    // per dataset at 12 threads, and C(100000, 2) / 2^42 = 1.1e-3 on one. (A name
     // that spilled into the next bucket, about 1% of them at 12 threads, is also
     // compared with that bucket's names, which raises the odds by under 2%.)
     let rows_mask = keys.len() as u32 - 1;
@@ -522,10 +533,11 @@ fn run_start(text: &[u8], from: usize, k: usize, parts: usize) -> usize {
 /// pairs) against counting each pair at once (c-11), -0.28 ms (-1.5%, 201 pairs)
 /// against counting each pair after the next pair (c-12); without the prefetch
 /// +2.0% (101 pairs), with three cursors +2.1% (51 pairs). (Cursors in arrays:
-/// +3 ms, the arrays stay in memory.) The
-/// second half starts at a cut found like the runs' cuts, so the first half must
-/// end exactly there. Every total, the min and max, and the set of pairs do not
-/// depend on the order in which records are counted.
+/// +3 ms, the arrays stay in memory.)
+///
+/// The second half starts at a cut found like the runs' cuts, so the first half
+/// must end exactly there. Every total, the min and max, and the set of pairs do
+/// not depend on the order in which records are counted.
 #[inline(never)]
 fn parse_run(
     text: &[u8],
@@ -544,7 +556,8 @@ fn parse_run(
         unsafe { _mm_prefetch::<_MM_HINT_NTA>(text.as_ptr().wrapping_add(i + 1024).cast()) };
         // SAFETY: fast_end is at most text.len() - FAST_MARGIN, or 0, and i >= 8
         // (above).
-        let mut r = unsafe { fast_record(text, i, fast_end) }.unwrap_or_else(|| *walk_record(text, i));
+        let mut r =
+            unsafe { fast_record(text, i, fast_end) }.unwrap_or_else(|| *walk_record(text, i));
         // The region's group is read after the next record's parse: its fetch starts
         // now. Ids above the table read its last entry, which is 0 (see REGION_IDS).
         r.region_id = r.region_id.min(REGION_IDS as u64 - 1);
