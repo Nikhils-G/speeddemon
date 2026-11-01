@@ -335,15 +335,17 @@ fn main() {
 /// endpoint).
 type Stats = [u32; 6];
 
-/// "YYYY-MM-DDTHH:00:00Z endpoint" then the numbers, each after a space, and LF.
+/// The length of a group's line, "YYYY-MM-DDTHH:00:00Z endpoint" then the numbers,
+/// each after a space, and LF: the 20-byte label and its space, the name, a space and
+/// the digits of each number, and the LF. 0 for an empty group, which has no line.
 fn line_len(name: &[u8], stat: &Stats) -> usize {
     let digits = |v: u32| v.checked_ilog10().map_or(1, |d| d as usize + 1);
     let len = 21 + name.len() + stat.iter().map(|&v| 1 + digits(v)).sum::<usize>() + 1;
     if stat[0] > 0 { len } else { 0 } // a count of 0: no line
 }
 
-/// Writes the line that ends at `out[end]`, from its end, straight into place, and
-/// returns where it starts: no number's length is needed first, and nothing is
+/// Writes the line that ends just before `out[end]`, from its end, straight into
+/// place, and returns where it starts: no number's length is needed first, and nothing is
 /// copied. (Put together in a stack buffer and copied, the copy's wide loads waited
 /// for the buffer's byte stores to reach the cache: a store-forwarding stall a line.)
 fn write(head: &[u8; 16], name: &[u8], stat: Stats, out: &mut [u8], end: usize) -> usize {
@@ -362,6 +364,8 @@ fn write(head: &[u8; 16], name: &[u8], stat: Stats, out: &mut [u8], end: usize) 
         at -= 2 + (value >= 10) as usize;
         out[at] = b' ';
     }
+    // The 20-byte label (the hour key's 13 bytes "YYYY-MM-DDTHH", then ":00:00Z"), its
+    // space, then the name.
     at -= 21 + name.len();
     out[at..at + 13].copy_from_slice(&head[..13]);
     out[at + 13..at + 21].copy_from_slice(b":00:00Z ");
