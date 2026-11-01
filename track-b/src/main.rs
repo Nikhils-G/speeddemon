@@ -28,10 +28,8 @@ use std::arch::asm;
 use std::arch::x86_64::*;
 use std::cmp::Reverse;
 use std::mem::{replace, take, transmute};
-use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
-use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicUsize};
-use std::sync::{Barrier, LazyLock, Mutex, OnceLock, RwLock};
-use std::thread::spawn;
+use std::sync::Barrier;
+use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, Ordering::Relaxed};
 
 #[cfg(not(all(target_feature = "avx2", target_feature = "bmi2")))]
 compile_error!("track-b needs AVX2 and BMI2: build with RUSTFLAGS=\"-C target-cpu=native\"");
@@ -69,9 +67,8 @@ const FIRST_IDS: u64 = 10;
 const SAMPLE_BYTES: usize = 1 << 20;
 /// A query whose cover terms are expected in more 64-document blocks than this
 /// (as a share, summed over the terms) is evaluated in every superblock instead
-/// of per document. (A board probe read 0.30 as 2.3 ms faster than 0.25; on the
-/// replica 0.30 was 0.3 ms faster, in 19 of 31 pairs. 0.20 and 0.35 were no
-/// better, and 512-document superblocks were 6.5 ms slower on the box.)
+/// of per document. (On the scoring box 0.30 beat 0.25 by 2.3 ms; 0.20, 0.35 and
+/// 0.5 were no better, and 512-document superblocks were 6.5 ms slower.)
 const ALWAYS: f64 = 0.30;
 /// Documents per superblock: four blocks of 64.
 const SUPER: u32 = 256;
@@ -95,14 +92,6 @@ fn main() {
     mmap::no_huge_pages();
     let open = |name: &str| mmap::map(&format!("{data_dir}/{name}"));
     let docs = open("docs.txt");
-    // PROBE: on the full input, exit with bit 0 = CPUID WAITPKG, bit 1 = umwait_control/enable_c02 is 1,
-    // bits 2-7 = umwait_control/max_time / 10000 (clamped to 63; 63 also when the file is missing).
-    if docs.len() > 100 << 20 {
-        let read = |f: &str| std::fs::read_to_string(format!("/sys/devices/system/cpu/umwait_control/{f}"));
-        let c02 = read("enable_c02").map_or(false, |t| t.trim() == "1");
-        let max = read("max_time").ok().and_then(|t| t.trim().parse::<u64>().ok()).map_or(63, |t| (t / 10000).min(63));
-        std::process::exit((*WAITPKG as i32) | (c02 as i32) << 1 | (max as i32) << 2);
-    }
     // The corpus: `docs` without the mmap::PAD zero bytes that follow it.
     let text = &docs[..docs.len() - mmap::PAD];
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
@@ -214,63 +203,13 @@ fn format_part(plan: &Plan, results: &[Results], p: usize, parts: usize) -> Vec<
     out
 }
 
-/// f(0), f(1), ... f(n - 1): f(0) on this thread and f(i) on worker i of a pool
-/// made by the first call (parts beyond it run on this thread). Between calls the
-/// workers wait (`wait`): a call spawns no thread, each worker keeps its heap
-/// arena, and its CPU stays out of the deep idle states that take up to 1 ms to
-/// wake from.
-fn par<T: Send + Sync>(n: usize, f: &(impl Fn(usize) -> T + Sync)) -> Vec<T> {
-    let out: Vec<_> = (0..n).map(|_| OnceLock::new()).collect();
-    // Part i, if there is one: every worker runs the job with its i.
-    let job = |i: usize| _ = out.get(i).map(|r| r.set(f(i)));
-    let job: &(dyn Fn(usize) + Sync) = &job;
-    // SAFETY: the workers use the job until they count it in FINISHED, and this
-    // call returns only once all of them have.
-    *JOB.write().unwrap() = Some(unsafe { transmute(job) });
-    let generation = GENERATION.fetch_add(1, Release) + 1;
-    let workers = *WORKERS.get_or_init(|| (1..n).map(|i| spawn(move || worker(i))).count());
-    (0..n).filter(|&i| i == 0 || i > workers).for_each(job);
-    wait(&FINISHED, |f| f >= generation * workers);
-    out.into_iter().flat_map(OnceLock::into_inner).collect()
-}
-
-/// The pool's job, its lifetime erased (see `par`).
-static JOB: RwLock<Option<&'static (dyn Fn(usize) + Sync)>> = RwLock::new(None);
-/// The number of jobs so far, the number of times a worker has finished one,
-/// and the number of workers.
-static GENERATION: AtomicUsize = AtomicUsize::new(0);
-static FINISHED: AtomicUsize = AtomicUsize::new(0);
-static WORKERS: OnceLock<usize> = OnceLock::new();
-/// Whether the CPU has WAITPKG (CPUID leaf 7, ECX bit 5), for `wait`.
-static WAITPKG: LazyLock<bool> = LazyLock::new(|| __cpuid_count(7, 0).ecx & 1 << 5 != 0);
-
-/// Waits until `done(word)`: in C0.2 (umwait) on a CPU with WAITPKG, woken by a
-/// write to the word's cache line or by the kernel's limit (100,000 TSC cycles),
-/// so a waiting thread leaves its core to its SMT sibling (spinning measured
-/// 0.5 ms slower). Without WAITPKG, it polls.
-fn wait(word: &AtomicUsize, done: impl Fn(usize) -> bool) {
-    while !done(word.load(Acquire)) && *WAITPKG {
-        // SAFETY: the CPU has WAITPKG. umonitor arms the monitor on the word's
-        // address, and umwait (deadline u64::MAX, so the kernel's) waits on it
-        // unless the word changed meanwhile; neither writes memory.
-        unsafe { asm!("umonitor {}", in(reg) word.as_ptr(), options(nostack, preserves_flags)) };
-        if !done(word.load(Acquire)) {
-            // SAFETY: as above.
-            unsafe { asm!("umwait {:e}", in(reg) 0, in("edx") u32::MAX, in("eax") u32::MAX, options(nostack)) };
-        }
-    }
-    while !done(word.load(Acquire)) {}
-}
-
-/// Worker i of `par`'s pool: runs each job with its i.
-fn worker(i: usize) {
-    for generation in 1.. {
-        wait(&GENERATION, |g| g >= generation);
-        // The read lock is held until the job is done: `par` writes the next job
-        // only once every worker has finished this one.
-        JOB.read().unwrap().unwrap()(i);
-        FINISHED.fetch_add(1, Release);
-    }
+/// f(0), f(1), ... f(n - 1), each on its own thread.
+fn par<T: Send>(n: usize, f: &(impl Fn(usize) -> T + Sync)) -> Vec<T> {
+    std::thread::scope(|s| {
+        let threads: Vec<_> = (0..n).map(|i| s.spawn(move || f(i))).collect();
+        // join cannot fail: with panic = "abort", a panic ends the process first.
+        threads.into_iter().map(|t| t.join().unwrap()).collect()
+    })
 }
 
 /// The p-th of `parts` near-equal ranges of 0..len.
@@ -816,23 +755,20 @@ impl Plan {
         let mut out = par(parts, &lines_part);
         let by_trigger: Vec<_> = out.iter_mut().map(|o| take(&mut o.0)).collect();
         let by_anchor: Vec<_> = out.iter_mut().map(|o| take(&mut o.1)).collect();
-        let always: Vec<_> = out.iter().flat_map(|o| o.2.iter().copied()).collect();
+        let mut always: Vec<_> = out.iter().flat_map(|o| o.2.iter().copied()).collect();
         let terms: Vec<_> = out.iter().flat_map(|o| o.3.iter().copied()).collect();
         let mut plan = Plan::default();
         // The anchors are grouped and the `always` entries sorted on a second
         // thread, while this one groups the entries.
-        let (always, entries, anchors) = (Mutex::new(always), OnceLock::new(), OnceLock::new());
-        par(2, &|i| match i {
-            0 => _ = entries.set(csr(&by_trigger, bool_terms + 1)),
-            _ => {
+        (plan.anchor, plan.anchored) = std::thread::scope(|s| {
+            let anchors = s.spawn(|| {
                 // By length and operators, so that `end_super` predicts its branches.
-                always.lock().unwrap().sort_unstable_by_key(|e| e.terms.iter().fold(e.len, |key, &word| key << 2 | word >> 30));
-                _ = anchors.set(csr(&by_anchor, order.len()));
-            }
+                always.sort_unstable_by_key(|e| e.terms.iter().fold(e.len, |key, &word| key << 2 | word >> 30));
+                csr(&by_anchor, order.len())
+            });
+            (plan.group, plan.entries) = csr(&by_trigger, bool_terms + 1);
+            anchors.join().unwrap()
         });
-        (plan.group, plan.entries) = entries.into_inner().unwrap();
-        (plan.anchor, plan.anchored) = anchors.into_inner().unwrap();
-        let mut always = always.into_inner().unwrap();
         plan.number_answers(&mut always, lines);
         let trig = |id: usize| id < bool_terms && plan.group[id] != plan.group[id + 1];
         let flag = |id: usize| (plan.anchor[id] != plan.anchor[id + 1]) as u32 * ANCHOR | trig(id) as u32 * TRIG;
