@@ -53,13 +53,8 @@ compile_error!("track-b needs AES-NI: build with RUSTFLAGS=\"-C target-cpu=nativ
 const ANCHOR: u32 = 1 << 31;
 const TRIG: u32 = 1 << 30;
 const ID: u32 = TRIG - 1;
-/// A document's stamp is its id modulo STAMPS, and each term keeps the stamp of
-/// its last document (`Scan::lastdoc`): one byte per term, a quarter of a u32.
-/// The bytes are reset to EMPTY every STAMPS documents, so an equal stamp is
-/// always this document's. DONE marks a trigger term that `end_doc` has taken.
-const STAMPS: u32 = 127;
-const EMPTY: u8 = 0xFF;
-const DONE: u8 = 0x80;
+/// Marks a trigger term's last document once `end_doc` has taken the term.
+const DONE: u32 = 1 << 31;
 /// Terms of up to KEY bytes live in the perfect hash, keyed by their bytes.
 const KEY: usize = 12;
 /// The spec's grammar: a BOOL query has 1 to 6 terms.
@@ -868,12 +863,10 @@ struct Scan<'a> {
     vocab: &'a Vocab,
     plan: Option<&'a Plan>,
     df: &'a [AtomicU32],
-    /// Per term, the stamp of the last document that contains it (see STAMPS).
-    /// Slot `count` takes the tokens no query uses; slot count + 1 is in no
-    /// document.
-    lastdoc: Vec<u8>,
-    /// The current document's stamp.
-    stamp: u8,
+    /// Per term, the last document that contains it (DONE marks a trigger term
+    /// that `end_doc` has taken). Slot `count` takes the tokens no query uses;
+    /// slot count + 1 is in no document.
+    lastdoc: Vec<u32>,
     /// This document's trigger term occurrences (as info words), and the entry
     /// ranges `(start, end)` of its trigger terms, each once.
     trig: Vec<u32>,
@@ -904,8 +897,7 @@ impl<'a> Scan<'a> {
             vocab,
             plan,
             df,
-            lastdoc: vec![EMPTY; plan.map_or(0, |_| vocab.count as usize + 2)],
-            stamp: 0,
+            lastdoc: vec![u32::MAX; plan.map_or(0, |_| vocab.count as usize + 2)],
             trig: Vec::new(),
             work: Vec::new(),
             wide,
@@ -1015,11 +1007,6 @@ impl<'a> Scan<'a> {
                 }
                 self.doc = id;
                 bit = 1 << (id % 64);
-                // A new window of stamps (the slice's first one starts empty).
-                if id % STAMPS == 0 {
-                    self.lastdoc.fill(EMPTY);
-                }
-                self.stamp = (id % STAMPS) as u8;
             }
             at += cut as usize;
             (mask, lf) = (next, next_lf);
@@ -1080,13 +1067,13 @@ impl<'a> Scan<'a> {
         self.pending.clear();
         // The sample only counts documents per term (end_doc).
         let Some(_) = self.plan else { return };
-        let (lastdoc, stamp) = (self.lastdoc.as_mut_ptr(), self.stamp);
+        let lastdoc = self.lastdoc.as_mut_ptr();
         for &info in &self.toks {
             let id = (info & ID) as usize;
             // SAFETY: id <= count < lastdoc.len(), min(id, rows) < wide.len(), and
             // block < 4.
             unsafe {
-                *lastdoc.add(id) = stamp;
+                *lastdoc.add(id) = doc;
                 *(*wide.add(min(id, rows))).0.get_unchecked_mut(block) |= bit;
             }
         }
@@ -1156,15 +1143,15 @@ impl<'a> Scan<'a> {
     fn trigger(&mut self, plan: &Plan) {
         let doc = self.doc;
         let (group, entries) = (plan.group.as_ptr(), plan.entries.as_ptr());
-        let (work, lastdoc, stamp) = (self.work.as_mut_ptr(), self.lastdoc.as_mut_ptr(), self.stamp);
+        let (work, lastdoc) = (self.work.as_mut_ptr(), self.lastdoc.as_mut_ptr());
         let mut m = 0;
         for t in self.trig.iter().map(|&info| (info & ID) as usize) {
             // SAFETY: trigger terms are below bool_terms, and group has
             // bool_terms + 2 entries; work has room for every trigger (look_up).
             unsafe {
                 // Branch-free: a repeated trigger term is written again and not kept.
-                let fresh = (*lastdoc.add(t) == stamp) as usize;
-                *lastdoc.add(t) = stamp | DONE;
+                let fresh = (*lastdoc.add(t) == doc) as usize;
+                *lastdoc.add(t) = doc | DONE;
                 let (from, to) = (*group.add(t), *group.add(t + 1));
                 prefetch(entries, from as usize);
                 work.add(m).write((from, to));
@@ -1185,7 +1172,7 @@ impl<'a> Scan<'a> {
             for e in unsafe { plan.entries.get_unchecked(from as usize..to as usize) } {
                 // Bit k: term k is in this document. SAFETY: entry terms are
                 // below count + 2 = lastdoc.len().
-                let has = |k: usize| unsafe { (*lastdoc.add(e.terms[k] as usize) & !DONE == stamp) as u32 } << k;
+                let has = |k: usize| unsafe { (*lastdoc.add(e.terms[k] as usize) & !DONE == doc) as u32 } << k;
                 let present = (0..MAX_BOOL_TERMS - 1).map(has).sum::<u32>();
                 // SAFETY: an entry's answer is an answer number, below state.len().
                 unsafe { self.answers.add_doc(e.answer, e.truth >> present & 1, doc) };
@@ -2610,13 +2597,7 @@ impl<'a> Scan<'a> {
     fn end_super(&mut self, base: u32) {
         let Some(plan) = self.plan else { return };
         let wide = self.wide.as_ptr() as *const __m256i;
-        for (k, entry) in plan.always.iter().enumerate() {
-            // The rows of the entry 4 on are random reads: fetched now, all six
-            // (padded with the all-ones row), so the count is fixed. A row is 32
-            // bytes, so shifting a term word by 5 also drops its op bits.
-            // SAFETY: the index is clamped to the last entry.
-            let ahead = unsafe { plan.always.get_unchecked((k + 4).min(plan.always.len() - 1)) };
-            ahead.terms.iter().for_each(|&word| prefetch(wide.cast::<u8>(), (word << 5) as usize));
+        for entry in &plan.always {
             let terms = &entry.terms[..entry.len as usize];
             // SAFETY: 32-byte loads of rows, which are 32-byte aligned (Row is
             // repr(align(32))); the terms of `always` entries are rows below
