@@ -129,11 +129,8 @@ fn main() {
                 // (A slice of n bytes has at most n / MIN_LINE + 1 lines.)
                 let most = len / MIN_LINE + slices;
                 let mut free = &mut vec![0; most].leak()[..];
-                loop {
-                    let p = slice.fetch_add(2, Relaxed);
-                    if p >= slices {
-                        break;
-                    }
+                let claim = || slice.fetch_add(2, Relaxed);
+                for p in std::iter::repeat_with(claim).take_while(|&p| p < slices) {
                     let pair = [&log[cut(p)..cut(p + 1)], &log[cut(p + 1)..cut(p + 2)]];
                     // SAFETY: the slices are part of the log: a read-only file mapping,
                     // which PAD zero bytes follow.
@@ -155,12 +152,13 @@ fn main() {
                         // at + len <= bound: every line is at most 214 bytes.
                         let out = unsafe { std::slice::from_raw_parts_mut((file + at) as _, len) };
                         let head = (hours[hour][0].0.0 << 24).to_be_bytes(); // its first 13 bytes
-                        let mut written = 0;
+                        // Last line first, each one ending where the next one starts.
+                        let mut at = len;
                         let named = endpoints.iter().zip(groups).filter(|g| g.1[0] > 0);
-                        for (&(_, name), &stat) in named {
-                            written += write(&head, name, stat, &mut out[written..]);
+                        for (&(_, name), &stat) in named.rev() {
+                            at = write(&head, name, stat, out, at);
                         }
-                        assert_eq!(written, len, "hour length");
+                        assert_eq!(at, 0, "hour length");
                         false
                     })
                 };
@@ -235,15 +233,8 @@ fn main() {
                     let (mut groups, mut len) = (Vec::with_capacity(endpoints.len()), 0);
                     for &(id, name) in endpoints {
                         let group = &mut values[start[id] as usize..start[id + 1] as usize];
-                        let mut stat = [0; 6]; // a count of 0: no line
-                        if !group.is_empty() {
-                            let [p50, p95, p99] = percentiles(group);
-                            let (n, errors) = (group.len() as u32, (counts[id] >> 32) as u32);
-                            let rate = (errors as u64 * 1_000_000 / n as u64) as u32; // in integers
-                            stat = [n, p50, p95, p99, errors, rate];
-                            len += line_len(name, &stat);
-                        }
-                        groups.push(stat);
+                        groups.push(stats(group, (counts[id] >> 32) as u32));
+                        len += line_len(name, groups.last().unwrap());
                     }
                     lens[hour].set(len).unwrap();
                     pending.push((hour, len, groups));
@@ -264,12 +255,11 @@ fn main() {
                 written.wait();
                 let total = offset(lens.len()).unwrap();
                 let k = share.fetch_add(1, Relaxed);
-                let [from, to] =
-                    [k, k + 1].map(|k| (file + total * k / threads).next_multiple_of(4096));
+                let at = |k: usize| (file + total * k / threads).next_multiple_of(PAGE);
                 // SAFETY: whole pages of the shared output mapping (page-aligned), all
-                // written and not touched again. MADV_DONTNEED (4) drops only their
+                // written and not touched again. MADV_DONTNEED drops only their
                 // page-table entries: the pages stay in the file.
-                unsafe { madvise(from as *mut u8, to - from, 4) };
+                unsafe { madvise(at(k) as *mut u8, at(k + 1) - at(k), MADV_DONTNEED) };
             });
         }
 
@@ -347,14 +337,17 @@ type Stats = [u32; 6];
 /// "YYYY-MM-DDTHH:00:00Z endpoint" then the numbers, each after a space, and LF.
 fn line_len(name: &[u8], stat: &Stats) -> usize {
     let digits = |v: u32| v.checked_ilog10().map_or(1, |d| d as usize + 1);
-    21 + name.len() + stat.iter().map(|&v| 1 + digits(v)).sum::<usize>() + 1
+    let len = 21 + name.len() + stat.iter().map(|&v| 1 + digits(v)).sum::<usize>() + 1;
+    if stat[0] > 0 { len } else { 0 } // a count of 0: no line
 }
 
-/// The line is put together from its end in a stack buffer, so no number's
-/// length is needed first, then copied to the start of `out`; returns its length.
-fn write(head: &[u8; 16], name: &[u8], stat: Stats, out: &mut [u8]) -> usize {
-    let mut line = [b'\n'; 256]; // 21 + 125 + 6 * 11 + 1 = 213 at most; it ends with LF
-    let mut at = line.len() - 1;
+/// Writes the line that ends at `out[end]`, from its end, straight into place, and
+/// returns where it starts: no number's length is needed first, and nothing is
+/// copied. (Put together in a stack buffer and copied, the copy's wide loads waited
+/// for the buffer's byte stores to reach the cache: a store-forwarding stall a line.)
+fn write(head: &[u8; 16], name: &[u8], stat: Stats, out: &mut [u8], end: usize) -> usize {
+    let mut at = end - 1;
+    out[at] = b'\n';
     for mut value in stat.into_iter().rev() {
         // Two digits at a time from the end, then the first digit of an odd-length
         // number (or the only one).
@@ -362,22 +355,21 @@ fn write(head: &[u8; 16], name: &[u8], stat: Stats, out: &mut [u8]) -> usize {
         while value >= 10 {
             let pair = value as usize % 100 * 2;
             at -= 2;
-            line[at..at + 2].copy_from_slice(&PAIRS[pair..pair + 2]);
+            out[at..at + 2].copy_from_slice(&PAIRS[pair..pair + 2]);
             value /= 100;
         }
         if value > 0 || at == end {
             at -= 1;
-            line[at] = b'0' + value as u8;
+            out[at] = b'0' + value as u8;
         }
         at -= 1;
-        line[at] = b' ';
+        out[at] = b' ';
     }
     at -= 21 + name.len();
-    line[at..at + 13].copy_from_slice(&head[..13]);
-    line[at + 13..at + 21].copy_from_slice(b":00:00Z ");
-    line[at + 21..at + 21 + name.len()].copy_from_slice(name);
-    out[..line.len() - at].copy_from_slice(&line[at..]);
-    line.len() - at
+    out[at..at + 13].copy_from_slice(&head[..13]);
+    out[at + 13..at + 21].copy_from_slice(b":00:00Z ");
+    out[at + 21..at + 21 + name.len()].copy_from_slice(name);
+    at
 }
 
 /// "00", "01", ..., "99".
@@ -487,16 +479,31 @@ unsafe fn parse(chunks: [&[u8]; 2], table: &Interner, free: &mut &'static mut [u
             (endpoint, len) = table.id(from);
         }
         // The latency: 1 to 10 digits from 5 bytes after the endpoint (its space,
-        // the three status digits and a space), to the LF. One that does not fit a
-        // record (1.2% of lines) goes to the escapes, and the record holds ESCAPE.
+        // the three status digits and a space), to the LF. Its first 8 bytes,
+        // zero-extended: up to 6 digits (99% of lines) are converted where they lie,
+        // and fit a record.
         let to = from.add(len);
-        let (latency, count) = parse_digits(to.add(5));
-        if latency >= ESCAPE as u64 {
-            escapes[k].push(latency as u32); // exact: latencies fit 32 bits (the spec)
-        }
+        let tail = _mm_loadl_epi64(to.add(5).cast());
+        let lf = _mm_cmpeq_epi8(tail, _mm_set1_epi8(b'\n' as i8));
+        let mut count = _mm_movemask_epi8(lf).trailing_zeros() as usize;
+        let latency = if count <= 6 {
+            let v = _mm_sub_epi8(tail, _mm_set1_epi8(b'0' as i8));
+            let v = _mm_maddubs_epi16(v, _mm_loadu_si128(DIGITS.0.as_ptr().add(8 * count).cast()));
+            let v = _mm_madd_epi16(v, _mm_loadu_si128(DIGITS.1.as_ptr().add(4 * count).cast()));
+            _mm_cvtsi128_si32(_mm_add_epi32(v, _mm_srli_epi64(v, 32))) as u32
+        } else {
+            // A latency that does not fit a record goes to the escapes, and the
+            // record holds ESCAPE.
+            let latency;
+            (latency, count) = parse_digits(to.add(5));
+            if latency >= ESCAPE as u64 {
+                escapes[k].push(latency as u32); // exact: latencies fit 32 bits (the spec)
+            }
+            latency.min(ESCAPE as u64) as u32
+        };
         // The status's first digit is right after the endpoint's space; '5' is 5xx.
         let error = ((*to.add(1) == b'5') as u32) << ERROR_SHIFT;
-        *record[k] = endpoint | error | latency.min(ESCAPE as u64) as u32;
+        *record[k] = endpoint | error | latency;
         record[k] = record[k].add(1);
         *line = to.add(5 + count + 1);
         true
@@ -514,11 +521,34 @@ unsafe fn parse(chunks: [&[u8]; 2], table: &Interner, free: &mut &'static mut [u
         runs[k].push((u128::MAX, lines[k], escapes[k].len())); // the end markers
     }
     let ([escapes0, escapes1], [runs0, runs1]) = (escapes, runs);
-    [(&first[..lines[0]], escapes0, runs0), (second, escapes1, runs1)]
+    let first = (&first[..lines[0]], escapes0, runs0);
+    [first, (second, escapes1, runs1)]
 }
 
 /// 128 bytes of 0xFF then 128 zeros: the 128 bytes from `128 - len` keep the first `len`.
 static KEEP: [[u8; 128]; 2] = [[0xFF; 128], [0; 128]];
+
+/// For n = 0..=6 digits at bytes 0..n of a vector, minus '0': at DIGITS.0[8n..],
+/// maddubs weights that make pairs (10a + b, or a alone for the last of an odd
+/// count), and at DIGITS.1[4n..], madd weights that give the pairs their place
+/// values, in two sums then added. Bytes from n on weigh 0, so the digits need no
+/// moving. Entries are 8 bytes apart, for one scaled address: a 16-byte load also
+/// reads the next entry, which only weighs the vector's upper half, not summed.
+static DIGITS: ([i8; 72], [i16; 36]) = {
+    let (mut pairs, mut scale) = ([0; 72], [0; 36]);
+    let mut i = 0;
+    while i < 56 {
+        let (n, j) = (i / 8, i % 8);
+        if j < n {
+            pairs[i] = if j % 2 == 0 && j + 1 < n { 10 } else { 1 };
+        }
+        if j < 4 && 2 * j < n {
+            scale[4 * n + j] = 10i16.pow((n - 2 * j).saturating_sub(2) as u32);
+        }
+        i += 1;
+    }
+    (pairs, scale)
+};
 
 /// An endpoint's identity: its bytes (at most 125), a space, then zeros to 128 bytes.
 /// No endpoint byte is a space or zero, so equal keys mean equal endpoints.
@@ -644,18 +674,16 @@ impl Interner {
         // Sync).
         unsafe {
             let load = |p: *const u8| _mm256_loadu_si256(p.cast());
-            let bytes: Key = std::array::from_fn(|i| load(from.add(32 * i)));
+            let line: Key = std::array::from_fn(|i| load(from.add(32 * i)));
             let space = _mm256_set1_epi8(b' ' as i8);
-            let mask =
-                |i: usize| (movemask(_mm256_cmpeq_epi8(bytes[i], space)) as u128) << (32 * i);
+            let mask = |i: usize| (movemask(_mm256_cmpeq_epi8(line[i], space)) as u128) << (32 * i);
             // 128 if there is none: a 125-byte endpoint's space is in the 128 bytes.
             let len = (mask(0) | mask(1) | mask(2) | mask(3)).trailing_zeros() as usize;
             // Tripwire for the spec's endpoint length: a file that breaks it stops here.
             assert!(len <= MAX_NAME, "requests.log: an endpoint is too long");
             // The key: the bytes up to and with the space after the endpoint, then zeros.
             let keep = KEEP.as_ptr().cast::<u8>().add(127 - len);
-            let key: Key =
-                std::array::from_fn(|i| _mm256_and_si256(bytes[i], load(keep.add(32 * i))));
+            let key = std::array::from_fn(|i| _mm256_and_si256(line[i], load(keep.add(32 * i))));
             // The same bytes as `find` hashes, from 8 bytes up (under 8 it never finds one).
             let bytes = key.as_ptr().cast::<u8>();
             let at = |i: usize| bytes.add(i).cast::<u64>().read_unaligned();
@@ -699,14 +727,17 @@ impl Interner {
     }
 }
 
-/// Nearest-rank p50, p95 and p99 (the value at 1-indexed rank ceil(p * n / 100)
-/// in sorted order) of a non-empty group. Groups of up to 64 values (95% of the
-/// groups) count ranks (see `small_ranks`); larger ones select: p50 first, then each
-/// next rank within the part above the last one. Each value is read at once: the
-/// next selection reorders that part, its own slot included.
-fn percentiles(values: &mut [u32]) -> [u32; 3] {
-    let ranks = [50, 95, 99].map(|p| (p * values.len()).div_ceil(100) - 1);
-    match values.len() {
+/// A group's line numbers (see Stats): its count (0, no line, for an empty group),
+/// nearest-rank p50, p95 and p99 (the value at 1-indexed rank ceil(p * n / 100) in
+/// sorted order), its errors and the error rate. Groups of up to 64 values (95% of
+/// the groups) count ranks (see `small_ranks`); larger ones select: p50 first, then
+/// each next rank within the part above the last one. Each value is read at once:
+/// the next selection reorders that part, its own slot included.
+fn stats(values: &mut [u32], errors: u32) -> Stats {
+    let n = values.len();
+    let ranks = [50, 95, 99].map(|p| (p * n).div_ceil(100).saturating_sub(1));
+    let [p50, p95, p99] = match n {
+        0 => return [0; 6],
         ..=8 => small_ranks::<1>(values, ranks),
         ..=32 => small_ranks::<4>(values, ranks),
         ..=64 => small_ranks::<8>(values, ranks),
@@ -716,7 +747,10 @@ fn percentiles(values: &mut [u32]) -> [u32; 3] {
             let p95 = *values[r50..].select_nth_unstable(r95 - r50).1;
             [p50, p95, *values[r95..].select_nth_unstable(r99 - r95).1]
         }
-    }
+    };
+    // The error rate in parts per million: errors * 1000000 / count, in integers.
+    let rate = (errors as u64 * 1_000_000 / n as u64) as u32;
+    [n as u32, p50, p95, p99, errors, rate]
 }
 
 /// The values at three ranks (0-indexed, in sorted order) of 1 to 8 * V values,
