@@ -740,7 +740,6 @@ impl Interner {
     /// rather than writing a wrong record. The bytes are copied: they are compared and
     /// printed after the input's pages are released.
     #[cold]
-    #[inline(never)]
     fn add(&self, slot: &AtomicU32, key: &Key, name: &[u8]) -> usize {
         // An id that lost its slot stays this thread's, for its next insert: at most
         // one id per thread is ever unpublished.
@@ -753,9 +752,7 @@ impl Interner {
         // SAFETY: the id is this thread's alone until a slot publishes it.
         unsafe { (*self.keys[id].get(), *self.names[id].get()) = (*key, name.to_vec().leak()) };
         let won = slot.compare_exchange(0, (id as u32) << ENDPOINT_SHIFT, Release, Acquire);
-        if won.is_err() {
-            SPARE.set(id);
-        }
+        SPARE.set(if won.is_err() { id } else { 0 }); // (taken above: 0 unless kept here)
         won.map_or_else(|held| (held >> ENDPOINT_SHIFT) as usize, |_| id)
     }
 }
