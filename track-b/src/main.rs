@@ -76,8 +76,8 @@ const SUM_BITS: u32 = 40;
 /// Document ids must be below this: a thread's sum of ids is then below
 /// MAX_DOCS^2 / 2 = 2^39, which fits in SUM_BITS.
 const MAX_DOCS: u32 = 1 << 20;
-/// How far ahead `end_doc` prefetches the presence and the state that the first
-/// entry of a trigger term's range reads, in ranges (1 and 4 measured the same).
+/// How far ahead `end_doc` prefetches the state that the first entry of a
+/// trigger term's range updates, in ranges (1 and 4 measured the same).
 const RANGES_AHEAD: usize = 2;
 /// Hash groups: a key's group is the low 6 bits of its hash (hash & 63). A pilot
 /// is 1 mod GROUPS, so each group owns a region of the table, and the threads
