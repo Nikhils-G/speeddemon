@@ -1,13 +1,16 @@
 # Track B: performance log
 
-**Result.** The reference: 56.35 s, 2,200 MB, S 91. The submitted code (step 62, 5fda0c0, S
-1033) is step 61 with one prefetch made to read only non-empty ranges; its runs took 0.087799 s
-(run-e734232a0ec5, 30.49 MB, 79.26 points), 0.088963 and 0.090207 s, and 0.132044 s in a slow
-dispatch. Step 61 ran 0.088016 s (run-6f92692cfe79, 30.13 MB, 79.24
-points) and 0.092338 s, and 0.144833 s in a slow dispatch. Step 59, the same engine, has the best Track B run: run-31588c94b3ee, 0.08596 s, 30.11 MB, S 1042, 79.46 points. On
-the replica steps 59 to 62 run at the same speed, about 85.1 to 85.5 ms. Every run ID below is in
-the board's history for team SALAAR. A run with "probe" in place of T, or a failed run in the probe
-tables, is a timing build that reports through its exit code.
+**Result.** The reference runs 56.35 s at 2,200 MB and S 91. The submitted code (step 65, 97b4897,
+S 1062) ran 0.085425 s on the board (run-a0a52b4578ea, 30.28 MB, 79.47 points), the best Track B
+run, and 0.086155 s; the steps since 57 ran 0.0857 to 0.0923 s in their clean runs. Three ideas carry it: no
+index at all, every query answered during one parallel scan, so nothing grows with the corpus
+(step 6); a perfect hash that gives each token one probe, built per input on every thread (steps
+31 and 58); and BOOL queries evaluated per document from truth tables, with the common ones
+evaluated once per 256 documents (steps 8 and 49-52). The last steps added a persistent pool of
+threads, whose waiting workers also map the corpus in, a 4-byte first-id log made exact for any
+line lengths, and checks for inputs the generator never writes, for 20 lines more than step 59.
+Every run ID below is in the board's history for team SALAAR. A run with "probe" in place of T, or
+a failed run in the probe tables, is a timing build that reports through its exit code.
 
 | What moved the score most | Step | Board, before → after |
 |---|---|---|
@@ -96,7 +99,10 @@ Before pushing, steps were timed in three ways ("How we measured", near the end)
 | 59 | 10ef5ba (runs from 86b9c7c, 807ce06) | b-stack-8: every phrase checked by one masked compare (look_up writes 8 `miss` ids after each document's tokens, so 8 ids exist from any phrase start; the loop, `Plan::terms` and `Phrase::start` gone; a phrase of over 8 terms stops the program); the row index as `id.min(rows)`, which LLVM compiles to `cmovb` (checked in the PGO binary), so the asm `min` is gone; the tail's lines pass (bt-4). Replica −1.349 ms (−1.56%, 29 of 31) against step 58; S 1073 → 1042. Its first run is the best Track B run | run-31588c94b3ee, run-ee87cc98e73b | 0.08596, 0.087145 | 30.11, 30.25 | 1042 | 79.46, 79.32 |
 | 60 | a046df6 (run from 30c2691) | b-stack-9: a lines pass at the same speed (tuple `let`s split, the state of the range `RANGES_AHEAD` on fetched without an `if let`, a stride not redefined; replica −0.25%, 20 of 31) | run-3c2c95caf5f8 | 0.08742 | 30.06 | 1030 | 79.32 |
 | 61 | 33ecba3 (later runs from eb1258d, 3aa95c6) | b-stack-10: review fixes: `par` asserts one call at a time (`BUSY`), and its SAFETY text covers the job left in `JOB`; the fallback wait without WAITPKG spins with `spin_loop`; a comment on why the setup's barrier cannot deadlock on the pool; one more line cut (replica +0.15%, 12 of 31: the same speed; second run in a slow dispatch) | run-6f92692cfe79, run-d023cb5dbb75, run-e39902c82c5d | 0.088016, 0.144833, 0.092338 | 30.13, 30.47, 30.63 | 1033 | 79.24, 73.83, 78.72 |
-| 62 | 5fda0c0 (later runs from 96502b4, 475aae6, 2f05cec) | b-stack-11: near the end of the work list, the trigger's lookahead prefetch reads the current range's first entry instead of entry 0, so every entry it reads is the first of a trigger term's range, which is never empty; 17 hand-made edge inputs added to the gate (replica +0.07%, 15 of 31: the same speed; first run in a slow dispatch). **The submitted code** | run-9a68373e9fd4, run-72fc88641e4b, run-43ec6fb133ea, run-e734232a0ec5 | 0.132044, 0.088963, 0.090207, 0.087799 | 29.97, 30.34, 30.42, 30.49 | 1033 | 74.83, 79.12, 78.97, 79.26 |
+| 62 | 5fda0c0 (later runs from 96502b4, 475aae6, 2f05cec) | b-stack-11: near the end of the work list, the trigger's lookahead prefetch reads the current range's first entry instead of entry 0, so every entry it reads is the first of a trigger term's range, which is never empty; 17 hand-made edge inputs added to the gate (replica +0.07%, 15 of 31: the same speed; first run in a slow dispatch) | run-9a68373e9fd4, run-72fc88641e4b, run-43ec6fb133ea, run-e734232a0ec5 | 0.132044, 0.088963, 0.090207, 0.087799 | 29.97, 30.34, 30.42, 30.49 | 1033 | 74.83, 79.12, 78.97, 79.26 |
+| 63 | 854810e (later runs from ffb2e77, aa1fe77) | b-stack-12: `slices` cuts a range of more than 2^16 documents every 2^16 lines, so a valid corpus of many short lines no longer aborts on the first-id log's limit (step 62 aborted on 9 of 15 runs of five skewed corpora); replica −0.11% (17 of 31) | run-995664fe93be, run-68dc93bf4db2, run-563148ea7a1e | 0.087268, 0.091365, 0.089198 | 30.45, 30.33, 29.96 | 1048 | 79.28, 78.78, 79.04 |
+| 64 | 50f07bb (run from 5216711) | b-stack-13: pool workers that wait for a job map the corpus pages in ahead of the scan, one read per 64 KB (replica −0.787 ms, 29 of 31, on seed 1; −1.361 ms, 31 of 31, on holdout 99) | run-d84c9fde9fad | 0.085659 | 30.43 | 1059 | 79.45 |
+| 65 | 97b4897 (second run from b8b733a) | b-stack-14: the terms' info words built by a parallel round over ranges of the old ids, instead of one serial pass of 0.51 ms (replica −0.334 ms, 20 of 31; eight more A/Bs, two builds a side, all ≤ 0, mean −0.25 ms). **The submitted code**; its run is the best Track B run | run-a0a52b4578ea, run-e3147d5de2df | 0.085425, 0.086155 | 30.28, 30.21 | 1062 | 79.47, 79.38 |
 
 **Code-quality pass (5a0612d, step 47; also pushed as 7f08fe7 and 045a6b5), on the box:**
 run-5892b2f7eb00 0.144406 s (a slow dispatch), run-eb924b66b4aa 0.115198 s (runs.log 09:47Z) and
@@ -106,7 +112,19 @@ offsets as step 44's in local PGO, local plain and test-server PGO builds (objdu
 and two PGO builds of each time the same on the test server (medians of 31 interleaved rounds of
 11 runs: 80.90 and 81.02 ms for step 44, 81.05 and 80.89 for the quality pass).
 
-**The submitted code is step 62 (b-stack-11, 5fda0c0), S 1033**: step 61 with the trigger's
+**The submitted code is step 65 (b-stack-14, 97b4897), S 1062**: step 64 with the terms' info words
+built in parallel. Replica −0.334 ms (20 of 31) against step 64, and in eight more A/Bs (two builds a
+side, seed 1 and holdout 99) all ≤ 0, mean −0.25 ms; memory, max of 10 runs,
+31.64 MB (9 of the 10 at most 30.29). Board: run-a0a52b4578ea, 0.085425 s, 30.28 MB, 79.47 points,
+the best Track B run, and run-e3147d5de2df, 0.086155 s.
+
+**Step 64 (b-stack-13, 50f07bb), S 1059**: step 62 with step 63's slicing of
+skewed corpora and step 64's mapping of the corpus by waiting workers. Replica: step 63 −0.11% (17
+of 31), step 64 −0.787 ms (29 of 31) on seed 1 and −1.361 ms (31 of 31) on holdout 99; memory, max
+of 10 runs, 30.31 MB. Board: run-d84c9fde9fad, 0.085659 s, 30.43 MB, 79.45 points, the fastest
+Track B time. S 1033 → 1059 costs 0.08 points; the replica's −1.0% on seed 1 is worth 0.11.
+
+**Step 62 (b-stack-11, 5fda0c0), S 1033**: step 61 with the trigger's
 lookahead prefetch reading only non-empty ranges (the old read was safe too: the work list is
 non-empty only when a trigger term exists). Replica +0.07% against step 61 (15 of 31): the same
 speed. Its gate added 17 hand-made edge inputs (only phrases, only `always` queries, one BOOL
@@ -476,6 +494,33 @@ step 24 ran without the disturbance.
   exists, since a range belongs to a trigger term and is never empty. The old read was safe too,
   and 17 hand-made edge inputs, now part of the gate, gave the reference's output with both
   versions and with a bounds-checked build. Replica +0.07% (15 of 31). S unchanged.
+- **Step 63: skewed corpora.** Slices were cut by bytes, and the 4-byte first-id log keeps 16 bits
+  of an id, so a slice must hold at most 2^16 documents. A valid corpus with many short lines in
+  one place broke that: 250,000 documents with 80,000 empty ones first, or last, made step 62
+  abort at 1, 3 and 12 CPUs, where the reference answers. Generated corpora, with even line
+  lengths and at most about 31,000 documents a slice, never hit it. `slices` now cuts a range of
+  more than 2^16 documents every 2^16 lines. The ranges' document counts come from the ids at the
+  byte cuts and the last line's id, so a normal input does no extra work. Five skewed corpora
+  (empty documents first, last and in the middle, no trailing LF, 300,000 tiny documents) give the
+  reference's output at 1, 3 and 12 CPUs (step 62: 9 of the 15 runs aborted), and joined the gate.
+  Replica −0.11% (17 of 31). S 1033 → 1048.
+- **Step 64: the corpus mapped in by waiting workers.** Between setup jobs the pool's workers sat
+  in `umwait`, while the scan later took the corpus's page faults itself. A waiting worker now
+  reads one byte per 64 KB of the corpus, and the kernel maps the 16 pages around each read
+  (fault-around); the reads are interleaved over the slices, so every slice gains alike.
+  `madvise(MADV_POPULATE_READ)` had held `mmap_lock` and stalled the main thread's allocations
+  (+7.7 ms); a page fault takes only its VMA's lock on kernels with per-VMA fault locks (Linux 6.4
+  and later; the replica runs 6.12). Replica −0.787 ms (29 of 31) on seed 1 and −1.361 ms (31 of
+  31) on holdout 99, and in a second set of A/Bs −1.338 and −1.114 ms on seed 1, −1.077 and
+  −1.465 ms on holdout 99 (two builds a side). The box's kernel was not probed: its first board
+  run, 0.085659 s, was the fastest Track B time until step 65. S 1048 → 1059.
+- **Step 65: the info words in parallel.** `Plan::new` built every term's info word (its new id
+  and the ANCHOR and TRIG flags, by old id) in one serial pass of 0.51 ms, with eleven threads
+  waiting. It is now a parallel round over ranges of the old ids, concatenated: the same words in
+  the same order, with the random reads of the group and anchor tables on twelve threads. Replica
+  −0.334 ms (20 of 31) against step 64; the eight A/Bs of the change, two builds a side on seed 1
+  and holdout 99, were all ≤ 0, mean −0.25 ms. S 1059 → 1062.
+
 
 ## Box probes since step 47
 
@@ -649,6 +694,9 @@ Board-measured reverts are in the table above (steps 11, 12, 14, 24, 27 and 46).
 | The query splits leaked instead of freed | −0.07 ms: their unmapping only moves to the exit |
 | `parse_queries` on half the threads | +1.4 ms |
 | First-round chunk sizes weighted for the threads' start order (the workers start 0.37 to 0.98 ms after the main thread) | No gain |
+| The slot prefetch with `_MM_HINT_T1` or `_MM_HINT_NTA` instead of T0 (on step 65) | Replica +0.421 ms (9 of 31) and +1.608 ms (0 of 31) |
+| The trigger's `add_doc` only on a hit, behind a branch (on step 65) | Replica +3.869 ms (0 of 31): 52% of the 5.51M triggered evaluations hit on seed 1, so the branch is a coin flip |
+| A parallel scatter for the plan's entries and anchors, each thread placing a key range, with the `always` sort by cached keys (on step 65) | Replica +0.234, +0.200, +0.079 and +0.190 ms (11 to 14 of 31), +23 S: the waiting threads of the round it replaced were time for mapping the corpus in |
 
 - **A faster setup can leave the whole run as it was.** Two setup changes above measured faster on
   their own, −0.424 and −0.185 ms, and in the whole run the same speed and +0.28 ms. Phase marks
@@ -801,7 +849,8 @@ the one tested. Steps 52 to 55 each passed the same gate on the replica's build;
 Steps 55 to 58 passed it too (full seed 1 at 1, 3, 7 and 12 CPUs, samples 1 to 4, holdout 99, the
 144 runs), each with the same 12 `vpinsrb` of the stamp gather; their memory, max of 5 runs, is
 39.67, 40.44, 36.91 and 31.06 MB. Steps 59 to 61 passed it too, with 30.28, 29.89 and 30.29 MB, and step 61 also gave the seed-1
-hash at 1 and 3 CPUs. Step 62 passed it with 17 hand-made edge inputs added, at 1, 3 and 12 CPUs.
+hash at 1 and 3 CPUs. Step 62 passed it with 17 hand-made edge inputs added, at 1, 3 and 12 CPUs, and steps 63 and 64
+with the five skewed corpora too (66 hand-made edge runs in all), and step 65 the same.
 
 **Robustness runs** (replica, Sun 1 Nov about 17:00 UTC), on the exact Dockerfile build, with data
 generated on the replica by the organisers' generator (it reproduces the official sample seed 1
@@ -828,12 +877,12 @@ The tiny sets re-seed the perfect hash, so every gate also runs its re-seed path
 **The box number.** Single board runs of one binary have spread up to 45% in disturbed
 dispatches, so:
 
-- **The replica first** (steps 52 to 62): paired runs, each part against the stack before it.
+- **The replica first** (steps 52 to 65): paired runs, each part against the stack before it.
 - **Board samples** then check. Step 52's last two runs were 0.093419 and 0.092845 s, and step
   53's runs 0.091413 to 0.092929 s, against step 49's median of 0.101022 s. An in-process probe on
   the box read step 52 8.7 ms faster than step 49. Steps 54 and 55's runs, 0.089795 to 0.114435
-  s, showed their replica gains only in their best runs; steps 57 to 62 ran 0.08596 to 0.092338
-  s in fourteen clean runs.
+  s, showed their replica gains only in their best runs; steps 57 to 65 ran 0.085425 to 0.092338
+  s in twenty clean runs.
 - **Alternating dispatches**, before the replica: candidates pushed in turn, minutes apart, against
   the code they would replace, and a result had to repeat (steps 41 to 44: 0.12433 for the
   sort-free first ids, 0.114997 back on the sort, 0.112506 sort-free again; steps 45, 46b and 47

@@ -20,14 +20,10 @@ percentiles need every latency of a group, not a running summary.
 
 ## Where the time goes on the box
 
-The submitted code is PERF.md step 60 (3aa95c6, S 449): the engine of step 51 in fewer lines,
-with the id space made a bound, `main` reviewed and its phases mapped. Its board runs took
-0.016349 s (run-a3c12461b2f4, 19.26 MB, 86.26 points), 0.016872, 0.017182 and 0.018029 s. Step 56, the same engine, ran 0.016437 s
-(run-363747825a0f, 18.86 MB, 86.39 points); step 59, the same code before formatting, ran 0.016337 s (run-e0198f0c5bb3,
-19.53 MB, 86.22 points), 0.016398 s (run-50a831ae6163, 19.15 MB, 86.27 points) and 0.016657 s, and
-0.021609 s in one of the box's slow runs for Track A (PERF.md). The best Track A points are step 55's
-run-ea674ef8448a (0.016399 s, 19.0 MB, S 428, 86.44 points); step 51's four runs took 0.016307 to
-0.023882 s. On the replica of the scoring box (the same CPU, timed by the board's own timer;
+The reference runs 32.05 s at 228 MB and S 56. The submitted code (PERF.md step 60, 3aa95c6, S
+449) runs 0.0163 to 0.0172 s on the board in its normal runs (run-252c6a84434b, 0.016292 s, 19.61
+MB, 86.22 points, the fastest Track A time; run-4f8350fdbe1a, 0.016341 s, 86.32 points) (details:
+PERF.md, steps 51-60). On the replica of the scoring box (the same CPU, timed by the board's own timer;
 PERF.md, "How we measured"), step 53 ran at a median of 16.856 ms over 201 pairs, and steps 54 to
 56, 59 and 60 within 0.3% of it.
 
@@ -565,8 +561,8 @@ hand. All the code is one file, `src/main.rs`.
 - **The selections of the large groups.** The 5.9K groups of more than 64 values hold 63% of the
   values, and their `select_nth_unstable` calls cost about 1.15 ms on the replica (a build that
   skips them, wrong output, ran 6.9% faster). Counting ranks up to 96 or 128 values did not help,
-  nor did sorting groups of up to 128 or 256 values, a bracketed sample selection, or an AVX2
-  quickselect (PERF.md, experiments). A cheaper exact selection for groups of 65 to a few thousand
+  nor did sorting groups of up to 128 or 256 values, a bracketed sample selection, an AVX2
+  quickselect or a radix select (PERF.md, experiments). A cheaper exact selection for groups of 65 to a few thousand
   values is still the next thing to try.
 - **The memory peak.** The board read 18.79 to 19.8 MB in six runs of step 56's engine, the
   replica up to 19.58 MB as the max of 20 runs, and the final scoring takes the largest of five

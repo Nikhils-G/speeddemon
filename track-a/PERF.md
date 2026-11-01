@@ -1,14 +1,18 @@
 # Track A: performance log
 
-**Result.** The reference: 32.05 s, 228 MB, S 56. The submitted code (step 60, 3aa95c6, S 449) is
-step 59 with the source formatted and two named patterns; its runs took 0.016349 s
-(run-a3c12461b2f4, 19.26 MB, 86.26 points), 0.016872, 0.017182 and 0.018029 s; the 0.018029 s run
-came in a slower window, in which step 59 itself had run 0.01795 s just before. Step 59's runs took 0.016337 s (run-e0198f0c5bb3, 19.53 MB, 86.22 points), 0.016398 s
-(run-50a831ae6163, 19.15 MB, 86.27 points) and 0.016657 s, and once 0.021609 s, in a dispatch where
-B and C ran fast: one of Track A's slow runs (below). Step 56, the same engine, ran 0.016437 to
-0.016896 s in five of its six runs. The best Track A run is step 55's run-ea674ef8448a: 0.016399
-s, 19.0 MB, S 428, 86.44 points. Every run ID below is in the board's history for team SALAAR. A run with "probe" in place of T is a timing build that reports
-through its exit code ("Box probes").
+**Result.** The reference runs 32.05 s at 228 MB and S 56. The submitted code (step 60, 3aa95c6,
+S 449) runs 0.0163 to 0.0172 s on the board in its normal runs (run-252c6a84434b, 0.016292 s,
+19.61 MB, 86.22 points, the fastest Track A time; run-4f8350fdbe1a, 0.016341 s, 86.32 points);
+about one run in four of steps 59 and 60 was slow, 0.018 to 0.0216 s, mostly with B and C normal in
+the same dispatch. Three ideas carry it: a parse that finds each line's fields from one AVX2 mask
+and looks its endpoint up where it lies, with two slices side by side per thread (steps 43 and
+51); 4-byte records grouped into hours as runs of lines, so no timestamp is parsed per line and no
+disorder bound is assumed (step 8); and a pass 2 that counts ranks for small groups and writes
+each hour in place as soon as its start is known (steps 19 and 44). The last steps traded 21 lines
+(0.16 points of S) for an exact id bound and a reviewed `main`, so step 55's run-ea674ef8448a
+(0.016399 s, S 428, 86.44 points) keeps the best points. Every run ID below is in the board's
+history for team SALAAR; "probe" marks a timing build that reports through its exit code ("Box
+probes").
 
 | What moved the score most | Step | Board, before → after |
 |---|---|---|
@@ -102,14 +106,15 @@ numbers are left out rather than guessed.
 | 57 | 44e0f8f (pushed again in 6c74bed and 1d0d4d2; runs from 44e0f8f, d45040c, f44e04e, 4968eb1 and 2c3726c) | **Not kept.** A two-stage hand-off from the merge, statistics in endpoint-id order, `merge` in its own function, review fixes in `main` (replica −1.07%; three slow runs, the first in a DISTURBED dispatch) | run-985d6d613f50, run-4450635c0aa4, run-b52d7aae5afa, run-a7d4ecb54f55, run-5ebacd965273 | 0.020201, 0.019909, 0.016445, 0.01712, 0.020064 | 18.98, 18.6, 19.95, 18.6, 19.25 | 455 | 83.98, 84.23, 86.00, 85.87, 84.00 |
 | 58 | 7b08d0e (pushed again in a106aad, 06dc6af, 807ce06 and 9551b98; runs from bd025d6, a106aad, 88af8ca, 53173d3, 807ce06, 33ecba3 and eb1258d) | **Not kept.** Comments only: a map of `main`'s six phases at its top, and a numbered marker at each (replica +0.06%; third and seventh runs DISTURBED) | run-1f3d437258fa, run-0d978e5039ea, run-73ac35eef2fb, run-e0d136168198, run-445e63a8cb62, run-b84b4205c810, run-b7d4ea68c951 | 0.016367, 0.018107, 0.018606, 0.024994, 0.016386, 0.018801, 0.018667 | 19.49, 18.95, 18.58, 18.6, 18.79, 18.85, 18.67 | 455 | 86.15, 85.18, 84.97, 81.76, 86.30, 84.79, 84.91 |
 | 59 | 398eb51 (pushed again in 42de64e, 86b9c7c, 9a96e47 and 96502b4; runs from 86b9c7c, 30c2691 and 96502b4) | Step 56 with one hand-off as before, the review fixes in `main` (`merge` in its own function, named mapping flags, the 213-byte bound from `LABEL` and `MAX_NAME`) and step 58's phase map (replica −0.11% against step 56 with its comments, +1.22% against step 58) | run-fa59eb3110d4, run-e0198f0c5bb3, run-50a831ae6163, run-4c8b8c38042b, run-732cf8332ca6 | 0.021609, 0.016337, 0.016398, 0.016657, 0.01795 | 19.12, 19.53, 19.15, 19.35, 18.43 | 447 | 83.28, 86.22, 86.27, 86.05, 85.45 |
-| 60 | 3aa95c6 (pushed again in 475aae6; later runs from 5fda0c0, 475aae6, 2f05cec) | Step 59 with the source rustfmt-clean (`DIGITS` reflowed) and named patterns for the hour key and the part (replica: four 201-pair runs within ±0.52%, the same speed). **The submitted code** | run-4b5fb70e5ea3, run-a3c12461b2f4, run-572c43fab1c2, run-b161edfe5e4e | 0.016872, 0.016349, 0.018029, 0.017182 | 19.56, 19.26, 19.0, 19.5 | 449 | 85.85, 86.26, 85.26, 85.67 |
+| 60 | 3aa95c6 (pushed again in 475aae6; later runs from 5fda0c0, 475aae6, 2f05cec, 854810e, ffb2e77, aa1fe77, 5216711, 97b4897 and b8b733a) | Step 59 with the source rustfmt-clean (`DIGITS` reflowed) and named patterns for the hour key and the part (replica: four 201-pair runs within ±0.52%, the same speed). **The submitted code** | run-4b5fb70e5ea3, run-a3c12461b2f4, run-572c43fab1c2, run-b161edfe5e4e, run-8968e0dda4bc, run-df119fbf8104, run-252c6a84434b, run-4f8350fdbe1a, run-9f79d54ff353, run-689f0017edc4 | 0.016872, 0.016349, 0.018029, 0.017182, 0.016905, 0.018828, 0.016292, 0.016341, 0.019578, 0.016896 | 19.56, 19.26, 19.0, 19.5, 19.18, 18.85, 19.61, 19.01, 19.02, 19.02 | 449 | 85.85, 86.26, 85.26, 85.67, 85.92, 84.82, 86.22, 86.32, 84.36, 85.96 |
 
 **The submitted code is step 60 (a-15, 3aa95c6), S 449**: step 59 with the source rustfmt-clean
 and named patterns for the hour key and the part, the same at run time (replica: +0.52%, −0.18%,
-−0.23%, and +0.06% in reverse order, over four 201-pair runs). Its runs took 0.016349 s
-(run-a3c12461b2f4, 19.26 MB, 86.26 points), 0.016872 s (run-4b5fb70e5ea3), 0.017182 s
-(run-b161edfe5e4e) and 0.018029 s (run-572c43fab1c2), the last in a slower window: step 59 ran
-0.01795 s in the dispatch before. Steps 56, 59 and 60 cost 21 lines against step 55,
+−0.23%, and +0.06% in reverse order, over four 201-pair runs). Its ten runs took 0.016292
+to 0.019578 s: run-252c6a84434b, 0.016292 s (19.61 MB, 86.22 points), the fastest Track A time;
+run-4f8350fdbe1a, 0.016341 s (19.01 MB, 86.32 points); run-a3c12461b2f4, 0.016349 s;
+run-4b5fb70e5ea3, 0.016872 s; run-689f0017edc4, 0.016896 s; run-8968e0dda4bc, 0.016905 s; run-b161edfe5e4e, 0.017182 s; and
+0.018029, 0.018828 and 0.019578 s in slower windows, the last with B and C normal. Steps 56, 59 and 60 cost 21 lines against step 55,
 0.16 points of S.
 
 **Step 59 (a-14, 398eb51), S 447**: step 56's engine and hand-off, with the review fixes in `main`
@@ -690,6 +695,7 @@ The earlier probes behind step 12 used 0.25 ms units; their run IDs are not in o
 | Workers spinning (`pause`) on the merge's hand-off instead of sleeping on the futex (step 58 work) | Replica +0.01% and −0.28%: noise, for 6 more lines |
 | `MADV_POPULATE_WRITE` of each hour's output range before writing it (step 58 work) | Replica +3.30% (won 40 of 201 pairs), and 3.41% slower again with the pair order reversed: one call costs more than the hour's page faults (about 35) |
 | Steps 57-58's hand-off without the wait: a write step skips until the name order is ready, and the last one computes it if needed (step 59 work) | Replica −0.70% against step 59, for 11 more lines and more synchronisation to trust; not on the board |
+| A radix select for the groups of more than 64 values | Replica +1.67% and +1.69% in the full program |
 | An AVX2 quickselect for the groups of more than 64 values | 45-85% slower than the chained `select_nth_unstable` in a microbenchmark |
 | Groups of 65 to 128, or 65 to 256, values sorted instead of selected | Replica +0.83% and +1.96% |
 | Bracketed sample selection for the groups of more than 64 values | Replica +0.54% / +2.98% |
@@ -843,7 +849,7 @@ The gate is a shell script kept outside the repo (scc would count it as code): f
 - **Board samples** then confirm. Step 51's last two runs were 0.016954 and 0.016307 s. Step
   56 ran 0.016437 s (run-363747825a0f, 86.39 points), step 55 run-ea674ef8448a (0.016399 s, 19.0
   MB, S 428, 86.44 points), the best Track A points, step 59 ran 0.016337 to 0.016657 s in
-  three runs and 0.021609 s in one, and the submitted step 60 0.016349 to 0.018029 s in four runs.
+  three runs and 0.021609 s in one, and the submitted step 60 0.016292 to 0.019578 s in ten runs.
 - **Alternating dispatches**, before the replica: a candidate and the code it would replace were
   pushed in turn, a few minutes apart, so both met the same box state, and a result counted only
   if it repeated. Example (runs.log 08:10Z): step 37, step 39, step 37, step 39, step 37 gave

@@ -19,16 +19,10 @@ and CRLF and LF terminators mixed. Distinct names must be counted per country ov
 
 ## Where the time goes on the box
 
-The submitted code is PERF.md step 55 (2f05cec, S 471): step 54 with a last record without a
-terminator read like any other. Its first board run took 0.020511 s, in a dispatch where C alone
-ran slow; step 54, the same hot code, ran 0.017101 s (run-ac57ad222a30, 10.24 MB, 83.92 points) and
-0.017377 s in clean runs. Step 52, the same hot code before a fix of rare memory
-spikes, ran 0.017135 to 0.017364 s in three runs, and 0.020836 s once; step 51 ran 0.017095 to 0.017418 s, and 0.020944 and 0.021534 s in two slow
-dispatches. The best-scoring Track C run is step 49's run-46d6bf16c5bd (0.017362 s, 9.32 MB, S
-451, 84.30 points), with the same hot code and 20 fewer lines. On the replica of the scoring box
-(the same CPU, timed by the board's own timer; PERF.md, "How we measured"), step 48's median was
-17.63 ms, step 49 is 1.36% faster (147 of 201 pairs), step 50 the same speed, steps 51 and 52
-about 1.0% faster than step 50, step 53 the same speed again, step 54 0.28% faster, and step 55 the same speed.
+The reference runs 14.44 s at 367 MB and S 108. The submitted code (PERF.md step 58, b8b733a,
+S 487) ran 0.017376 s on the board (run-819427baa4d8, 10.17 MB, 83.67 points), and step 57, the
+same hot code, 0.0170 to 0.0173 s in its normal runs (run-c56b067ab64d, 0.016978 s, 10.74 MB, 83.71
+points; run-9ac7e3c0222d, 0.017339 s) (details: PERF.md, steps 49-58).
 
 Per record, step 46 executed about 193 instructions in all, parse and deduplication together
 (640.9M instructions for 3.32M records at 12 threads). The single largest stall is the join
@@ -68,7 +62,8 @@ against the reference).
 - *Size.* The join table has one byte per region id, for 2^20 ids: listed ids are below 1,000,000
   (spec 2.3), and every id above the table reads its last entry, which no listed id can set.
 - *Filling.* Threads claim 64 line-aligned chunks of regions.csv as they start and store each
-  region's group.
+  region's group. A country's three letters, read as a base-26 number (`(a * 26 + b) * 26 + c`),
+  index the table of codes already seen.
 - *Groups.* `_UNMATCHED` is group 0, the first key of the group list. A country gets the next
   group, 1 to 240, the first time any thread sees it.
 - *Output order.* The groups are sorted by code when the output is written, with `_UNMATCHED`
@@ -173,6 +168,16 @@ Two names are confused only if they share every compared bit:
   thread waits for another one until the very end.
 - *Why.* An earlier version had a barrier after each of 8 rounds, and one CPU shared with a busy
   loop made it take twice as long (42 ms instead of 22 on the test server); now it takes 25.
+- *Two threads on one CPU.* About one C run in four on the board was 20% slow: two of our threads
+  shared a CPU while another idled, and the scheduler left them together. After the wait for
+  regions.csv each thread now calls `move_off_shared_cpu`: it sets its CPU's bit (`sched_getcpu`) in one shared word; a thread that
+  finds its bit already set moves to the lowest CPU of its affinity mask that no thread has
+  claimed, and stays there for the rest of the run (`sched_setaffinity`). Only movers are pinned:
+  pinning every thread at its start was worse (18 slow runs in 300 against 4), and a move happens
+  in about 3% of runs. The mask is read once (`sched_getaffinity`), so a move never
+  leaves the CPUs the program was given, and a failed call leaves the thread where it is. A normal
+  run moves nothing. On the replica, runs over 19.5 ms went from 9 to 2 and from 12 to 6 in two
+  sets of 300, and induced stacking from 43.96 to 20.57 ms (PERF.md, step 56).
 - *Takeover.* If an inbox grows past 4 × threads buffers because its thread fell behind, whoever
   files into it takes over its table. If the owner holds its table just then, it has most likely
   lost its core to a filer, so the filer yields its core. Together these keep memory bounded.
@@ -196,7 +201,9 @@ Two names are confused only if they share every compared bit:
 The pair buffers wait for about one run, so their size follows the run size. About 3.3 MB is
 outside the program's control (measured before step 46): about 1 MB already charged when the
 program starts, about 0.7 MB of kernel page tables and stacks, and 1-2 MB of the kernel's per-CPU
-charge batching. On the replica the max of 7 runs was 10.32, 10.57 and 10.39 MB in three sets.
+charge batching. On the replica (mem.sh): step 58, 20 runs, max 10.50 MB; step 57, 20 runs, 9.30
+to 10.43 MB; step 56, the same
+logic, 200 runs, median 10.11 MB, max 10.99 MB.
 
 ## Techniques
 
@@ -252,7 +259,7 @@ are exact; the distinct-name count rests on a hash (technique 6 below).
 45. Tables sized from the generator's 100,000-name pool with 8 standard deviations of room, at most 5/8 full; more names stop the program. Exact: it stops; it never drops a name.
 46. Input pages dropped after the parse in two parts, one call per thread for each (`drop_pages`): the first two thirds before the last takes, the last third by the non-writers during the write; 23 TLB-shootdown rounds instead of one per block. Exact: `MADV_DONTNEED` on a private file mapping that is never written, so a later read faults the same bytes back in.
 47. Totals summed under one lock as each thread finishes, counted by `merged`; once all are in, thread 0 writes and exits without frees, while the others drop their tables' pages and a share of the join table, of regions.csv and of the input's last third (`drop_pages`). Exact: sums are added, min and max taken; the output is complete before the exit.
-48. The main thread is worker 0. Exact: thread placement only.
+48. The main thread is worker 0; a thread that finds another of ours on its CPU after the region wait moves to a free CPU of its affinity mask (`move_off_shared_cpu`, `sched_setaffinity`), and a failed call leaves it where it is. Exact: thread placement only.
 49. `#[inline(never)]` on `parse_run` and `add`: edits around them cannot change their register allocation. Exact: code placement only.
 50. Profile-guided build trained on generator seed 7, with atomic profile counters (Dockerfile). Items 50 and 51 change speed only: every check runs the Dockerfile's binary.
 51. Hot loops aligned to 64 bytes; fat LTO, one codegen unit, `panic = "abort"`, `crt-static`, `target-cpu=native`; `compile_error!` without AVX2, PCLMULQDQ or AES.
@@ -488,8 +495,8 @@ Evidence, on the binary the Dockerfile builds:
   one cut after a one-decimal amount, answered like any one-decimal amount, which the reference
   rejects.
 - **Robustness runs on the replica** (Sun 1 Nov, about 17:00 UTC), on the exact Dockerfile build
-  of step 52 (steps 53 and 54 change no output path, step 55 only a last record without a
-  terminator, which the generator never writes; all passed the gate), with data generated on the replica by the organisers' generator (Python 3.11, which
+  of step 52 (steps 53, 54 and 56 to 58 change no output path, step 55 only a last record without
+  a terminator, which the generator never writes; all passed the gate), with data generated on the replica by the organisers' generator (Python 3.11, which
   reproduces the official sample seed 1 and its reference output byte for byte). Every run was
   byte-exact, with no crash, no nonzero exit and no output on stderr:
   - 30 fresh full-scale seeds (101-130) at 12 threads, seeds 101-102 also at 1 and 3 CPUs and
@@ -538,8 +545,9 @@ edge cases of the robustness runs, each run through this program and through the
   moves (a lone quote, a lost LF) almost always ends a half-run somewhere else, and the assert
   stops the program. It is a tripwire, not a proof: for general 2.1 input, the step-24 version in
   PERF.md is the one to use.
-- *Other panics.* Indexing out of bounds, an unexpected header, a listed region id of 2^20 − 1 or
-  more, more than 240 countries, and more distinct names than the tables hold. The build aborts on
+- *Other panics.* A file that cannot be mapped, whose message names the OS error; indexing out of
+  bounds, an unexpected header, a listed region id of 2^20 − 1 or more, more than 240 countries,
+  and more distinct names than the tables hold. The build aborts on
   panic (`panic = "abort"`), so each one prints its message and the exit status is nonzero.
 - *Bounds.* Every `unsafe` access is in bounds for any input, not only for 2.2 input: the fast path
   never reads outside the 256-byte margin it checks, and the walker hashes a padded copy of the
@@ -564,8 +572,8 @@ removed (PERF.md, step 25).
 
 ## Dependencies
 
-None: the Rust standard library only, with `mmap`, `madvise`, `mallopt` and `prctl` declared by
-hand. The build needs AVX2, PCLMULQDQ and AES (the Dockerfile builds with `target-cpu=native`);
+None: the Rust standard library only, with `mmap`, `madvise`, `mallopt`, `prctl`, `sched_getcpu`,
+`sched_getaffinity` and `sched_setaffinity` declared by hand. The build needs AVX2, PCLMULQDQ and AES (the Dockerfile builds with `target-cpu=native`);
 without them a `compile_error!` stops it.
 
 ## With another 24 hours

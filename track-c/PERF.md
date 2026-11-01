@@ -1,16 +1,15 @@
 # Track C: performance log
 
-**Result.** The reference: 14.44 s, 367 MB, S 108. The submitted code (step 55, 2f05cec, S 471) is
-step 54 with a last record without a terminator read like any other; its first run took 0.020511
-s (run-d4f9240d849b, 10.06 MB, 82.02 points), in a dispatch where C alone ran slow. Step 54's runs
-took 0.017101 s (run-ac57ad222a30, 10.24 MB, 83.92 points), 0.017377 and 0.019528 s, and 0.020717
-and 0.02109 s in a DISTURBED and a slow dispatch. Step 52, the same hot code before a fix of rare memory spikes and review fixes, ran
-0.017135 to 0.017364 s in three clean runs; its run-f42a9af9241c (0.017135 s, 10.25 MB, 83.92
-points) is its best. The best Track C run is step 49's run-46d6bf16c5bd (0.017362 s, 9.32 MB, S
-451, 84.30 points): steps 50 to 54 added 20 lines (0.14 points of S) for review fixes, a parallel
-teardown and the memory fix (replica about −1.1% over steps 51 to 54, worth about 0.12 points). Every run ID
-below is in the board's history for team SALAAR. A run with "probe" in place of T is a timing
-build that reports through its exit code ("Box probes").
+**Result.** The reference runs 14.44 s at 367 MB and S 108. The submitted code (step 58, b8b733a,
+S 487) ran 0.017376 s on the board (run-819427baa4d8, 10.17 MB, 83.67 points), and step 57, the
+same hot code, 0.0170 to 0.0173 s in its normal runs (run-c56b067ab64d, 0.016978 s, 10.74 MB, 83.71
+points; run-9ac7e3c0222d, 0.017339 s). Three ideas carry it: a simdjson-style parse that never reads a field's bytes
+twice (steps 6-15), cuts and a record path that trust spec 2.2 behind tripwires (step 25), and a
+join and a distinct-name count with no shared state, whose one random load is prefetched a whole
+record ahead (steps 46-49). The last nine steps traded 36 lines (0.25 points of S) for review
+fixes, a parallel teardown and two fixes of the box's rare slow and memory-heavy runs. Every run ID
+below is in the board's history for team SALAAR; "probe" marks a timing build that reports through
+its exit code ("Box probes").
 
 | What moved the score most | Step | Board, before → after |
 |---|---|---|
@@ -98,7 +97,10 @@ their own, or their run is not in the log; their numbers are left out rather tha
 | 52 | 53173d3 (later runs from 42de64e, 86b9c7c, 807ce06) | c-17: the input's pages dropped in two parts, two thirds before the last takes and the last third by the other threads while thread 0, now always the writer, writes the output (replica about −0.5%: −0.07% to −0.68% over four builds; probe builds of the same split −0.52% to −1.02%; third run: C alone slow) | run-ae04f5d6b6e3, run-beae5769413b, run-2de41de3360e, run-f42a9af9241c | 0.017364, 0.017247, 0.020836, 0.017135 | 10.44, 10.59, 11.34, 10.25 | 467 | 83.70, 83.71, 81.36, 83.92 |
 | 53 | 30c2691 (second run from 33ecba3) | c-18: the record parser's four early-exit guards through a named helper, `ensure` (replica +0.14%, 67 of 151 pairs: the same speed; first run: C alone slow) | run-481bdc9d6143, run-0ab5efa1c8b9 | 0.020766, 0.01721 | 10.51, 10.42 | 470 | 81.71, 83.78 |
 | 54 | eb1258d (later runs from 3aa95c6, 5fda0c0, 96502b4, 475aae6) | c-19: a filer whose takeover finds the table locked yields its core, which ends rare memory spikes; `drop_pages` takes a raw pointer; comments brought up to date (replica −0.28% against step 53; first run DISTURBED, third in a slow dispatch) | run-ee5c6aeac392, run-de2dd8d747e2, run-f3dcdb9fca12, run-ac57ad222a30, run-adf9a0251048 | 0.020717, 0.017377, 0.02109, 0.017101, 0.019528 | 10.1, 10.32, 9.93, 10.24, 10.39 | 471 | 81.90, 83.71, 81.77, 83.92, 82.41 |
-| 55 | 2f05cec | c-20: a last record without a terminator, which 2.1 allows, read like any other, with the reference's output; the top comment says exactly what is answered and how (replica +0.33% and −0.10% in two builds: build noise; first run: C alone slow). **The submitted code** | run-d4f9240d849b | 0.020511 | 10.06 | 471 | 82.02 |
+| 55 | 2f05cec (second run from 854810e) | c-20: a last record without a terminator, which 2.1 allows, read like any other, with the reference's output; the top comment says exactly what is answered and how (replica +0.33% and −0.10% in two builds: build noise; both runs: C alone slow) | run-d4f9240d849b, run-a968d9c22097 | 0.020511, 0.020647 | 10.06, 10.15 | 471 | 82.02, 81.91 |
+| 56 | ffb2e77 | c-21: after the region wait, a thread that finds another of ours on its CPU moves to the lowest free CPU of its affinity mask (replica −0.39%, 115 of 201; runs over 19.5 ms 9 → 2 and 12 → 6 in two sets of 300 pairs) | run-2fae75090a37 | 0.017003 | 10.38 | 483 | 83.84 |
+| 57 | aa1fe77 (later runs from 5216711, outside the queue, and 97b4897) | c-22: a failed CPU lookup, mask read or move leaves the thread where it is, with nothing asserted (replica +0.16%, 87 of 201: the same speed) | run-9ac7e3c0222d, run-fbcbe364dd0f, run-c56b067ab64d | 0.017339, 0.017057, 0.016978 | 10.31, 10.49, 10.74 | 483 | 83.66, 83.76, 83.71 |
+| 58 | b8b733a | c-23: the CPU move as a named function (`move_off_shared_cpu`), `mmap` errors that name their cause, `fill` indexing the codes by `(a * 26 + b) * 26 + c`, review comments; the hot code compiles as step 57's (replica −0.11%, 106 of 201; mem.sh, 20 runs, max 10.50 MB). **The submitted code** | run-819427baa4d8 | 0.017376 | 10.17 | 487 | 83.67 |
 
 Two more runs of step 32's code were in a DISTURBED and a SLOW BOX dispatch: run-87e294d71310
 (0.022429 s) and run-dc9ee4598ca3 (0.021796 s, 11.28 MB).
@@ -110,7 +112,26 @@ dispatch for A and B); run-84ffefa565f7 0.021882 s, 10.77 MB, 81.04, and run-f93
 fall in step 35's range (0.021639 to 0.022423 s), so the pass cost no speed; it cost points
 through S (429 → 469).
 
-**The submitted code is step 55 (c-20, 2f05cec), S 471**: step 54 with a last record without a
+**The submitted code is step 58 (c-23, b8b733a), S 487**: step 57 with the review's code items. The
+CPU move is a named function, `move_off_shared_cpu`, called after the region wait, whose comment
+says that a moved thread stays on its new CPU and why that is safe enough; `mmap`'s failure message
+names the OS error; `fill` indexes the country codes by `(a * 26 + b) * 26 + c`; and `parse_run`'s
+comment keeps the why, with its measurements in this file (steps 47-48). Against step 57's build,
+`add`, `walk_record`, `write_output`, `run` and `main` compile to the same instructions, and
+`parse_run` to the same 920 but for the usual 4-line block swap between PGO builds. Replica −0.11%
+(106 of 201 pairs); the gate passed, and fresh full seeds 101-105 gave the reference's output as
+root and as uid 65534; mem.sh, 20 runs, max 10.50 MB (step 57: 10.43). Board: run-819427baa4d8,
+0.017376 s, 10.17 MB, 83.67 points.
+
+**Step 57 (c-22, aa1fe77), S 483**: step 55 with step 56's move off a shared
+CPU, and step 57's handling of a failed CPU call (the thread stays where it is). Replica: step 56
+−0.39% (115 of 201 pairs) and, in two sets of 300 interleaved pairs against step 55, medians
+−0.27% and −0.23%, with runs over 19.5 ms 9 → 2 and 12 → 6; step 57 +0.16% (87 of 201), the same
+speed. Board: run-c56b067ab64d, 0.016978 s, 10.74 MB, 83.71 points; run-fbcbe364dd0f, 0.017057
+s, 10.49 MB, 83.76 points; run-9ac7e3c0222d, 0.017339 s; and step 56's run-2fae75090a37, 0.017003
+s, all inside docker as uid 65534.
+
+**Step 55 (c-20, 2f05cec), S 471**: step 54 with a last record without a
 terminator read like any other. Only the cold record walker changed: `parse_run` and `add` compile
 to the same instructions as step 54's. Replica +0.33% (82 of 201 pairs) and −0.10% (103 of 201) in
 two builds of it, build-to-build noise. Its first run, 0.020511 s (run-d4f9240d849b, 10.06 MB,
@@ -433,7 +454,9 @@ C run is still step 32's run-1ef2cedeac0a (0.02147 s, S 430, 81.60 points).
   - *Step 48* counts each record right after the next record is parsed, so the load still has a
     record's parse to arrive and fewer records wait in registers: 201 pairs against step 47,
     17.982 → 17.628 ms, −0.387 ms (−2.15%), 183 won. Against step 46 the hot path alone measured
-    −0.877 ms (−4.72%, 198 of 201). It was merged with cl-1's line cuts (S 468 → 435), which leave
+    −0.877 ms (−4.72%, 198 of 201), and against step 47's counting one pair later −0.28 ms
+    (−1.5%, 201 pairs); without the prefetch it was +2.0% (101 pairs), with three cursors +2.1% (51
+    pairs), and with the cursors in arrays +3 ms (the arrays stay in memory). It was merged with cl-1's line cuts (S 468 → 435), which leave
     the hot path untouched: `run` folded into `main`, the libc constants as commented numbers,
     `drop_pages`, `many`, `merge` and `digits` inlined, `_UNMATCHED` as group 0 of the group list.
     Memory, max of 7 runs: 10.32, 10.57 and 10.39 MB.
@@ -514,6 +537,34 @@ C run is still step 32's run-1ef2cedeac0a (0.02147 s, S 430, 81.60 points).
   give wrong byte counts). The gate passes except two mutants, changed on purpose: one without a
   final terminator now exits 0 with the reference's output, and one cut after a one-decimal amount
   exits 0 like any one-decimal amount, where the reference rejects it. S unchanged.
+- **Step 56: two threads on one CPU.** About one C run in four on the board ran 20% slow (0.0204 to
+  0.0215 s against 0.0171 to 0.0174 s), with A normal in the same dispatches, and 4 of steps 54
+  and 55's first 6 runs. Phase marks of slow replica runs showed one thread stalled 2.5 to 5.5 ms
+  early: two of our threads on one CPU while another idled, which the scheduler did not move apart
+  for most of the run. Now, after the region wait, each thread sets its CPU's bit (`sched_getcpu`)
+  in one shared word; a thread that finds the bit already set moves to the lowest CPU of its
+  affinity mask (`sched_getaffinity`, read once) that no thread has claimed (`sched_setaffinity`),
+  and stays there for the rest of the run. Only movers are pinned: pinning every thread at its
+  start was worse (18 slow runs in 300 against 4, "Experiments"), and a move happens in about 3% of
+  runs (9 of 300 on the replica; 8 of those 9 ran at normal speed). A normal run does nothing.
+  Measured on the replica:
+  - two sets of 300 interleaved pairs against step 55: medians 17.16 against 17.22 ms and 17.16
+    against 17.18 ms; runs over 19.5 ms 2 against 9 and 6 against 12; the 98th percentile 18.45
+    against 20.27 ms and 19.34 against 20.52 ms;
+  - induced stacking (all threads started on one CPU), 41 runs: median 20.57 ms against 43.96;
+  - forced stacking (12 threads on 11 CPUs): 20.14 against 20.30 ms, and no CPU outside the mask
+    used (an earlier draft that took CPUs 0 to threads − 1 escaped to CPU 11: the mask fixed it);
+  - ab.sh, 201 pairs: −0.39% (115 of 201).
+  Not fixed: runs where one thread stalls late (its last run ends 1.5 ms late and its input drop
+  takes 1.6 ms instead of 0.35), about 2% of replica runs. S 471 → 483.
+- **Step 57: failed calls change nothing.** A failed `sched_getcpu` reads as a CPU outside the
+  mask, which never counts as shared; a failed `sched_getaffinity` leaves no CPU to move to; a
+  failed `sched_setaffinity` leaves the thread where it is. Nothing asserts on them. Replica
+  +0.16% (87 of 201); the seed-1 hash also as uid 65534 under the board's timer. S unchanged.
+- **Step 58: the review's code items.** The CPU move became a function with its own comment, a
+  failed `mmap` now says why, and the replica numbers left `parse_run`'s comment for this file. The
+  hot code compiles to the same instructions as step 57's. Replica −0.11% (106 of 201). S 483 →
+  487.
 
 ## Box probes
 
@@ -563,6 +614,10 @@ The last three run one copy of the code with different constants, so they carry 
 | Experiment | Where measured | Result |
 |---|---|---|
 | 32-bit keys with a variable shift and a 64-bit check constant (first version of step 33) | server | +0.3 ms: registers spilled. The kept version shifts by a constant |
+| Each thread pinned to its own CPU at its start, never released (step 56 work) | replica, 300 pairs against step 55 | 18 slow runs against 4, median 17.31 against 17.25 ms |
+| The main thread pins itself to CPU w before spawning thread w, so that the child starts there; and the same with every thread released after the region wait (step 56 work) | replica, 300 pairs against step 55 | 1 slow run against 5 and 0 against 2, but medians +1.2% (17.45 against 17.24 and 17.43 against 17.23 ms): the main thread's 11 migrations make the spawn loop 0.53 ms longer |
+| Each child started on {the main thread's CPU, its own} (step 56 work) | replica, 300 pairs against step 55 | 166 slow runs against 0, median 20.26 ms |
+| Two or four malloc arenas | replica | 2 arenas: median −0.5 MB but T +1.07%; 4 arenas: −0.15 MB, +0.39% |
 | Threads drop their tables before the last one exits (02a535c) | board run-60031508190b | 0.025472 s against 0.025101 for step 24b: no gain, reverted in 98e7cb6 |
 | The end phase reordered: takes and merge first, then the writer writes while the others drop the input in claimed slices, and exits once all are dropped (step 51 work) | replica | +0.48% (88 of 201) with 4 × threads slices, +0.27% (91 of 201) with 2 ×, +0.45% (90 of 201) with 8 × |
 | The join table's shares dropped before the takes, on the critical path (step 51 work) | replica | +0.29% (89 of 201) |
@@ -654,6 +709,8 @@ The box is the board's scoring machine; the test server is a 16-vCPU AMD VM. On 
   5.5 ms early in the run (it starts late, or passes the wait for regions.csv late), and takeovers
   and large inboxes after it: two threads sharing a CPU. Pinning each thread to its own CPU at its
   start made it worse on the replica: 18 slow runs in 300 against 4 (medians 17.31 and 17.25 ms).
+  Moving only a thread that finds another of ours on its CPU (step 56) cut the slow replica runs
+  from 9 to 2 and from 12 to 6 in 300, and its first board runs took 0.017003 to 0.017339 s.
 
 - **Cuts of uops and branches on the per-record path pay.** The opaque `vpmovmskb` (step 7: 0.0979
   → 0.0553 s with step 6), the per-record fast path (step 15: 506 → 282 instructions per record,
@@ -752,8 +809,9 @@ codes:
   now aborts with 134, where step 46 wrote an answer. The reference rejects both inputs too.
 
 Steps 50 to 54 passed the same gate on the replica's builds (sha256 7f533d8d563d…,
-e434a819c579…, 74d0d0bca777…, 9103dd575699… and 0dd0a9a14529…), and step 55 (576fa2eac40b…) with
-the two intended changes above, each against the step before: the seed-1 hash d8088b1cd42b… at
+e434a819c579…, 74d0d0bca777…, 9103dd575699… and 0dd0a9a14529…), step 55 (576fa2eac40b…) with
+the two intended changes above, steps 56 and 57 (dd1989cba606… and 6478f47c380b…), and step 58
+(2f0c9e28d3c7…), each against the step before: the seed-1 hash d8088b1cd42b… at
 1, 3, 7 and 12 CPUs, sample seed 1 and holdout 99 equal, and every mutant's exit code unchanged.
 
 **Robustness runs** (replica, Sun 1 Nov about 17:00 UTC), on the exact Dockerfile build, with data
@@ -805,7 +863,8 @@ Step 39 also checked `objdump | grep -c vpinsrb` = 0.
 
 - **The replica first** (from step 42): paired runs against the code a step replaces (steps 42,
   46, 47, 48, 49, 50, 51, 52, 53 and 54: −0.90%, −2.13%, −3.54%, −2.15%, −1.36%, +0.11%, −0.45%,
-  −0.68%, +0.14% and −0.28%; step 55 +0.33% and −0.10% in two builds).
+  −0.68%, +0.14% and −0.28%; step 55 +0.33% and −0.10% in two builds; steps 56, 57 and 58 −0.39%,
+  +0.16% and −0.11%).
 - **Probes** (see "Box probes"): before the replica, in-process A/B probes on the box. A pass is
   run once as a warm-up, then 8 times, ABBA ABBA between the shipped code and the variant, and the
   probe exits with the difference in 0.1 ms units. Both modes see the same box state, so a 0.4 ms
@@ -816,8 +875,8 @@ Step 39 also checked `objdump | grep -c vpinsrb` = 0.
 - **Board samples** confirm: step 46's nine runs have a median of 0.018846 s, step 47's three
   0.018023 s, step 48's two clean runs 0.01758 and 0.017572 s, step 49 ran 0.017192 to 0.018128 s
   in six clean runs, step 51 0.017095 to 0.017418 s in four, step 52 0.017135 to 0.017364 s in three clean runs, step 54 0.017101 to
-  0.019528 s in three clean runs, and the submitted step 55 0.020511 s in its first run, with C alone
-  slow; run-46d6bf16c5bd
+  0.019528 s in three clean runs, step 55 0.020511 and 0.020647 s, with C alone slow both
+  times, step 57 0.016978 to 0.017339 s (step 56: 0.017003 s), and the submitted step 58 0.017376 s; run-46d6bf16c5bd
   (84.30 points) is the best Track C run.
 - **Points** are the board's; M counts on this track, so no point value is computed here.
 
