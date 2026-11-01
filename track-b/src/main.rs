@@ -943,7 +943,11 @@ impl Plan {
         let flag = |id: usize| {
             (plan.anchor[id] != plan.anchor[id + 1]) as u32 * ANCHOR | trig(id) as u32 * TRIG
         };
-        plan.info = rank.iter().map(|&id| id | flag(id as usize)).collect();
+        // In parallel, a range of old ids per part.
+        let word = |&id: &u32| id | flag(id as usize);
+        let ids = |p| &rank[part(rank.len(), p, parts)];
+        let info = par(parts, &|p| ids(p).iter().map(word).collect::<Vec<_>>());
+        plan.info = info.concat();
         (plan.always, plan.rows) = (always, rows);
         plan
     }
