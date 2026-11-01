@@ -142,20 +142,20 @@ fn map(path: &str) -> &'static [u8] {
     unsafe { std::slice::from_raw_parts(ptr, len) }
 }
 
-/// Drops the whole pages inside `bytes` from the page tables. Exit would otherwise
-/// unmap the input's 50,000 pages one by one, on one core (6 ms on the box); this
-/// does it in each parsing thread, in parallel. Best effort: if the call fails, the
-/// pages just stay.
+/// Drops the whole pages inside `items` from the page tables. Exit would otherwise
+/// free them one by one, on one core (the input's 50,000 pages: 6 ms on the box);
+/// this does it in the worker threads, in parallel. Best effort: if the call fails,
+/// the pages just stay.
 ///
 /// # Safety
-/// `bytes` must lie in a private file mapping that is never written, as `map`'s
-/// are: a dropped page then faults back in from the page cache with the same bytes.
-/// (Anonymous or written memory would read back as zeros.)
-unsafe fn drop_pages(bytes: &[u8]) {
-    let start = (bytes.as_ptr() as usize).next_multiple_of(PAGE);
-    let end = (bytes.as_ptr() as usize + bytes.len()) / PAGE * PAGE;
-    // SAFETY: MADV_DONTNEED on the whole pages inside `bytes` (none if it holds no
-    // whole page), which read back the same by the caller's contract.
+/// A dropped page faults back in from the page cache with the same bytes if it is
+/// in a private file mapping that is never written, as `map`'s are, and as zeros
+/// otherwise. So either `items` lies in such a mapping, or no thread reads it again.
+unsafe fn drop_pages<T>(items: &[T]) {
+    let start = (items.as_ptr() as usize).next_multiple_of(PAGE);
+    let end = (items.as_ptr() as usize + size_of_val(items)) / PAGE * PAGE;
+    // SAFETY: MADV_DONTNEED on the whole pages inside `items` (none if it holds no
+    // whole page), which are not read as zeros by the caller's contract.
     unsafe { madvise(start as *mut u8, end.saturating_sub(start), MADV_DONTNEED) };
 }
 
@@ -167,7 +167,9 @@ unsafe fn drop_pages(bytes: &[u8]) {
 fn wait(count: &AtomicUsize, n: usize) {
     for spin in (0u32..).take_while(|_| count.load(Acquire) < n) {
         std::hint::spin_loop();
-        (spin >= 1 << 14).then(thread::yield_now); // from the 2^14th spin on
+        if spin >= 1 << 14 {
+            thread::yield_now(); // from the 2^14th spin on
+        }
     }
 }
 
@@ -240,8 +242,8 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
     let inboxes: Vec<Mutex<Vec<Vec<u64>>>> = (0..threads).map(|_| Default::default()).collect();
     let empties = Mutex::new(Vec::new());
     // The threads' totals, summed as each one finishes (kept one per thread, with
-    // the Vec's regrowth: 0.2 MB more), and how many have.
-    let finished = Mutex::new((0, [EMPTY; GROUPS]));
+    // the Vec's regrowth: 0.2 MB more), and how many have added theirs.
+    let (sums, merged) = (Mutex::new([EMPTY; GROUPS]), AtomicUsize::new(0));
     let worker = &|w: usize| {
         let mut totals = [EMPTY; GROUPS];
         // This thread's table and pair buffers: made here, so they are in its cache.
@@ -253,6 +255,7 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
         // yet (it has not started).
         let (mut taken, mut spare) = (Vec::new(), Vec::new());
         let mut take = |t: usize, totals: &mut _| {
+            // table.0: its keys, empty until its thread makes the table.
             if let Ok(mut table) = tables[t].try_lock()
                 && !table.0.is_empty()
             {
@@ -320,15 +323,27 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
         // SAFETY: `text` is `map`'s: a private mapping that is never written.
         unsafe { drop_pages(&text[slice(w)..slice(w + 1)]) };
         (0..threads).for_each(|t| take((w + t) % threads, &mut totals));
-        // The last thread to finish writes the output and exits, without waiting
-        // for the others to exit and without dropping anything.
-        let (done, sums) = &mut *finished.lock().unwrap();
-        merge(sums, &totals);
-        *done += 1;
-        if *done == threads {
-            write_output(out_dir, sums, &countries.lock().unwrap());
+        // The last thread to add its totals writes the output and exits, without
+        // waiting for the others to exit and without dropping anything.
+        merge(&mut sums.lock().unwrap(), &totals);
+        if merged.fetch_add(1, AcqRel) == threads - 1 {
+            write_output(out_dir, &sums.lock().unwrap(), &countries.lock().unwrap());
             std::process::exit(0);
         }
+        // Once every thread has added its totals, only the output is read again: while
+        // the last one writes, the others drop their table's pages and a slice of the
+        // join table's and of regions.csv's, which exit would otherwise free one by one
+        // on one core. (Replica: -0.9%; their tables alone: -0.6%; the join table's
+        // slices dropped before the takes instead: +0.3%.)
+        wait(&merged, threads);
+        let (keys, rows) = &*tables[w].lock().unwrap();
+        let part = |n: usize, k: usize| n * k / threads;
+        // SAFETY: no thread reads the tables, the join table or regions.csv again
+        // (above).
+        unsafe { drop_pages(keys) };
+        unsafe { drop_pages(rows) };
+        unsafe { drop_pages(&group_of[part(REGION_IDS, w)..part(REGION_IDS, w + 1)]) };
+        unsafe { drop_pages(&lines[part(lines.len(), w)..part(lines.len(), w + 1)]) };
     };
     thread::scope(|s| {
         // The handles are not needed: the scope joins the threads, and the last
