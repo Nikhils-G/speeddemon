@@ -350,20 +350,16 @@ fn write(head: &[u8; 16], name: &[u8], stat: Stats, out: &mut [u8], end: usize) 
     let mut at = end - 1;
     out[at] = b'\n';
     for mut value in stat.into_iter().rev() {
-        // Two digits at a time from the end, then the first digit of an odd-length
-        // number (or the only one).
-        let end = at;
-        while value >= 10 {
-            let pair = value as usize % 100 * 2;
+        // Two digits at a time from the end while more than two are left, then the
+        // last one or two as a pair: a lone digit's leading 0 is overwritten by the
+        // space before the number.
+        while value >= 100 {
             at -= 2;
-            out[at..at + 2].copy_from_slice(&PAIRS[pair..pair + 2]);
+            out[at..at + 2].copy_from_slice(&PAIRS[2 * (value % 100) as usize..][..2]);
             value /= 100;
         }
-        if value > 0 || at == end {
-            at -= 1;
-            out[at] = b'0' + value as u8;
-        }
-        at -= 1;
+        out[at - 2..at].copy_from_slice(&PAIRS[2 * value as usize..][..2]);
+        at -= 2 + (value >= 10) as usize;
         out[at] = b' ';
     }
     at -= 21 + name.len();
