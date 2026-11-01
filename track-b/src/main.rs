@@ -53,8 +53,13 @@ compile_error!("track-b needs AES-NI: build with RUSTFLAGS=\"-C target-cpu=nativ
 const ANCHOR: u32 = 1 << 31;
 const TRIG: u32 = 1 << 30;
 const ID: u32 = TRIG - 1;
-/// Marks a trigger term's last document once `end_doc` has taken the term.
-const DONE: u32 = 1 << 31;
+/// A document's stamp is its id modulo STAMPS, and each term keeps the stamp of
+/// its last document (`Scan::lastdoc`): one byte per term, a quarter of a u32.
+/// The bytes are reset to EMPTY every STAMPS documents, so an equal stamp is
+/// always this document's. DONE marks a trigger term that `end_doc` has taken.
+const STAMPS: u32 = 127;
+const EMPTY: u8 = 0xFF;
+const DONE: u8 = 0x80;
 /// Terms of up to KEY bytes live in the perfect hash, keyed by their bytes.
 const KEY: usize = 12;
 /// The spec's grammar: a BOOL query has 1 to 6 terms.
@@ -117,10 +122,6 @@ pub fn run() {
     let df: Vec<u32> = df.into_iter().map(AtomicU32::into_inner).collect();
     let plan = Plan::new(queries, &df, sampled.iter().sum::<u32>().max(1), threads);
     vocab.finish(&plan);
-    // Give the setup's freed memory back before the scan: glibc keeps it after
-    // the large blocks it has seen freed (about 4 MB of the memory peak).
-    // SAFETY: a glibc call that takes no pointers.
-    unsafe { mmap::malloc_trim(0) };
 
     // The output is formatted in `parts` ranges of lines.
     let parts = slices.len().max(1);
@@ -660,6 +661,20 @@ fn doc_entry(words: &[u32], c: u32, earlier: &[u32], answer: u32, pad: u32) -> D
     DocEntry { terms, truth: truth.sum(), answer }
 }
 
+/// A phrase as its anchor term finds it: its first 8 term ids (all of them in
+/// the spec's phrases of 2 to 8 terms), its answer, the anchor's position in it,
+/// its length, and where its terms start in `Plan::terms` (for longer ones). One
+/// cache line: a check reads one line of the plan.
+#[derive(Clone, Copy, Default)]
+#[repr(align(64))]
+struct Phrase {
+    terms: [u32; 8],
+    answer: u32,
+    offset: u32,
+    start: u32,
+    len: u32,
+}
+
 /// What the scan does with each query, decided from the sample.
 #[derive(Default)]
 struct Plan {
@@ -672,9 +687,7 @@ struct Plan {
     rows: usize,
     /// Phrases anchored on term t: `anchored[anchor[t]..anchor[t + 1]]`.
     anchor: Vec<u32>,
-    /// Per phrase: `(answer, offset, start, len)`, its answer, the anchor's
-    /// position in the phrase, and its terms `terms[start..start + len]`.
-    anchored: Vec<(u32, u32, u32, u32)>,
+    anchored: Vec<Phrase>,
     /// The queries' term words, with the new ids.
     terms: Vec<u32>,
     /// The info word of each term, by its old id: its new id, ANCHOR and TRIG.
@@ -727,7 +740,10 @@ impl Plan {
                     // The first of the rarest terms (a phrase has at least one).
                     let rarest = |&k: &usize| sample_df[order[words[k] as usize] as usize];
                     let offset = (0..words.len()).min_by_key(rarest).unwrap();
-                    by_anchor.push((words[offset], (answer, offset as u32, start, len)));
+                    let mut phrase = Phrase { answer, offset: offset as u32, start, len, ..Phrase::default() };
+                    let n = words.len().min(8);
+                    phrase.terms[..n].copy_from_slice(&words[..n]);
+                    by_anchor.push((words[offset], phrase));
                     continue;
                 }
                 if always_lines[line] {
@@ -750,8 +766,7 @@ impl Plan {
         let by_trigger: Vec<_> = out.iter_mut().map(|o| take(&mut o.0)).collect();
         let by_anchor: Vec<_> = out.iter_mut().map(|o| take(&mut o.1)).collect();
         let mut always: Vec<_> = out.iter().flat_map(|o| o.2.iter().copied()).collect();
-        // 8 ids of padding after the last phrase, for `end_doc`'s 32-byte compares.
-        let terms: Vec<_> = out.iter().flat_map(|o| o.3.iter().copied()).chain([0; 8]).collect();
+        let terms: Vec<_> = out.iter().flat_map(|o| o.3.iter().copied()).collect();
         let mut plan = Plan::default();
         // The anchors are grouped and the `always` entries sorted on a second
         // thread, while this one groups the entries.
@@ -788,7 +803,7 @@ impl Plan {
         };
         always.iter_mut().for_each(|e| number(&mut e.answer));
         self.entries.iter_mut().for_each(|e| number(&mut e.answer));
-        self.anchored.iter_mut().for_each(|a| number(&mut a.0));
+        self.anchored.iter_mut().for_each(|a| number(&mut a.answer));
     }
 }
 
@@ -863,10 +878,12 @@ struct Scan<'a> {
     vocab: &'a Vocab,
     plan: Option<&'a Plan>,
     df: &'a [AtomicU32],
-    /// Per term, the last document that contains it (DONE marks a trigger term
-    /// that `end_doc` has taken). Slot `count` takes the tokens no query uses;
-    /// slot count + 1 is in no document.
-    lastdoc: Vec<u32>,
+    /// Per term, the stamp of the last document that contains it (see STAMPS).
+    /// Slot `count` takes the tokens no query uses; slot count + 1 is in no
+    /// document.
+    lastdoc: Vec<u8>,
+    /// The current document's stamp.
+    stamp: u8,
     /// This document's trigger term occurrences (as info words), and the entry
     /// ranges `(start, end)` of its trigger terms, each once.
     trig: Vec<u32>,
@@ -897,7 +914,8 @@ impl<'a> Scan<'a> {
             vocab,
             plan,
             df,
-            lastdoc: vec![u32::MAX; plan.map_or(0, |_| vocab.count as usize + 2)],
+            lastdoc: vec![EMPTY; plan.map_or(0, |_| vocab.count as usize + 2)],
+            stamp: 0,
             trig: Vec::new(),
             work: Vec::new(),
             wide,
@@ -1007,6 +1025,11 @@ impl<'a> Scan<'a> {
                 }
                 self.doc = id;
                 bit = 1 << (id % 64);
+                // A new window of stamps (the slice's first one starts empty).
+                if id % STAMPS == 0 {
+                    self.lastdoc.fill(EMPTY);
+                }
+                self.stamp = (id % STAMPS) as u8;
             }
             at += cut as usize;
             (mask, lf) = (next, next_lf);
@@ -1045,12 +1068,15 @@ impl<'a> Scan<'a> {
         self.work.reserve(self.pending.len());
         let (toks, mut len) = (self.toks.as_mut_ptr(), self.toks.len());
         let (trig, mut nt) = (self.trig.as_mut_ptr(), self.trig.len());
+        let anchor = self.plan.map_or(std::ptr::null(), |p| p.anchor.as_ptr());
         for &(key, off) in &self.pending {
             // SAFETY: off is the byte offset of a slot of the table: Phf::slot gives
             // one below 2^(64 - shift), and get_long a long term's or the last one.
             let info = unsafe { probe(table.byte_add(off as usize), key, miss) };
             if info & ANCHOR != 0 {
                 self.anchors.push(len as u32);
+                // Its phrases' range, read at the document's end.
+                prefetch(anchor, (info & ID) as usize);
             }
             // SAFETY: room for every pending token was reserved above.
             unsafe {
@@ -1067,13 +1093,13 @@ impl<'a> Scan<'a> {
         self.pending.clear();
         // The sample only counts documents per term (end_doc).
         let Some(_) = self.plan else { return };
-        let lastdoc = self.lastdoc.as_mut_ptr();
+        let (lastdoc, stamp) = (self.lastdoc.as_mut_ptr(), self.stamp);
         for &info in &self.toks {
             let id = (info & ID) as usize;
             // SAFETY: id <= count < lastdoc.len(), min(id, rows) < wide.len(), and
             // block < 4.
             unsafe {
-                *lastdoc.add(id) = doc;
+                *lastdoc.add(id) = stamp;
                 *(*wide.add(min(id, rows))).0.get_unchecked_mut(block) |= bit;
             }
         }
@@ -1088,25 +1114,25 @@ impl<'a> Scan<'a> {
             for &at in &self.anchors {
                 let anchor = (self.toks[at as usize] & ID) as usize;
                 for i in plan.anchor[anchor] as usize..plan.anchor[anchor + 1] as usize {
-                    let (answer, offset, start, len) = plan.anchored[i];
-                    let phrase = &plan.terms[start as usize..(start + len) as usize];
-                    let from = (at as usize).checked_sub(offset as usize);
+                    let p = &plan.anchored[i];
+                    let from = (at as usize).checked_sub(p.offset as usize);
                     let hit = match from {
-                        // Up to 8 ids with 8 tokens left: one masked 32-byte compare
-                        // (the plan's terms end with 8 ids of padding), not a loop
-                        // whose exit is unpredictable.
-                        Some(f) if len <= 8 && f + 8 <= self.toks.len() => {
-                            // SAFETY: 8 words from f in toks (checked) and from start in
-                            // plan.terms (padded); AVX2 and BMI2 are enabled for the build.
+                        // Up to 8 ids with 8 tokens left: one masked 32-byte compare,
+                        // not a loop whose exit is unpredictable.
+                        Some(f) if p.len <= 8 && f + 8 <= self.toks.len() => {
+                            // SAFETY: 8 words from f in toks (checked), and the 32
+                            // aligned bytes of p.terms (Phrase is 64-byte aligned); AVX2
+                            // and BMI2 are enabled for the build.
                             unsafe {
                                 let a = _mm256_loadu_si256(self.toks.as_ptr().add(f).cast());
                                 let a = _mm256_and_si256(a, _mm256_set1_epi32(ID as i32));
-                                let b = _mm256_loadu_si256(plan.terms.as_ptr().add(start as usize).cast());
-                                let need = _bzhi_u32(!0, 4 * len);
+                                let b = _mm256_load_si256(p.terms.as_ptr().cast());
+                                let need = _bzhi_u32(!0, 4 * p.len);
                                 movemask(_mm256_cmpeq_epi32(a, b)) & need == need
                             }
                         }
                         _ => {
+                            let phrase = &plan.terms[p.start as usize..(p.start + p.len) as usize];
                             let ids = from.and_then(|f| self.toks.get(f..f + phrase.len()));
                             ids.is_some_and(|ids| ids.iter().zip(phrase).all(|(&i, &t)| i & ID == t))
                         }
@@ -1114,7 +1140,7 @@ impl<'a> Scan<'a> {
                     if hit && self.last[i] != doc {
                         self.last[i] = doc;
                         // SAFETY: a phrase's answer is an answer number, below state.len().
-                        unsafe { self.answers.add(answer, 1 << (doc % 64), doc & !63) };
+                        unsafe { self.answers.add(p.answer, 1 << (doc % 64), doc & !63) };
                     }
                 }
             }
@@ -1143,15 +1169,15 @@ impl<'a> Scan<'a> {
     fn trigger(&mut self, plan: &Plan) {
         let doc = self.doc;
         let (group, entries) = (plan.group.as_ptr(), plan.entries.as_ptr());
-        let (work, lastdoc) = (self.work.as_mut_ptr(), self.lastdoc.as_mut_ptr());
+        let (work, lastdoc, stamp) = (self.work.as_mut_ptr(), self.lastdoc.as_mut_ptr(), self.stamp);
         let mut m = 0;
         for t in self.trig.iter().map(|&info| (info & ID) as usize) {
             // SAFETY: trigger terms are below bool_terms, and group has
             // bool_terms + 2 entries; work has room for every trigger (look_up).
             unsafe {
                 // Branch-free: a repeated trigger term is written again and not kept.
-                let fresh = (*lastdoc.add(t) == doc) as usize;
-                *lastdoc.add(t) = doc | DONE;
+                let fresh = (*lastdoc.add(t) == stamp) as usize;
+                *lastdoc.add(t) = stamp | DONE;
                 let (from, to) = (*group.add(t), *group.add(t + 1));
                 prefetch(entries, from as usize);
                 work.add(m).write((from, to));
@@ -1172,7 +1198,7 @@ impl<'a> Scan<'a> {
             for e in unsafe { plan.entries.get_unchecked(from as usize..to as usize) } {
                 // Bit k: term k is in this document. SAFETY: entry terms are
                 // below count + 2 = lastdoc.len().
-                let has = |k: usize| unsafe { (*lastdoc.add(e.terms[k] as usize) & !DONE == doc) as u32 } << k;
+                let has = |k: usize| unsafe { (*lastdoc.add(e.terms[k] as usize) & !DONE == stamp) as u32 } << k;
                 let present = (0..MAX_BOOL_TERMS - 1).map(has).sum::<u32>();
                 // SAFETY: an entry's answer is an answer number, below state.len().
                 unsafe { self.answers.add_doc(e.answer, e.truth >> present & 1, doc) };
@@ -1521,10 +1547,6 @@ pub fn run() {
     let df: Vec<u32> = df.into_iter().map(AtomicU32::into_inner).collect();
     let plan = Plan::new(queries, &df, sampled.iter().sum::<u32>().max(1), threads);
     vocab.finish(&plan);
-    // Give the setup's freed memory back before the scan: glibc keeps it after
-    // the large blocks it has seen freed (about 4 MB of the memory peak).
-    // SAFETY: a glibc call that takes no pointers.
-    unsafe { mmap::malloc_trim(0) };
 
     // The output is formatted in `parts` ranges of lines.
     let parts = slices.len().max(1);
@@ -2064,6 +2086,20 @@ fn doc_entry(words: &[u32], c: u32, earlier: &[u32], answer: u32, pad: u32) -> D
     DocEntry { terms, truth: truth.sum(), answer }
 }
 
+/// A phrase as its anchor term finds it: its first 8 term ids (all of them in
+/// the spec's phrases of 2 to 8 terms), its answer, the anchor's position in it,
+/// its length, and where its terms start in `Plan::terms` (for longer ones). One
+/// cache line: a check reads one line of the plan.
+#[derive(Clone, Copy, Default)]
+#[repr(align(64))]
+struct Phrase {
+    terms: [u32; 8],
+    answer: u32,
+    offset: u32,
+    start: u32,
+    len: u32,
+}
+
 /// What the scan does with each query, decided from the sample.
 #[derive(Default)]
 struct Plan {
@@ -2076,9 +2112,7 @@ struct Plan {
     rows: usize,
     /// Phrases anchored on term t: `anchored[anchor[t]..anchor[t + 1]]`.
     anchor: Vec<u32>,
-    /// Per phrase: `(answer, offset, start, len)`, its answer, the anchor's
-    /// position in the phrase, and its terms `terms[start..start + len]`.
-    anchored: Vec<(u32, u32, u32, u32)>,
+    anchored: Vec<Phrase>,
     /// The queries' term words, with the new ids.
     terms: Vec<u32>,
     /// The info word of each term, by its old id: its new id, ANCHOR and TRIG.
@@ -2131,7 +2165,10 @@ impl Plan {
                     // The first of the rarest terms (a phrase has at least one).
                     let rarest = |&k: &usize| sample_df[order[words[k] as usize] as usize];
                     let offset = (0..words.len()).min_by_key(rarest).unwrap();
-                    by_anchor.push((words[offset], (answer, offset as u32, start, len)));
+                    let mut phrase = Phrase { answer, offset: offset as u32, start, len, ..Phrase::default() };
+                    let n = words.len().min(8);
+                    phrase.terms[..n].copy_from_slice(&words[..n]);
+                    by_anchor.push((words[offset], phrase));
                     continue;
                 }
                 if always_lines[line] {
@@ -2154,8 +2191,7 @@ impl Plan {
         let by_trigger: Vec<_> = out.iter_mut().map(|o| take(&mut o.0)).collect();
         let by_anchor: Vec<_> = out.iter_mut().map(|o| take(&mut o.1)).collect();
         let mut always: Vec<_> = out.iter().flat_map(|o| o.2.iter().copied()).collect();
-        // 8 ids of padding after the last phrase, for `end_doc`'s 32-byte compares.
-        let terms: Vec<_> = out.iter().flat_map(|o| o.3.iter().copied()).chain([0; 8]).collect();
+        let terms: Vec<_> = out.iter().flat_map(|o| o.3.iter().copied()).collect();
         let mut plan = Plan::default();
         // The anchors are grouped and the `always` entries sorted on a second
         // thread, while this one groups the entries.
@@ -2192,7 +2228,7 @@ impl Plan {
         };
         always.iter_mut().for_each(|e| number(&mut e.answer));
         self.entries.iter_mut().for_each(|e| number(&mut e.answer));
-        self.anchored.iter_mut().for_each(|a| number(&mut a.0));
+        self.anchored.iter_mut().for_each(|a| number(&mut a.answer));
     }
 }
 
@@ -2457,12 +2493,15 @@ impl<'a> Scan<'a> {
         self.work.reserve(self.pending.len());
         let (toks, mut len) = (self.toks.as_mut_ptr(), self.toks.len());
         let (trig, mut nt) = (self.trig.as_mut_ptr(), self.trig.len());
+        let anchor = self.plan.map_or(std::ptr::null(), |p| p.anchor.as_ptr());
         for &(key, off) in &self.pending {
             // SAFETY: off is the byte offset of a slot of the table: Phf::slot gives
             // one below 2^(64 - shift), and get_long a long term's or the last one.
             let info = unsafe { probe(table.byte_add(off as usize), key, miss) };
             if info & ANCHOR != 0 {
                 self.anchors.push(len as u32);
+                // Its phrases' range, read at the document's end.
+                prefetch(anchor, (info & ID) as usize);
             }
             // SAFETY: room for every pending token was reserved above.
             unsafe {
@@ -2497,28 +2536,35 @@ impl<'a> Scan<'a> {
     fn end_doc(&mut self) {
         let doc = self.doc;
         if let Some(plan) = self.plan {
+            // The phrases' first records are random reads: fetched now, and read
+            // after the BOOL evaluation (they update other answers).
+            for &at in &self.anchors {
+                let anchor = (self.toks[at as usize] & ID) as usize;
+                prefetch(plan.anchored.as_ptr(), plan.anchor[anchor] as usize);
+            }
+            self.trigger(plan);
             for &at in &self.anchors {
                 let anchor = (self.toks[at as usize] & ID) as usize;
                 for i in plan.anchor[anchor] as usize..plan.anchor[anchor + 1] as usize {
-                    let (answer, offset, start, len) = plan.anchored[i];
-                    let phrase = &plan.terms[start as usize..(start + len) as usize];
-                    let from = (at as usize).checked_sub(offset as usize);
+                    let p = &plan.anchored[i];
+                    let from = (at as usize).checked_sub(p.offset as usize);
                     let hit = match from {
-                        // Up to 8 ids with 8 tokens left: one masked 32-byte compare
-                        // (the plan's terms end with 8 ids of padding), not a loop
-                        // whose exit is unpredictable.
-                        Some(f) if len <= 8 && f + 8 <= self.toks.len() => {
-                            // SAFETY: 8 words from f in toks (checked) and from start in
-                            // plan.terms (padded); AVX2 and BMI2 are enabled for the build.
+                        // Up to 8 ids with 8 tokens left: one masked 32-byte compare,
+                        // not a loop whose exit is unpredictable.
+                        Some(f) if p.len <= 8 && f + 8 <= self.toks.len() => {
+                            // SAFETY: 8 words from f in toks (checked), and the 32
+                            // aligned bytes of p.terms (Phrase is 64-byte aligned); AVX2
+                            // and BMI2 are enabled for the build.
                             unsafe {
                                 let a = _mm256_loadu_si256(self.toks.as_ptr().add(f).cast());
                                 let a = _mm256_and_si256(a, _mm256_set1_epi32(ID as i32));
-                                let b = _mm256_loadu_si256(plan.terms.as_ptr().add(start as usize).cast());
-                                let need = _bzhi_u32(!0, 4 * len);
+                                let b = _mm256_load_si256(p.terms.as_ptr().cast());
+                                let need = _bzhi_u32(!0, 4 * p.len);
                                 movemask(_mm256_cmpeq_epi32(a, b)) & need == need
                             }
                         }
                         _ => {
+                            let phrase = &plan.terms[p.start as usize..(p.start + p.len) as usize];
                             let ids = from.and_then(|f| self.toks.get(f..f + phrase.len()));
                             ids.is_some_and(|ids| ids.iter().zip(phrase).all(|(&i, &t)| i & ID == t))
                         }
@@ -2526,11 +2572,10 @@ impl<'a> Scan<'a> {
                     if hit && self.last[i] != doc {
                         self.last[i] = doc;
                         // SAFETY: a phrase's answer is an answer number, below state.len().
-                        unsafe { self.answers.add(answer, 1 << (doc % 64), doc & !63) };
+                        unsafe { self.answers.add(p.answer, 1 << (doc % 64), doc & !63) };
                     }
                 }
             }
-            self.trigger(plan);
         } else {
             // The sample: count the document's distinct terms (the table has no
             // flags yet, so the info words are the ids).
