@@ -520,15 +520,20 @@ fn run_start(text: &[u8], from: usize, k: usize, parts: usize) -> usize {
 /// and it ran 2-4% slower.
 ///
 /// The run is parsed as two halves at once: each pass of the loop parses one
-/// record from each half and then counts both, so their two chains of dependent
-/// work, above all their two random region-table loads, are in the core at the
-/// same time (as 1BRC solutions run several cursors per thread). Server, 12
-/// threads: -0.5 ms; single-threaded the region-load stall went from about 35% of
-/// this function's cycles to 13%. (Three cursors: no faster, more instructions;
-/// cursors in arrays: +3 ms, the arrays stay in memory.) The second half starts at
-/// a cut found like the runs' cuts, so the first half must end exactly there.
-/// Every total, the min and max, and the set of pairs do not depend on the order in
-/// which records are counted.
+/// record from each half, so that their two chains of dependent work are in the
+/// core at the same time (as 1BRC solutions run several cursors per thread). The
+/// pair is counted one pass later, after the next pair is parsed: a record's group
+/// is a random load from the 1 MB region table (an L2 miss on the box), which
+/// `record` starts as a prefetch as soon as the region id is known, and which then
+/// has a whole pass to arrive; the count's load also needs no value still being
+/// computed. On the box's CPU (i5-13500): -0.74 ms (-4.0%), though +10%
+/// instructions from the records kept across the pass; counting right after the
+/// parse, the load after the region table's was 19% of this function's cycles.
+/// (Three cursors: -0.8% counted at once, +4% counted a pass later; cursors in
+/// arrays: +3 ms, the arrays stay in memory.) The second half starts at a cut found
+/// like the runs' cuts, so the first half must end exactly there. Every total, the
+/// min and max, and the set of pairs do not depend on the order in which records
+/// are counted.
 #[inline(never)]
 fn parse_run(
     text: &[u8],
@@ -547,7 +552,12 @@ fn parse_run(
         unsafe { _mm_prefetch::<_MM_HINT_NTA>(text.as_ptr().wrapping_add(i + 1024).cast()) };
         // SAFETY: fast_end is at most text.len() - FAST_MARGIN, or 0, and i >= 8
         // (above).
-        unsafe { fast_record(text, i, fast_end) }.unwrap_or_else(|| *walk_record(text, i))
+        let r = unsafe { fast_record(text, i, fast_end) }.unwrap_or_else(|| *walk_record(text, i));
+        // The region's group is read a pass of the loop later: its fetch starts now.
+        let entry = &group_of[(r.region_id as usize).min(REGION_IDS - 1)];
+        // SAFETY: a prefetch never faults.
+        unsafe { _mm_prefetch::<_MM_HINT_T0>((entry as *const AtomicU8).cast()) };
+        r
     };
     let mut count = |r: &Record| {
         // Copied out first: read through `r` after the stores into `t` below, the
@@ -574,11 +584,19 @@ fn parse_run(
     let mid = run_start(&text[..end], start, 1, 2);
     let (mut i, mut j) = (start, mid);
     // Bounded by fast_end too, so that fast_record's own test of it is known true.
+    // The pair parsed in the previous pass, counted in this one (see above).
+    let mut last = None;
     while i < mid.min(fast_end) && j < fast_end {
         let (a, b) = (record(i), record(j));
+        (i, j) = (a.next, b.next);
+        for (a, b) in last.replace((a, b)) {
+            count(&a);
+            count(&b);
+        }
+    }
+    for (a, b) in last {
         count(&a);
         count(&b);
-        (i, j) = (a.next, b.next);
     }
     // The rest of the longer half, one record at a time; each half must end exactly
     // at its end (for the first, the cut in the middle).
