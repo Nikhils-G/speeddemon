@@ -642,6 +642,11 @@ fn parse_run(
     }
 }
 
+/// `Some(())` if `ok`, else `None`: with `?`, `fast_record`'s early exits.
+fn ensure(ok: bool) -> Option<()> {
+    ok.then_some(())
+}
+
 /// A record, `id,name,note,region_id,amount` and a terminator, whose name and note
 /// are empty or quoted (spec 2.2), from the bitmaps of the 64 bytes at `i` (rarely
 /// 128) and of 32 bytes after the note. None if the name or the note runs past
@@ -652,9 +657,8 @@ fn parse_run(
 /// Every read is in `i - 8..i + 196` (see below), so it is then inside the text.
 #[inline(always)]
 unsafe fn fast_record(text: &[u8], i: usize, fast_end: usize) -> Option<Record> {
-    // `?` gives None if not. (i >= 8, the caller's contract: load() reads the 8
-    // bytes before an offset.)
-    (i < fast_end).then_some(())?;
+    // (i >= 8, the caller's contract: load() reads the 8 bytes before an offset.)
+    ensure(i < fast_end)?;
     // From here on 8 <= i and i + FAST_MARGIN <= text.len(). The reads, as offsets
     // from i, end by 196:
     // - the windows, 0..64, and 64..128 for a long note;
@@ -677,7 +681,7 @@ unsafe fn fast_record(text: &[u8], i: usize, fast_end: usize) -> Option<Record> 
     out &= out.wrapping_sub(1);
     let name_end = out.trailing_zeros() as usize; // 64 if none
     out &= out.wrapping_sub(1);
-    (name_end < 64).then_some(())?;
+    ensure(name_end < 64)?;
     // Empty, or quoted with every inner quote half of a `""` pair (spec 2.2): quoted
     // if its first byte is inside quotes. (A lone quote, outside spec 2.2, would make
     // the length below negative, wrapping to far above 32: the walker takes it.)
@@ -691,7 +695,7 @@ unsafe fn fast_record(text: &[u8], i: usize, fast_end: usize) -> Option<Record> 
     let name_len = name_end - name_quoted - name_start;
     // Names are one block for the hash: a longer one (none in the generator's pool)
     // goes to the walker, whose hash takes any length.
-    (name_len <= 32).then_some(())?;
+    ensure(name_len <= 32)?;
     // SAFETY: the name's 32 bytes end by i + 96, and the text goes on to i + 256 at
     // least (above).
     let hash = unsafe { hash_words(text, i + name_start, name_len) };
@@ -707,7 +711,7 @@ unsafe fn fast_record(text: &[u8], i: usize, fast_end: usize) -> Option<Record> 
         let inside_to_e = (inside2 & !(u64::MAX << (e & 63))).count_ones();
         (64 + e, inside.count_ones() + inside_to_e)
     };
-    (note_end < 128).then_some(())?;
+    ensure(note_end < 128)?;
     let note_quoted = (note_end > name_end + 1) as usize;
     let note_bytes = inside_to_note as usize - name_inside - note_quoted;
     // The tail, `region_id,amount`: its first comma and dot, from its 32 bytes.
