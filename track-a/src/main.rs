@@ -440,10 +440,15 @@ unsafe fn parse(chunks: [&[u8]; 2], table: &Interner, free: &mut &'static mut [u
     // `most[k]` lines, one record each. `free` is not used meanwhile. The slices may
     // go back to the kernel at the end (the caller's contract): their endpoint names
     // were copied (see Interner::add).
-    let mut step = |k: usize| unsafe {
+    // Written as a macro, not a closure, so that the line's code is always in the
+    // loop (a closure this size was not inlined once the long way was).
+    macro_rules! step {
+        ($k:expr) => {{
+            let k = $k;
+            'step: {
         let line = &mut line[k];
         if *line >= stop[k] {
-            return false;
+            break 'step false;
         }
         // Lines from one shard arrive in time order, so most lines repeat the
         // previous line's hour. Its bytes "MM-DDTHH" (5..13) decide: every timestamp
@@ -507,9 +512,14 @@ unsafe fn parse(chunks: [&[u8]; 2], table: &Interner, free: &mut &'static mut [u
         record[k] = record[k].add(1);
         *line = to.add(5 + count + 1);
         true
-    };
-    while step(0) & step(1) {}
-    while step(0) | step(1) {}
+            }
+        }};
+    }
+    // SAFETY: see above.
+    unsafe {
+        while step!(0) & step!(1) {}
+        while step!(0) | step!(1) {}
+    }
     // SAFETY: the slices go back to the kernel (the caller's contract); nothing reads
     // them again.
     chunks.iter().for_each(|chunk| unsafe { release(*chunk) });
@@ -665,8 +675,7 @@ impl Interner {
     /// # Safety
     ///
     /// The 128 bytes from `from` must be readable.
-    #[cold]
-    #[inline(never)]
+    #[inline(always)]
     unsafe fn id(&self, from: *const u8) -> (u32, usize) {
         // SAFETY: AVX2 and SSE4.2 are enabled; the reads stay within the 128 bytes
         // from `from` (the caller's contract) and within KEEP (len <= 125, asserted).
