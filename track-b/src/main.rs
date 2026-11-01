@@ -88,9 +88,6 @@ const MAX_DOCS: u32 = 1 << 20;
 /// turns on fewer threads), at most about 31,000 documents each at the spec's
 /// 250,000 when the lines are about equally long.
 const MIN_SLICES: usize = 8;
-/// How far ahead `end_doc` prefetches the state that the first entry of a
-/// trigger term's range updates, in ranges (1 and 4 measured the same).
-const RANGES_AHEAD: usize = 2;
 /// Hash groups: a key's group is the low 6 bits of its hash (hash & 63). A pilot
 /// is 1 mod GROUPS, so each group owns a region of the table, and the threads
 /// place their groups in parallel.
@@ -762,7 +759,9 @@ struct Entry {
 /// query's other distinct terms, padded with a term no document has, and its
 /// truth table over their presence (c being present). The table is zero where
 /// a cover term before c is present: that term's entry counts the document.
+/// Seven u32 words in this order, in 32 bytes (repr(C)): `trigger` gathers them.
 #[derive(Clone, Copy, Default)]
+#[repr(C, align(32))]
 struct DocEntry {
     terms: [u32; MAX_BOOL_TERMS - 1],
     /// Bit a: whether the query matches when the terms of the set bits of a are
@@ -892,6 +891,7 @@ impl Plan {
                     by_anchor.push((words[offset], phrase));
                     continue;
                 }
+                assert!(words.len() <= 6, "queries.txt: a BOOL of over 6 terms");
                 if always_lines[line] {
                     // end_super reads only the first len terms: the rest stay 0.
                     let mut entry = Entry {
@@ -939,6 +939,9 @@ impl Plan {
         (plan.anchor, plan.anchored) = anchors.into_inner().unwrap();
         let mut always = always.into_inner().unwrap();
         plan.number_answers(&mut always, lines);
+        // 8 entries after the last that never match (truth 0): `trigger` writes up
+        // to 7 indices past a range, and pads its last 8 with the last of them.
+        plan.entries.extend([DocEntry::default(); 8]);
         let trig = |id: usize| id < bool_terms && plan.group[id] != plan.group[id + 1];
         let flag = |id: usize| {
             (plan.anchor[id] != plan.anchor[id + 1]) as u32 * ANCHOR | trig(id) as u32 * TRIG
@@ -1053,10 +1056,12 @@ struct Scan<'a> {
     lastdoc: Vec<u8>,
     /// The current document's stamp.
     stamp: u8,
-    /// This document's trigger term occurrences (as info words), and the entry
-    /// ranges `(start, end)` of its trigger terms, each once.
+    /// This document's trigger term occurrences (as info words); then the
+    /// entries of its trigger terms, each term once, as indices, and those of
+    /// them that match (see `trigger`; both as long as the entries).
     trig: Vec<u32>,
-    work: Vec<(u32, u32)>,
+    evals: Vec<u32>,
+    hits: Vec<u32>,
     /// Per block of this superblock, its words: word r < plan.rows of block b,
     /// `wide[b * (rows + 1) + r]`, is BOOL term r's in that block. Word `rows`
     /// takes the other terms (its bits are never read). Kept block by block,
@@ -1084,10 +1089,12 @@ impl<'a> Scan<'a> {
             vocab,
             plan,
             df,
-            lastdoc: vec![EMPTY; plan.map_or(0, |_| vocab.count as usize + 2)],
+            // 3 bytes more: `trigger` gathers 4 bytes from a stamp.
+            lastdoc: vec![EMPTY; plan.map_or(0, |_| vocab.count as usize + 5)],
             stamp: 0,
             trig: Vec::new(),
-            work: Vec::new(),
+            evals: vec![0; plan.map_or(0, |p| p.entries.len())],
+            hits: vec![0; plan.map_or(0, |p| p.entries.len())],
             wide,
             pending: Vec::new(),
             toks: Vec::new(),
@@ -1240,7 +1247,6 @@ impl<'a> Scan<'a> {
         // 8 more: end_doc's phrase compares read 8 ids from any token.
         self.toks.reserve(self.pending.len() + 8);
         self.trig.reserve(self.pending.len());
-        self.work.reserve(self.pending.len());
         let (toks, mut len) = (self.toks.as_mut_ptr(), self.toks.len());
         let (trig, mut nt) = (self.trig.as_mut_ptr(), self.trig.len());
         let anchor = self.plan.map_or(std::ptr::null(), |p| p.anchor.as_ptr());
@@ -1336,53 +1342,86 @@ impl<'a> Scan<'a> {
     }
 
     /// Evaluates the BOOL entries of this document's trigger terms, each term
-    /// once (its stamp is then marked DONE, which the evaluation masks off). Two
-    /// passes, so that the cold lines of an evaluation are fetched before it: the
-    /// trigger terms' entry ranges, each first entry fetched; then, RANGES_AHEAD
-    /// ranges ahead, the state the first entry updates (the stamps, 75 KB, stay in
-    /// L2). No branch on the data: whether a query matches is too random to
-    /// predict.
+    /// once (its stamp is then marked DONE, which the evaluation masks off), 8 at
+    /// a time: the fresh terms' entry ranges, about 1.5 entries each, become one
+    /// list of entry indices (each range's first entry fetched), and each 8 of them
+    /// are evaluated in AVX2 registers, their terms' stamps gathered. Only the
+    /// matches, about half, update their answers. No branch on the data: whether a
+    /// query matches is too random to predict (so was a loop per range).
     fn trigger(&mut self, plan: &Plan) {
-        let doc = self.doc;
-        let (group, entries) = (plan.group.as_ptr(), plan.entries.as_ptr());
-        let (work, stamp) = (self.work.as_mut_ptr(), self.stamp);
-        let lastdoc = self.lastdoc.as_mut_ptr();
-        let mut m = 0;
-        for t in self.trig.iter().map(|&info| (info & ID) as usize) {
-            // SAFETY: trigger terms are below bool_terms, and group has
-            // bool_terms + 2 entries; work has room for every trigger (look_up).
-            unsafe {
+        let (doc, stamp, entries) = (self.doc, self.stamp, plan.entries.as_ptr());
+        let (evals, hits) = (self.evals.as_mut_ptr(), self.hits.as_mut_ptr());
+        let (group, lastdoc) = (plan.group.as_ptr(), self.lastdoc.as_mut_ptr());
+        let mut n = 0;
+        // SAFETY: trigger terms are below bool_terms, and group has bool_terms + 2
+        // entries. Fresh terms are distinct, so their ranges are disjoint, and n
+        // stays at most the number of real entries, entries.len() - 8: a store of
+        // 8 indices from n + j (j < the range's length; 0 for a repeat) ends inside
+        // evals, which is as long as the entries. AVX2 is enabled for the build.
+        unsafe {
+            let lane = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+            for t in self.trig.iter().map(|&info| (info & ID) as usize) {
                 // Branch-free: a repeated trigger term is written again and not kept.
-                let fresh = (*lastdoc.add(t) == stamp) as usize;
+                let fresh = *lastdoc.add(t) == stamp;
                 *lastdoc.add(t) = stamp | DONE;
                 let (from, to) = (*group.add(t), *group.add(t + 1));
                 prefetch(entries, from as usize);
-                work.add(m).write((from, to));
-                m += fresh;
+                // Its entries' indices, 8 per store: the next range overwrites the
+                // spare ones, and a range of over 8 (rare) goes on.
+                let store = |f: u32| {
+                    let at = evals.add(n + (f - from) as usize).cast();
+                    _mm256_storeu_si256(at, _mm256_add_epi32(_mm256_set1_epi32(f as i32), lane));
+                };
+                store(from);
+                if fresh && to - from > 8 {
+                    (from + 8..to).step_by(8).for_each(store);
+                }
+                n += fresh as usize * (to - from) as usize;
+            }
+            // The last 8's spare lanes: the last padding entry, which never matches.
+            let padding = _mm256_set1_epi32(plan.entries.len() as i32 - 1);
+            _mm256_storeu_si256(evals.add(n).cast(), padding);
+        }
+        // Word 8i + k of the entries is terms[k] of entry i, and 8i + 5 its truth.
+        let (words, stamps) = (entries.cast::<i32>(), lastdoc.cast::<i32>().cast_const());
+        let mut nh = 0;
+        for b in (0..n).step_by(8) {
+            // SAFETY: AVX2 and BMI2 are enabled for the whole build. evals[b..b + 8]
+            // (b < n) were written above, with indices below entries.len() (a range's
+            // spare ones are at most 7 past it, among the padding), so the words 8i
+            // to 8i + 5 gathered are inside entries. Entry terms are below count + 2,
+            // and lastdoc has 3 bytes more, so the 4 bytes gathered from each stamp
+            // are inside it. nh <= b < n, so the 8 lanes stored at hits[nh..] are
+            // inside hits, as long as evals.
+            unsafe {
+                let idx = _mm256_loadu_si256(evals.add(b).cast());
+                let word = |k| _mm256_add_epi32(_mm256_slli_epi32::<3>(idx), _mm256_set1_epi32(k));
+                // Bit k: term k is in this document, from the stamp byte without
+                // DONE (EMPTY's 0x7F is no stamp): has is -1 if so, and the bits
+                // are shifted in from the last term (present * 2 - has).
+                let mut present = _mm256_setzero_si256();
+                for k in (0..MAX_BOOL_TERMS as i32 - 1).rev() {
+                    let terms = _mm256_i32gather_epi32::<4>(words, word(k));
+                    let s = _mm256_i32gather_epi32::<1>(stamps, terms);
+                    let s = _mm256_and_si256(s, _mm256_set1_epi32(!DONE as i32));
+                    let has = _mm256_cmpeq_epi32(s, _mm256_set1_epi32(stamp as i32));
+                    present = _mm256_sub_epi32(_mm256_add_epi32(present, present), has);
+                }
+                // Bit 31 of a lane: bit `present` of its truth table, whether it matches.
+                let truth = _mm256_i32gather_epi32::<4>(words, word(5));
+                let hit = _mm256_slli_epi32::<31>(_mm256_srlv_epi32(truth, present));
+                let mask = _mm256_movemask_ps(_mm256_castsi256_ps(hit)) as u64;
+                // The matches' indices to the front: pext picks their lane numbers.
+                let bytes = _pdep_u64(mask, 0x0101_0101_0101_0101) * 0xFF;
+                let lanes = _mm_cvtsi64_si128(_pext_u64(0x0706_0504_0302_0100, bytes) as i64);
+                let packed = _mm256_permutevar8x32_epi32(idx, _mm256_cvtepu8_epi32(lanes));
+                _mm256_storeu_si256(hits.add(nh).cast(), packed);
+                nh += mask.count_ones() as usize;
             }
         }
-        // SAFETY: the first m ranges were written.
-        unsafe { self.work.set_len(m) };
-        let state = self.answers.state.as_ptr();
-        for (k, &(from, to)) in self.work.iter().enumerate() {
-            // The state of the range RANGES_AHEAD on (this one's near the end).
-            let ahead = self.work.get(k + RANGES_AHEAD).map_or(from, |r| r.0) as usize;
-            // SAFETY: entry `ahead` is the first of a trigger term's range, which is
-            // never empty (TRIG is set only then, Plan::new). Its answer is only read,
-            // for a prefetch.
-            prefetch(state, unsafe { (*entries.add(ahead)).answer } as usize);
-            // SAFETY: group holds ranges of entries.
-            for e in unsafe { plan.entries.get_unchecked(from as usize..to as usize) } {
-                // Bit k: term k is in this document. SAFETY: entry terms are
-                // below count + 2 = lastdoc.len().
-                let has = |k: usize| {
-                    let s = unsafe { *lastdoc.add(e.terms[k] as usize) };
-                    ((s & !DONE == stamp) as u32) << k
-                };
-                let present = (0..MAX_BOOL_TERMS - 1).map(has).sum::<u32>();
-                // SAFETY: an entry's answer is an answer number, below state.len().
-                unsafe { self.answers.add_doc(e.answer, e.truth >> present & 1, doc) };
-            }
+        for &e in &self.hits[..nh] {
+            // SAFETY: an entry's answer is an answer number, below state.len().
+            unsafe { self.answers.add_doc(plan.entries[e as usize].answer, doc) };
         }
     }
 
@@ -1463,18 +1502,18 @@ impl Answers {
         *s += n << SUM_BITS | (n * base as u64 + positions.sum::<u64>());
     }
 
-    /// Adds document `doc` if `hit` is 1 (else nothing), branch-free.
+    /// Adds document `doc`, branch-free.
     ///
     /// # Safety
     ///
     /// As for `add`.
-    unsafe fn add_doc(&mut self, answer: u32, hit: u32, doc: u32) {
+    unsafe fn add_doc(&mut self, answer: u32, doc: u32) {
         // SAFETY: as in `add`.
         unsafe {
             let s = &mut *self.state.as_mut_ptr().add(answer as usize);
             *self.log.as_mut_ptr().add(self.logged) = answer << 16 | doc & 0xFFFF;
-            self.logged += (hit != 0 && *s >> SUM_BITS < FIRST_IDS) as usize;
-            *s += hit as u64 * (1 << SUM_BITS | doc as u64);
+            self.logged += (*s >> SUM_BITS < FIRST_IDS) as usize;
+            *s += 1 << SUM_BITS | doc as u64;
         }
     }
 
