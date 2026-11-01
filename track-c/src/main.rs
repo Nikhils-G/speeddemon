@@ -518,9 +518,11 @@ fn run_start(text: &[u8], from: usize, k: usize, parts: usize) -> usize {
 /// region id is known, and which then has a record's parse to arrive; the count's
 /// load also needs no value still being computed. Counted right after the parse,
 /// the instruction after that load took 19% of this function's cycles on the box's
-/// CPU (i5-13500). Replica of the box: -1.6 ms (-8.7%) against counting each pair
-/// at once; counting each pair after the next pair: -0.7 ms; no prefetch: +2%;
-/// three cursors: +2%. (Cursors in arrays: +3 ms, the arrays stay in memory.) The
+/// CPU (i5-13500). On the replica of the box, paired runs: -0.88 ms (-4.7%, 201
+/// pairs) against counting each pair at once (c-11), -0.28 ms (-1.5%, 201 pairs)
+/// against counting each pair after the next pair (c-12); without the prefetch
+/// +2.0% (101 pairs), with three cursors +2.1% (51 pairs). (Cursors in arrays:
+/// +3 ms, the arrays stay in memory.) The
 /// second half starts at a cut found like the runs' cuts, so the first half must
 /// end exactly there. Every total, the min and max, and the set of pairs do not
 /// depend on the order in which records are counted.
