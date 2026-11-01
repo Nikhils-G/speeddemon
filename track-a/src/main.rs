@@ -759,21 +759,63 @@ impl Interner {
 }
 
 /// Nearest-rank p50, p95 and p99 (the value at 1-indexed rank ceil(p * n / 100)
-/// in sorted order) of a non-empty group, by selection instead of a full sort: p50
-/// first, then each next rank within the part above the last one. Each value is
-/// read at once: the next selection reorders that part, its own slot included.
+/// in sorted order) of a non-empty group. Groups of up to 64 values (95% of the
+/// groups) count ranks (see `small_ranks`); larger ones select: p50 first, then each
+/// next rank within the part above the last one. Each value is read at once: the
+/// next selection reorders that part, its own slot included.
 fn percentiles(values: &mut [u32]) -> [u32; 3] {
-    let [r50, r95, r99] = [50, 95, 99].map(|p| (p * values.len()).div_ceil(100) - 1);
-    // Most groups are small: 91% have 32 values or fewer (28% of the records). There
-    // the standard library's small-input sort beats three selections; 32 was the
-    // best of 16, 32 and 64 (see PERF.md).
-    if values.len() <= 32 {
-        values.sort_unstable();
-        return [r50, r95, r99].map(|r| values[r]);
+    let ranks = [50, 95, 99].map(|p| (p * values.len()).div_ceil(100) - 1);
+    match values.len() {
+        ..=8 => small_ranks::<1>(values, ranks),
+        ..=32 => small_ranks::<4>(values, ranks),
+        ..=64 => small_ranks::<8>(values, ranks),
+        _ => {
+            let [r50, r95, r99] = ranks;
+            let p50 = *values.select_nth_unstable(r50).1;
+            let p95 = *values[r50..].select_nth_unstable(r95 - r50).1;
+            [p50, p95, *values[r95..].select_nth_unstable(r99 - r95).1]
+        }
     }
-    let p50 = *values.select_nth_unstable(r50).1;
-    let p95 = *values[r50..].select_nth_unstable(r95 - r50).1;
-    [p50, p95, *values[r95..].select_nth_unstable(r99 - r95).1]
+}
+
+/// The values at three ranks (0-indexed, in sorted order) of 1 to 8 * V values,
+/// without sorting or a branch on the values. The value at rank r is the largest
+/// value v with at most r values below v: the r + 1 smallest values are not above
+/// the one at rank r, so a larger v has at least r + 1 values below it. The values
+/// sit in V vectors of eight, zeros past the end (never the largest; never counted,
+/// as only the real values are compared against), and one vector compare per value
+/// and vector counts the values below each lane. (Sorting groups of up to 32 values
+/// took twice as long in a microbenchmark on the groups' real sizes.)
+#[inline(always)]
+fn small_ranks<const V: usize>(values: &[u32], ranks: [usize; 3]) -> [u32; 3] {
+    // SAFETY: AVX2 is enabled for this build. Each masked load reads only the
+    // lanes below values.len() - 8k, which are in the slice; the pointer of a
+    // vector past the end is formed with wrapping_add, and nothing is read there.
+    // Any 32 bytes are a valid [u32; 8].
+    unsafe {
+        let lane = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+        let n = values.len() as i32;
+        let v: [__m256i; V] = std::array::from_fn(|k| {
+            let mask = _mm256_cmpgt_epi32(_mm256_set1_epi32(n - 8 * k as i32), lane);
+            _mm256_maskload_epi32(values.as_ptr().cast::<i32>().wrapping_add(8 * k), mask)
+        });
+        // Unsigned order as signed order: the top bit flipped.
+        let flip = |x| _mm256_xor_si256(x, _mm256_set1_epi32(i32::MIN));
+        let (x, mut below) = (v.map(flip), [_mm256_setzero_si256(); V]);
+        for &value in values {
+            let value = flip(_mm256_set1_epi32(value as i32));
+            for k in 0..V {
+                // A lane above `value` has one more value below it (true is -1).
+                below[k] = _mm256_sub_epi32(below[k], _mm256_cmpgt_epi32(x[k], value));
+            }
+        }
+        ranks.map(|rank| {
+            let rank = _mm256_set1_epi32(rank as i32 + 1);
+            let held = (0..V).map(|k| _mm256_and_si256(_mm256_cmpgt_epi32(rank, below[k]), v[k]));
+            let most = held.reduce(|a, b| _mm256_max_epu32(a, b)).unwrap();
+            std::mem::transmute::<_, [u32; 8]>(most).into_iter().max().unwrap()
+        })
+    }
 }
 
 // SAFETY: these are the C library's own prototypes on x86-64 Linux, where C's int
