@@ -56,15 +56,24 @@ numbers are left out rather than guessed.
 | 38 | (aspeed3-1, no board run of its own) | Four slices per thread, taken in file order from a shared counter; one records/escapes pair per thread (the stacked-thread fix) | — | — | — | 351 | — |
 | 39 | 067466b (board runs from 5afab2c, 8ee6e49, 6923e1e) | aspeed3-2: records released once per part (142 fewer `madvise` calls); the final wait sleeps on the `OnceLock`s, not in a yield loop. The first run was in a slow dispatch (B's unchanged code 0.129587 s) | run-ad77dae6f7a8, run-f864a17b46cc, run-5e361abae820 | 0.020124, 0.019000, 0.018979 | 19.07, —, — | 346 | 84.90, —, 85.56 |
 | 40 | 51f3e80 (board runs from b9237f3, 2c8ba1c, 1877866) | aspeed3-3: after the last write, a barrier, then each thread drops the page-table entries of a page-aligned share of the output mapping (`MADV_DONTNEED`; the pages stay in the file), so the exit does not do it on one core | run-b273d14e2d15, run-d71d8b7f9981, run-73354c271737 | 0.018743, 0.018716, 0.018676 | 19.12, 19.15, — | 353 | 85.59, 85.60, 85.61 |
-| 41 | (not yet on the board) | qa-1 and qa-2: comments, `unsafe fn` contracts (`parse`, `parse_digits`, `release` on a raw pointer), named constants. The hot loops compile to the same instructions (objdump); test server, 2 Dockerfile builds each, 61 interleaved rounds: 19.95 / 19.75 against 19.78 / 19.77 ms (medians), within build-to-build noise | — | — | — | 372 | — |
+| 41 | 1806066 (board runs from 7f08fe7, aa82492, 045a6b5, 9ce324f and a later B sweep push) | Code-quality pass (qa-1, qa-2): comments, `unsafe fn` contracts (`parse`, `parse_digits`, `release` on a raw pointer), named constants. The hot loops compile to the same instructions (objdump); test server, 2 Dockerfile builds each, 61 interleaved rounds: 19.95 / 19.75 against 19.78 / 19.77 ms (medians), within build-to-build noise. The submitted code | run-414047b8285e, run-06d513a7635c, run-696e1acfaf1a, run-e4efcd67f121, run-38a2fba0decc | 0.020761, 0.018823, 0.020965, 0.018636, 0.021146 | —, —, 18.61, 18.96, 18.39 | 372 | —, —, 84.32, 85.52, 84.28 |
 
-The current code is step 40's engine with step 41's comments, built by the Dockerfile of step 37
-(loop alignment on). Step 40's three runs above are our fastest Track A times on the board. Two
-more runs of the same code were slower: run-37da6cecde40, 0.020268 s, 84.91 (45c369c, a dispatch
-where B's run is "likely slow dispatch" in our log), and run-56976cca74a9, 0.021599 s (d576688);
-board.py's latest at 08:55Z is run-2d8150565262, 0.020757 s, 18.94 MB, 84.52. The board's
-best-scoring Track A run, run-faf8de198217 (0.018916 s, 85.72 points), is step 37's code: slower
-than step 40's best, but 16 lines shorter.
+**Code-quality pass (1806066, step 41), on the box:** run-414047b8285e 0.020761 s and
+run-06d513a7635c 0.018823 s (runs.log 09:47Z); run-696e1acfaf1a 0.020965 s, 18.61 MB, 84.32
+points, run-e4efcd67f121 0.018636 s, 18.96 MB, 85.52 points, and run-38a2fba0decc 0.021146 s,
+18.39 MB, 84.28 points (`board.py`). 0.018636 s is our fastest Track A time, so the pass did not
+slow the engine.
+
+The current code is step 41, built by the Dockerfile of step 37 (loop alignment on). Two of its
+five runs are in A's fast mode (0.0186-0.0188 s) and three in the slow one (0.0208-0.0211 s). In the
+045a6b5 dispatch, A's 0.020965 s came with Track B at 0.108491 s (run-29fa59a9bf1f) and Track C at
+0.021882 s (run-84ffefa565f7), both normal or fast, so A's slow mode is not only a slow box, and the
+stacked-thread fix of step 38 did not remove it there. Step 40's code, the same engine, ran
+0.018743, 0.018716 and 0.018676 s (step 40's row), and twice more in slower dispatches:
+run-37da6cecde40, 0.020268 s, 84.91 (45c369c, where B's run is "likely slow dispatch" in our log),
+and run-56976cca74a9, 0.021599 s (d576688). The board's best-scoring Track A run,
+run-faf8de198217 (0.018916 s, 85.72 points), is step 37's code: slower than step 41's best, but 35
+lines shorter.
 
 Same-day A/B of step 39 against step 37 (runs.log 08:10Z, one push each, alternating): step 39
 run-f864a17b46cc 0.019000 s and run-5e361abae820 0.018979 s; step 37 run-110ec4581099 0.019041 s,
@@ -212,12 +221,12 @@ dispatches where B's unchanged code ran 0.1209-0.1312 s.
   exit spent about 0.6 ms on the output's 2,500 page-table entries. Server medians, 2 PGO builds,
   three repetitions (61, 81 and 61 runs): 18.45 / 18.43 → 18.00 / 18.13, 18.14 / 18.08 → 17.79 /
   17.75 and 18.13 / 18.08 → 17.78 / 17.72 ms. M 18.53 → 18.52 MB. On the box, its three normal runs
-  are our fastest A times (0.018676-0.018743 s). This is apost-1's fourth item (step 35), whose
+  (0.018676-0.018743 s) were the fastest A times until step 41's 0.018636 s, the same engine. This is apost-1's fourth item (step 35), whose
   two box runs came before the stacked-thread mode was known.
 - **Step 41** changes no instruction in the hot loops (parse, `parse_digits`, pass 2, writer),
   checked with `objdump` on deterministic builds. Two forms of a checked `OnceLock::set` (with
   `expect` or an `assert!`) were tried and dropped: each changed the instructions of the parse
-  loop, which shares a function with the slice loop that sets the part.
+  loop, which shares a function with the slice loop that sets the part. On the box it ran 0.018636 to 0.021146 s in five runs, the same two modes as step 40.
 
 Where the server time goes (step 39, PGO, 41 interleaved runs, medians; probes, not candidates):
 
@@ -232,20 +241,39 @@ Where the server time goes (step 39, PGO, 41 interleaved runs, medians; probes, 
 Pass 2 cannot be hidden inside the parse: all 12 CPUs are busy there, so only less total work
 helps.
 
-## The box versus the test server
+## What we learned about the box
 
-Several steps did well on the test server and did nothing, or worse, on the box:
+The box is the board's scoring machine; the test server is a 16-vCPU VM. What held on Track A
+(Tracks B and C have their own evidence):
 
-| Change | Test server | Box |
-|---|---|---|
-| Names copied before release (step 11) | 36.2 → 29.9 ms | 0.0367 s against 0.03528, 4% slower |
-| pread through 128 KB buffers (step 16) | −0.9 ms | 0.0236 and 0.0244 s against 0.02188 |
-| apost-1: sort in worker 0, no `munmap` of the scratch, parallel output teardown (step 35) | −0.70 ms (−3.8%) | 0.019312 and 0.021607 s against 0.018935 and 0.019217 |
+- **Cutting work the box waits on pays; cutting work it does not wait on does not.** Branch-free
+  field ends (step 9: 0.0377 → 0.0361 s), the inline key compare (step 13), 333 → 199
+  instructions per line (step 14, 0.02257 s on its second run) and a shorter serial merge (step
+  33: 0.018935 s) all moved the box. 4% fewer parse instructions (step 25: 0.019916 against
+  0.019691 s) and dynamic parse blocks (step 24: 0.019777 s) did not, and the probes of step 32 say
+  why: the 12-thread parse ends at 11.0 ms against a 7.8 ms memory floor, so it waits on memory,
+  not on instructions.
+- **State and teardown cost real time.** Freeing the tables one at a time cost 4-5 ms on the box
+  (step 12: exiting right after the write took 0.0367 → 0.03066 s). 8-byte records alive during the
+  write held M at 44.66 MB; 4-byte records freed before the write gave 24.3 MB (step 8).
+- **Kernel-side gains on the test server need a board run.** In the VM, page faults, the mmap lock
+  and TLB-shootdown interrupts cost much more than on the box:
 
-All three are kernel-side: page faults, the `mmap` lock, TLB shootdowns and the exit's unmap. The
-test server is a VM, where faults and cross-core interrupts cost much more than on the bare-metal
-box. Changes that remove plain CPU work from the critical path (steps 9, 13, 14, 19, 33) moved
-both machines the same way. A kernel-side or teardown gain is only real once a board run shows it.
+  | Change | Test server | Box |
+  |---|---|---|
+  | Names copied before release (step 11) | 36.2 → 29.9 ms | 0.0367 s against 0.03528, 4% slower |
+  | pread through 128 KB buffers (step 16) | −0.9 ms | 0.0236 and 0.0244 s against 0.02188 |
+  | apost-1: sort in worker 0, no `munmap` of the scratch, parallel output teardown (step 35) | −0.70 ms (−3.8%) | 0.019312 and 0.021607 s against 0.018935 and 0.019217 |
+
+  Changes that remove plain CPU work from the critical path (steps 9, 13, 14, 19, 33) moved both
+  machines the same way.
+- **Settings tuned on the test server can be wrong on the box.** Four slices per thread (step 38)
+  removed the stacked-thread tail on the server (slowest of 100 runs 25.98 → 21.69 ms), but on the
+  box three of step 41's five runs are still in the slow mode. Loop alignment fixed a layout gap for
+  Track B on the server and shows nothing on A's box runs (steps 34 and 36).
+- **A's box times are bimodal**: about 0.0187 s, or 0.0205 to 0.027 s, for the same binary. A single
+  run cannot tell a 3% change from the mode, so decisions use alternating dispatches ("How the
+  final number was verified").
 
 ## Box probes (failed runs on the board, by design)
 
@@ -328,10 +356,37 @@ The earlier probes behind step 12 used 0.25 ms units; their run IDs are not in o
 - **Lines are points.** Steps 20 and 26–27 gained 0.86 and 1.07 points with no change in speed.
   Steps 26–27 cut 177 lines for 1.07 points, about 0.006 points per line.
 
-## How correctness was verified
+## How the final number was verified
 
-Before every push, on the binary built by this directory's Dockerfile (so the PGO build is the
-one tested):
+**The gate**, before every push, runs the binary that this directory's Dockerfile builds
+(`docker build`, then `docker create` and `docker cp` of `/app/solution`), so the PGO build the
+board makes is the one tested. For the submitted code (step 41):
+
+- full seed 1, sha256 495ca09682b9… (the spec's), at `taskset -c 0`, `0-2`, `0-6` and `0-7` (1, 3,
+  7 and 8 CPUs) on the laptop, and at 1, 3, 12 and 16 CPUs on the test server, on two Dockerfile
+  builds;
+- sample seeds 2-4 and holdout seed 99 byte-equal to the reference output, on the laptop and on
+  both server builds; the empty input gives an empty summary.txt;
+- the hot loops compile to the same instructions as step 40's (`objdump`), whose gate also passed
+  fresh tiny and sample seeds 41-43 at 1 and 8 CPUs, the malformed logs of step 29, and
+  `objdump | grep -c vpinsrb` = 0.
+
+The gate is a shell loop kept outside the repo (scc would count it as code): for each input, run
+`solution <data dir> <out dir>` and compare `summary.txt` with `cmp` or its sha256.
+
+**The box number.** Runs of one binary spread about 3% on the board, plus A's slow mode. So:
+
+- **Alternating dispatches.** A candidate and the code it would replace are pushed in turn, a few
+  minutes apart, so both meet the same box state, and a result counts only if it repeats. Example
+  (runs.log 08:10Z): step 37, step 39, step 37, step 39, step 37 gave 0.019041, 0.019000,
+  0.019097, 0.018979 and 0.020012 s, so step 39 was kept as level-or-better. A run in a dispatch
+  where the other tracks' unchanged code was slow too is marked DISTURBED or SLOW BOX and not used.
+- **Exit-code probes** measure phases the board does not report (see "Box probes"): parse end
+  11.0 ms, memory floor 7.8 ms.
+- **The submitted code** ran 0.018636 s (run-e4efcd67f121), our fastest Track A run, so the
+  quality pass cost no speed; its slower runs are the slow mode above.
+
+### What every gate checked (steps 8 to 41)
 
 - **Seed hashes.** sha256 of the full seed-1 output, 495ca09682b9… (as in the spec), and of
   sample seed 1, ca6311bbeb53….
@@ -348,11 +403,3 @@ one tested):
   segfault (step 29).
 - **Code check.** `objdump | grep -c vpinsrb` = 0: the bit-by-bit mask rebuild that the inline
   `vpmovmskb` avoids is not in the binary.
-- **Current code (step 41).** The exact Dockerfile image: full seed 1 at `taskset -c 0`, `0-2`,
-  `0-6` and all CPUs (laptop) and at 1, 3, 12 and 16 CPUs (test server, four Dockerfile builds),
-  samples 2-4 and holdout seed 99 byte-equal to the reference, and the empty input giving an empty
-  summary. The gate is a shell loop kept outside the repo (scc would count it as code): build the
-  image with `docker build`, copy `/app/solution` out with `docker create` and `docker cp`, then
-  for each input run `solution <data dir> <out dir>` and compare `summary.txt` with `cmp` or its
-  sha256. The fuzzing of step 29 mutated a sample log 300 times (a tail without LF, a long method,
-  random bytes, a 300-byte endpoint) and checked that each run aborts with a message or exits 0.

@@ -53,19 +53,25 @@ box, so no decision rests on one run.
 | 42 | 061e6e7 | Back to sorting the first ids, as a board A/B of step 41. Run on 2c8ba1c (B unchanged) | run-1d513d5e3c12 | 0.114997 | 41.34 | 845 | 76.99 |
 | 43 | 1877866 | Step 41's code again, a second sample | run-4bf47a08b8fc | 0.112506 | 42.23 | 856 | 77.18 |
 | 44 | d576688 | ALWAYS back at 0.25, as a board A/B of step 43's 0.125. The best B run | run-4bb3867f9472 | 0.108588 | 42.02 | 856 | 77.57 |
-| 45 | 0613dd1 | The formatter prefetches the 12 threads' states of the line 8 ahead: they are stored in answer order and read in line order, so each line's 12 reads are random. Test server: format phase 1.9 → 1.35 ms, −0.35 to −0.56 ms on three PGO builds. Second sample on ade4b30, run-6b284372d9e8: 0.109028 s, 41.98 MB, 77.52 | run-2e7482eb1235 | 0.115166 | 41.06 | 858 | 76.92 |
+| 45 | 0613dd1 | The formatter prefetches the 12 threads' states of the line 8 ahead: they are stored in answer order and read in line order, so each line's 12 reads are random. Test server: format phase 1.9 → 1.35 ms, −0.35 to −0.56 ms on three PGO builds. Later samples of this code: run-6b284372d9e8 (ade4b30) 0.109028 s, 41.98 MB, 77.52; run-92f2f932e951 (82cf0cf) 0.114512 s; run-cc93468c4bc0 (aa82492) 0.110054 s | run-2e7482eb1235 | 0.115166 | 41.06 | 858 | 76.92 |
 | 46 | 631d15b | **Reverted** (ade4b30). Step 45 plus a block end that filters touched slots by a per-term trigger bitmap and drops entries whose two rarest required terms share no document before evaluating them (1.37M of 4.26M block evaluations on seed 1): test server −1.9% on three builds, but the box ran 23% slower and over the 44 MB credit | run-e007250809db | 0.134041 | 45.52 | 892 | 75.00 |
-| 47 | | Plan::new groups the anchors and sorts the `always` entries on a second scoped thread while the main thread groups the entries (serial before: about 1.45 ms on the test server). On step 45's code: −0.9 to −1.3 ms on three PGO builds; merged here with the quality pass. Board run pending | | | | 905 | |
+| 46b | d063ddd | Board A/B, pushed after step 47: the quality pass alone (qb-2: step 44's code with the quality changes, without step 45's prefetch and step 47's second thread) | run-a9b8897b3449 | 0.112084 | — | 896 | 77.07* |
+| 47 | 5a0612d (board runs from 5a0612d, 7f08fe7, 045a6b5) | The submitted code. The code-quality pass (renames, SAFETY arguments, setup split into named functions, named constants) on step 45's code, plus `Plan::new` grouping the anchors and sorting the `always` entries on a second scoped thread while the main thread groups the entries (serial before: about 1.45 ms on the test server; −0.9 to −1.3 ms on three PGO builds). The first run was in a slow dispatch (A's unchanged code ran 0.022241 s in it) | run-5892b2f7eb00, run-eb924b66b4aa, run-29fa59a9bf1f | 0.144406, 0.115198, 0.108491 | 40.88, —, 41.57 | 905 | 74.29, 76.74*, 77.40 |
 
-The submitted source is step 44's code with code-quality changes only (renames, SAFETY arguments,
-setup split into named functions, named constants): `Scan::run`, `end_block` and `end_super` have
-the same instructions at the same offsets as step 44's in local PGO, local plain and test-server
-PGO builds (objdump, 0 differing), and on the test server two PGO builds of each time the same
-(medians of 31 interleaved rounds of 11 runs: 80.90 and 81.02 ms for step 44, 81.05 and 80.89 for
-the submitted source), so step 44's run measures its speed. Its S is 896 (`static_axes.py`) against
-step 44's 856. Later board runs (run-991a3ad938c2, run-5fd89506515e, run-2e7482eb1235: ALWAYS
-0.35 and 0.5, and a formatter prefetch, 0.112231 to 0.117245 s) are of experiments not in this
-source.
+**Code-quality pass (5a0612d, step 47; also pushed as 7f08fe7 and 045a6b5), on the box:**
+run-5892b2f7eb00 0.144406 s (a slow dispatch), run-eb924b66b4aa 0.115198 s (runs.log 09:47Z) and
+run-29fa59a9bf1f 0.108491 s, 41.57 MB, 77.40 points (`board.py`). The pass itself changed no hot
+instruction: `Scan::run`, `end_block` and `end_super` are the same instructions at the same
+offsets as step 44's in local PGO, local plain and test-server PGO builds (objdump, 0 differing),
+and two PGO builds of each time the same on the test server (medians of 31 interleaved rounds of
+11 runs: 80.90 and 81.02 ms for step 44, 81.05 and 80.89 for the quality pass).
+
+The submitted code is step 47. In the A/B of 09:28-09:47Z (pushes in turn, runs.log 09:47Z) the
+three candidates ran: the quality pass alone (step 46b) 0.112084 s, step 47 0.115198 s, step 45
+0.110054 s; then step 47 again 0.108491 s. All three versions sit inside one 0.108-0.115 s band
+(step 45's four runs span 0.109028 to 0.115166 s), so the box does not separate them. The S cost
+is real: at the board's S exponent, step 47's 905 lines score 0.17 points below step 45's 858 at
+equal T, and the board's best B run is still step 44's run-4bb3867f9472 (0.108588 s, S 856, 77.57).
 
 Later runs of step 37's binary (with the flag): run-d97dcca08b7d, 0.12489 s, 40.61 MB, 76.20 (5d6d235, a dispatch our log
 calls "a bit slow"); run-7bbf842f335a, 0.121849 s, 41.73 MB, 76.47 (51d3674, "box slower than
@@ -73,10 +79,11 @@ morning"); run-8addd6917ec9, 0.121414 s, 42.24 MB, 76.51 (3e7d9a4, SLOW BOX); ru
 0.118445 s, 41.5 MB, 76.78 (1f8d96a, normal box). S is the harness's `static_axes.py` count, which matches the board for
 every run where the board's S was logged. M is blank where it was not logged. Points marked * are
 computed from T and S with the board's formula: every M logged since step 6 is under the 44 MB cap
-(26.8 to 43.8 MB) except step 26's 44.09 MB, which costs 0.01 points, and the formula reproduces every
+(26.8 to 43.8 MB) except step 26's 44.09 MB, which costs 0.01 points, and the reverted step 46's
+45.52 MB, whose logged points are used as they are; the formula reproduces every
 logged point value to within 0.01. M is blank for steps 29 and 35 to 37 because runs.log did not
 record it, and for steps 10 and 19 because the values once written there are not in runs.log;
-steps 33 to 44 are at 40.6 to 42.2 MB wherever it was logged.
+steps 33 to 47 are at 40.6 to 42.2 MB wherever it was logged, step 46 aside.
 Steps 24 and 27 are the round's reverted experiments; step 23 was
 kept because its server gain was clear and the box did not show it slower than step 22 once
 step 24 ran without the disturbance.
@@ -213,7 +220,8 @@ step 24 ran without the disturbance.
 - **Steps 40 and 44: ALWAYS is a box decision.** After step 39 a sweep off the board measured 0.125
   fastest of 0.0625 to 0.25 (b9237f3's comment); with 0.125 the box ran 0.11394 to 0.12433 s (steps
   40 to 43), with 0.25 0.113311 and 0.108588 (steps 39 and 44), so 0.25 stays. A board sweep since (0.35: 0.112231 s in a slow
-  dispatch; 0.5: 0.117245) did not beat it.
+  dispatch; 0.5: 0.117245; 0.30 on step 47's code: run-0c4bcc0a40b7, 0.113925 s, 43.03 MB) did not beat it. The
+  test server's own sweep had picked 0.125: a constant tuned there was wrong for the box.
 - **Steps 45 and 46: the box pays for random state, not for instructions.** Step 46's block end did
   less work (a third fewer evaluations, test server −1.9%) but kept a bitmap, a pair per entry and
   two more per-thread lists, and the box ran 0.134 s against 0.109 to 0.115 and passed the memory
@@ -228,17 +236,12 @@ step 24 ran without the disturbance.
 
 ## Experiments that did not make it (measured, reverted)
 
-Board-measured reverts are in the table above (steps 11, 12, 14, 24 and 27). These were measured elsewhere.
+Board-measured reverts are in the table above (steps 11, 12, 14, 24, 27 and 46). These were measured elsewhere. Five early ideas (lookups batched per document, a larger hot table, an early return on a zero result, hot tables of 2^10 to 2^14 buckets, prefetching the term table while parsing queries) were tried on the test server, but their numbers were not kept, so no result is claimed for them.
 
 | Experiment | Result |
 |---|---|
 | v7–v11: streaming evaluation per document instead of an index (1cd58a4) | board run-5a81a3585198: T 0.517 s, M 104 MB, S 1,132, 56.0 pts (K 13.17): worse than step 4's K 13.57, reverted |
-| Prefetched lookups in batches per document | within noise on the test server; number not kept |
-| A larger hot table in step 4's design | within noise on the test server; number not kept |
 | Block engine: a per-block presence bitmap to avoid cold `presence` loads | 4.30G → 4.72G cycles (one thread) |
-| Block engine: early return when an evaluation's result is zero | within noise on the test server; number not kept |
-| Block engine: hot table of 2^10 to 2^14 buckets | 2^13 fastest on the test server; numbers not kept |
-| Prefetching the term table while parsing queries | within noise on the test server; number not kept |
 | Superblock threshold ALWAYS at 0.125 / 0.5 instead of 0.25 | 129–131 / 133 ms vs 127 ms (step 8's code, test server). After step 39 the box was asked again: 0.25 kept (steps 40 and 44) |
 | One term table of 2^17 buckets | 135 ms vs 129 at 2^16 (kept 2^15 for memory) |
 | Prefetching the entries' `presence` words at the block end | cycles 2.45G → 2.55G |
@@ -271,8 +274,7 @@ Board-measured reverts are in the table above (steps 11, 12, 14, 24 and 27). The
 | `add_wide` with one branch (count_positions always computed, branch only for an unsaturated answer with hits) | test server +1.3 ms |
 | `always` term words packed into one stream (`row * 32 \| op`) with runs of equal length | test server about −0.6 ms (about −0.9% cycles) for S +15: break-even, not kept |
 | `always` entries sorted by their term ids after length and operators, for row locality | test server +1.2 to +1.5 ms |
-
-| Probes of the term table kept in its first 512 KB or 128 KB (token path only, answers wrong) | box: 41.0 ms (run-76a286c818fc) against 42.0 ms (run-2cfcd3e991a4) for 512 KB: an L2-resident table does not pay on the box |
+| Probes of the term table kept in its first 512 KB (token path only, answers wrong) | box: 42.0 ms (run-2cfcd3e991a4) against 41.0 ms for the full 2 MB table (run-76a286c818fc): an L2-resident table does not pay on the box |
 | The token loop of step 39 as inline asm (23 instructions per token, every table pointer in a register) | instructions −84M, ops −57M, but test server +1.1 to +1.7 ms on three PGO builds |
 | The table, pilots and seed read once per slice instead of once per run of tokens | instructions unchanged, cycles +2.5% |
 | Info word by a volatile scalar load instead of vpextrd (one uop instead of two) | ops −37M, test server +0.6 to +0.8 ms on three builds |
@@ -281,19 +283,74 @@ Board-measured reverts are in the table above (steps 11, 12, 14, 24 and 27). The
 
 - **Byte-identical copies of one binary ran up to 2.5% apart on the test server** (for example 83.1 against 84.4 ms, the same sha256), so every comparison here averages several copies of each binary.
 
-## Other seeds
+## Robust on unseen seeds
 
-The submitted build on the test server (12 threads, `taskset -c 0-11`, output on tmpfs), medians
-of 21 runs for each of two PGO builds; query and evaluation counts from a counting build at 12
-threads. The output is byte-equal to the reference on seed 99, and the same as step 44's on seed 2.
+README, "Robust on unseen seeds", has the full argument. In short: the plan is made per input from
+that input's own sample, the perfect hash re-seeds rather than answer wrongly, holdout seed 99 and
+fresh tiny and sample seeds match the reference at every gate, and on the test server the
+quality-pass source (step 46b's code) times the same on three full-scale seeds: medians of two PGO
+builds, 21 runs each, 12 threads.
 
-| Input | Median (two builds) | Step 44's builds | Superblock queries | Block-entry evaluations |
+| Input | Step 46b's builds | Step 44's builds | Superblock queries | Block-entry evaluations |
 |---|---|---|---|---|
 | Full seed 1 | 80.43 / 80.74 ms | 80.73 / 80.65 ms | 6,023 | 4.52M |
 | Holdout seed 99 | 80.33 / 80.76 ms | 80.12 / 80.35 ms | 6,044 | 4.55M |
 | Full seed 2 | 80.20 / 80.42 ms | 80.48 / 79.77 ms | 6,105 | 4.45M |
 
-## Correctness checks run before every push
+## What we learned about the box
+
+The box is the board's scoring machine; the test server is a 16-vCPU AMD VM. On Track B:
+
+- **Cuts of uops on the token path pay.** Step 17 cut 6.8% of the instructions and the box went
+  0.1619 → 0.1484 s (−8%); step 39 cut 6.2% and the box went from 0.116583 / 0.119467 to 0.113311
+  s. The perfect hash (step 31) replaced four key compares with one probe: box −10.4%. But
+  instruction cuts that did not shorten the token path's stalls did not show: steps 18 and 19 (each
+  4 to 5% fewer instructions on the test server) ran 0.1529 to 0.1478 s against step 17's 0.1484.
+- **L2-miss cuts do not pay.** Numbering the answers in evaluation order cut L2 misses 10% on the
+  test server, and the one-word filter 19% more; the box did not move (0.1443 against 0.1459 s,
+  steps 23 and 24). Two probes of the token path alone (answers wrong, by design): with the 2 MB term
+  table it took 41.0 ms on the box (run-76a286c818fc), with every probe kept in the table's first
+  512 KB 42.0 ms (run-2cfcd3e991a4). An L2-sized table buys nothing there.
+- **Hiding random loads pays.** Prefetching the block end's entry ranges (step 20: 0.1478 →
+  0.1404 s) and the two-pass block end (step 28: 0.1374 s against 0.1389 and 0.1420) both moved
+  the box, more than the test server predicted.
+- **Random state costs.** Step 46 did a third fewer evaluations (test server −1.9%) but added a
+  bitmap, a pair per entry and two per-thread lists: the box ran 0.134041 s against 0.109 to 0.115,
+  and M went to 45.52 MB, over the credit. Step 26's 4.5 MB copy of the answer state put M at
+  44.09 MB.
+- **Settings tuned on the test server can be wrong on the box.** ALWAYS: the server's sweep picked
+  0.125, the box runs faster at 0.25 (steps 40 to 44; 0.35, 0.5 and 0.30 did not beat it). Loop
+  alignment: on the server it removed a 1.5 to 2.5 ms layout gap; on the box B is not slower
+  without it (step 38). Setup work, by contrast, transferred: spreading it over twelve threads took
+  17 to 19 ms off the box (steps 15 and 16), and a probe later put the box's setup at 16.5 ms, the
+  same as the server's 16.4 to 16.8 ms.
+
+## How the final number was verified
+
+**The gate.** Before every push, the exact Dockerfile build (`docker build`, then `docker create`
+and `docker cp` of the binary), so the PGO binary the board builds is the one tested. For the
+submitted code (step 47):
+
+- full seed 1, sha256 f86973c21022…, at `taskset -c 0`, `0-2`, `0-6` and all 8 CPUs (1, 3, 7 and 8
+  threads) on the laptop; the quality pass also at 12 and 16 threads on two test-server PGO builds;
+- sample seeds 1 to 4 and holdout seed 99 byte-equal to the reference output;
+- 144 tiny, fresh and adversarial runs at 1, 3 and 8 CPUs, and fresh tiny seeds 801 to 806 and
+  sample seeds 51 and 52 against `reference/b_index.py` (24 of 24 equal);
+- `objdump | grep -c vpinsrb` = 0.
+
+**The box number.** Single board runs of one binary have spread up to 45% in disturbed
+dispatches, so:
+
+- **Alternating dispatches.** Candidates are pushed in turn, minutes apart, against the code they
+  would replace, and a result must repeat (steps 41 to 44: 0.12433 for the sort-free first ids,
+  0.114997 back on the sort, 0.112506 sort-free again; steps 45, 46b and 47 above). A dispatch where
+  Track A's or C's unchanged code was also slow is marked and not used.
+- **Exit-code probes** measure phases the board does not report (setup end, scan end, the scan
+  without BOOL evaluation; see "Timing probes on the box" in "What each step taught").
+- **Points marked \*** are computed from T and S with exponents fitted to the logged runs (K ∝ T^-0.5 ·
+  S^-0.15 while M is under the credit), which reproduce every logged B point value to within 0.01.
+
+### What every gate checked
 
 sha256 of the seed-1 output; byte comparison with the reference output for sample seeds 2–4; 30
 generated `tiny` seeds against `reference/b_index.py` at 1, 3 and 8 CPUs; adversarial inputs (token

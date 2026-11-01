@@ -16,10 +16,13 @@ percentiles need every latency of a group, not a running summary.
 
 ## Where the time goes on the box
 
-The submitted engine's fastest board run is 0.018676 s (run-73354c271737, 85.61 points; PERF.md,
-step 40). The best-scoring Track A run on the board, run-faf8de198217 (0.018916 s, 85.72 points),
-is step 37's code, 16 lines shorter than step 40's (PERF.md, step 37). The probes below were taken
-on step 31's code. A probe is a temporary build that exits with the elapsed time as its exit code,
+The submitted code is PERF.md step 41: step 40's engine after the code-quality pass (1806066,
+S 372). Its board runs: run-e4efcd67f121 0.018636 s (18.96 MB, 85.52 points, our fastest Track A
+time), run-06d513a7635c 0.018823 s, run-414047b8285e 0.020761 s, run-696e1acfaf1a 0.020965 s and
+run-38a2fba0decc 0.021146 s: A's box times come in a fast and a slow mode (PERF.md, "What we learned
+about the box").
+The best-scoring Track A run, run-faf8de198217 (0.018916 s, 85.72 points), is step 37's code, 35
+lines shorter (PERF.md, step 37). The probes below were taken on step 31's code. A probe is a temporary build that exits with the elapsed time as its exit code,
 in 0.1 ms units, because the board reports only T and the exit code of a failed run (PERF.md,
 step 32):
 
@@ -94,49 +97,49 @@ One line per technique: what it is, where it is in `src/main.rs`, and why the ou
 7. Hour key = the timestamp's first 13 bytes as a big-endian number. Exact: fixed width, so byte order is time order, and the bytes are the output label.
 8. Runs of lines instead of an hour per record (`Part`, `Run`). Exact: every run of an hour is gathered from every slice, so no disorder bound is assumed.
 9. One 64-byte AVX2 space mask after the fixed 27-byte timestamp (`spaces`). Exact: fields are separated by one space.
-10. Field ends by `tzcnt` and clear-lowest-bit, no branch on the method or the length.
+10. Field ends by `tzcnt` and clear-lowest-bit, no branch on the method or the length. Exact: the first two set bits after byte 27 are the method's and the endpoint's spaces.
 11. `vpmovmskb` as inline asm (`movemask`): LLVM would rebuild the 64-bit mask bit by bit without AVX-512. Exact: the same instruction.
-12. Bounded 32-byte window search for endpoints past byte 92 (`parse`).
-13. Tripwire `assert!` on the method and endpoint length: malformed input stops instead of reading past the pad.
+12. Bounded 32-byte window search for endpoints past byte 92 (`parse`). Exact: the windows reach the space after a 125-byte endpoint, the longest the spec allows; anything longer fails an assert.
+13. Tripwire `assert!` on the method and endpoint length: malformed input stops instead of reading past the pad. Exact: it stops; it never guesses.
 14. Zero-padded 64-byte vector key from a sliding `KEEP` mask. Exact: no endpoint byte is zero.
-15. Two CRC32 steps over the key folded to 16 bytes (`Interner::id`).
+15. Two CRC32 steps over the key folded to 16 bytes (`Interner::id`). Exact: the hash only picks the first slot; identity is the full key compare (18, 19).
 16. One lock-free open-addressing table shared by all threads, ids published by compare-and-swap (`Interner`). Exact: a losing id is never in a record.
-17. 8x slots per possible id (11% load): almost every lookup is one probe.
-18. Key compare by two vector XORs and one `vptest` instead of `memcmp`.
+17. 8x slots per possible id (11% load): almost every lookup is one probe. Exact: the load changes the probe count, not the answer.
+18. Key compare by two vector XORs and one `vptest` instead of `memcmp`. Exact: all 64 key bytes are compared.
 19. Byte compare only for endpoints of 64 bytes or more. Exact: covers keys that share 64 bytes.
-20. Insert out of line (`#[cold]`, `#[inline(never)]`): the hot loop keeps its registers.
+20. Insert out of line (`#[cold]`, `#[inline(never)]`): the hot loop keeps its registers. Exact: code placement only.
 21. Endpoint bytes copied at insert: the input's pages can be released early.
-22. Table allocated zeroed (`Box::new_zeroed`): its pages fault in only as touched.
+22. Table allocated zeroed (`Box::new_zeroed`): its pages fault in only as touched. Exact: a zero slot means empty, and untouched pages read as zero.
 23. SIMD latency parse: LF by compare, digits right-aligned by `pshufb`, then `maddubs`/`madd`/`packus`/`madd` (`parse_digits`). Exact: 1 to 10 digits as two 8-digit halves.
-24. 4-byte records `id << 21 | 5xx << 20 | latency`.
+24. 4-byte records `id << 21 | 5xx << 20 | latency`. Exact: 11 bits hold the 2,048 ids; a latency that does not fit in 20 bits escapes (25).
 25. Branch-free escape list: the slot is always written, the cursor moves only for a latency of 2^20 - 1 or more. Exact: read back in order, run by run.
-26. Worst-case pre-sized record arrays, one pair per thread (`free`), written through raw pointers: no capacity checks; untouched pages cost nothing.
+26. Worst-case pre-sized record arrays, one pair per thread (`free`), written through raw pointers: no capacity checks; untouched pages cost nothing. Exact: the room is sized from the slice's bytes and the shortest line (`MIN_LINE`), and an assert checks it.
 27. 5xx from the status's first digit. Exact: a status is 5xx exactly when it starts with 5.
 28. Input pages dropped by each parse thread (`release`, `MADV_DONTNEED`): the exit does not unmap 58,000 pages on one core.
-29. Log unmapped by the idle main thread during pass 2: its page tables are freed off the serial path.
-30. Endpoint keys released after the sort.
+29. Log unmapped by the idle main thread during pass 2: its page tables are freed off the serial path. Exact: nothing reads the log after the parse; the names were copied (21).
+30. Endpoint keys released after the sort. Exact: no key is read after it.
 31. Endpoint sort by the first 32 key bytes as two big-endian `u128`, then the name. Exact: byte order, a proper prefix first.
-32. All runs sorted by (hour, part) and cut into hours with `chunk_by` (the merge in `main`, `same_hour`).
-33. Hours queued in blocks of one per thread, largest first: small hours do not pile up behind a big one.
+32. All runs sorted by (hour, part) and cut into hours with `chunk_by` (the merge in `main`, `same_hour`). Exact: every run of an hour, from any slice, lands in that hour, whatever the disorder.
+33. Hours queued in blocks of one per thread, largest first: small hours do not pile up behind a big one. Exact: it orders the work; each hour's place in the file comes from the published lengths (43).
 34. Per-hour counting sort with count and 5xx count packed in one `u64`: one add per record.
 35. Scatter without bounds checks (SAFETY: the counts are this hour's).
 36. Record pages released per part once no hour reads it (`readers`): one `madvise` per part, because each call is a round of TLB shootdowns (perf on the test server showed `madvise` at 14.9% of cycles and IPIs at 8.8% with a release per run). Exact: released only after the last reader has placed its values.
 37. p50, p95, p99 by nested `select_nth_unstable`; groups of up to 32 sorted (`percentiles`). Exact: ranks `ceil(p * n / 100)`.
 38. Each percentile read right after its own selection. Exact: the next selection reorders the slice.
-39. Scratch sized once for the largest hour and allocated zeroed.
-40. Pending statistics in 20 bytes per endpoint; the rate is computed when printed (`numbers`).
+39. Scratch sized once for the largest hour and allocated zeroed. Exact: every hour fits in it.
+40. Pending statistics in 20 bytes per endpoint; the rate is computed when printed (`numbers`). Exact: the rate is the integer `errors * 1000000 / count` from the same counts.
 41. Each hour's exact output length computed first (`line_len`), and the writer asserts it.
 42. Output mapped shared at a bound, truncated to the total at the end: no write calls on the tmpfs inode lock.
 43. Out-of-order compute, in-order placement: an hour's start is the sum of the published lengths before it.
-44. Lines built backwards in a stack buffer from a two-digit table (`write`, `PAIRS`).
+44. Lines built backwards in a stack buffer from a two-digit table (`write`, `PAIRS`). Exact: the writer asserts that each hour's bytes match its computed length (41).
 45. Exit without teardown (`process::exit`). Before it, the threads drop the output mapping's page-table entries in parallel after a barrier (`written`, `share`): the pages stay in the file.
-46. Profile-guided build trained on generator seed 7, not the scored seed (Dockerfile).
+46. Profile-guided build trained on generator seed 7, not the scored seed (Dockerfile). Items 46 to 51 change speed only: every correctness check runs the binary this Dockerfile builds.
 47. Atomic profile counters: every build gets the same profile.
-48. Hot loops aligned to 64 bytes (`-align-loops=64`). The one board run without it (step 36) ran 0.0271 s, but A's box times are bimodal (about 0.019 s or 0.022-0.027 s for the same code), so that run does not prove the flag helps; it is kept because C's best run uses it and A is not slower with it.
+48. Hot loops aligned to 64 bytes (`-align-loops=64`). Kept because A is not slower with it and C's best run uses it. The one board run without it (step 36, 0.027124 s) fell in A's slow mode, so it shows neither a gain nor a loss (PERF.md, steps 34 and 36).
 49. Fat LTO, one codegen unit, `panic = "abort"` (Cargo.toml).
 50. Static binary (`crt-static`).
 51. `target-cpu=native`, with a `compile_error!` without AVX2.
-52. Exit-code timing probes on the box (PERF.md, "Box probes").
+52. Exit-code timing probes on the box (PERF.md, "Box probes"). Measurement only, never a scored version.
 53. No dependencies: libc calls declared by hand.
 
 Each technique below names the bottleneck, what the design does about it, and why the output
@@ -308,8 +311,9 @@ stays exact for every seed of the generator.
   the final binary with the profile. The training run uses atomic profile counters
   (`-instrprof-atomic-counter-update-all`): with plain counters, its threads lost updates, so
   every build got a different profile and a different binary. Aligning loops to 64 bytes
-  (`-align-loops=64`) is on for A: the board A/B in PERF.md (step 36) built without
-  it and ran 0.0271 s, so the flag went back on (PERF.md, steps 36 and 37). Fat LTO, one
+  (`-align-loops=64`) is on for A. The one board build without it (PERF.md, step 36) ran
+  0.027124 s, in A's slow mode, so it proves nothing either way; the flag stays because A is not
+  slower with it and C's best run uses it. Fat LTO, one
   codegen unit, `panic = "abort"`, a static binary, and `target-cpu=native` (the board builds on
   the box). A `compile_error!` stops a build without AVX2.
 - **Why exact.** The build changes speed only. Each correctness check runs the binary built by this
@@ -338,6 +342,30 @@ timestamp, the 72-hour span, one space between fields, the 3-digit status, and 1
 digits then LF. A line that breaks them gives wrong output or stops at an assert, never a read
 outside the mapping (SAFETY in `parse`). Checked by an `assert!`, which stops the program: the method and endpoint
 lengths, the 2,048 ids, the room for the records, and each hour's written length.
+
+## Robust on unseen seeds
+
+The board scores seed 1; nothing in the program is fitted to seed 1's data.
+
+| What could change with the seed | What the program does |
+|---|---|
+| Disorder between the eight shards | No bound is assumed: a line out of order starts another run, and pass 2 gathers every run of an hour from every slice (technique 6) |
+| Number and size of the hours | Hours come from the data; the scratch array is sized from the largest hour |
+| Latencies up to 4294967295 | The escape list keeps any `u32` (technique 5) |
+| Distinct endpoints | 2,048 ids for the spec's 1,842 (E15); more stops the program. The lost-id margin (at most 13 of 206 spare ids lost in 100 runs) was measured on seed 1 only; it depends on threads meeting a new endpoint at the same moment, not on seed 1's order |
+| The build | PGO is trained on generator seed 7 at sample scale, not on the scored seed |
+
+Evidence, all on the binary built by this directory's Dockerfile:
+
+- **Holdout seed 99**, full scale, byte-equal to the reference output in the gate since step 13 (the
+  hidden-seed check in our run log), and for the submitted code on the laptop and on two server builds (PERF.md, "How the final
+  number was verified").
+- **Sample seeds 2-4** byte-equal to the reference at every gate.
+- **Fresh seeds** the earlier gates had not seen: tiny and sample seeds 21-24 (step 30), 21-23
+  (step 31) and 41-43 (steps 38-40, the hot code that ships), each at 1 and 8 CPUs, against
+  `reference/a_ingest.py`.
+- **Malformed input**: 300 mutated logs abort with a message or exit 0, never a segfault (step 29).
+- **Timing on other seeds** was not measured for Track A: every time in these docs is seed 1.
 
 ## Error handling
 
