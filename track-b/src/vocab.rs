@@ -40,8 +40,8 @@ fn split_lines(chunk: &'static [u8], padded: &'static [u8], seed: u64) -> Split 
                 long.extend((word.len() > KEY).then_some(word));
             } else {
                 // `AND`, `NOT` and `OR` start with bytes ending in binary 01, 10 and 11.
-                // queries.txt is trusted (spec 2.3): any other word reads as AND
-                // (index 0).
+                // queries.txt is trusted (spec 2.3): any other word reads as the
+                // operator its first byte's low two bits pick, 00 as AND.
                 op = [0, AND, NOT, OR][(word[0] & 3) as usize];
             }
         }
@@ -91,8 +91,10 @@ struct Key {
     len: u32,
 }
 
-/// Splits the lines in parallel, then gives the terms ids: their slots in the
-/// perfect hash. `padded` is the file and mmap::PAD zero bytes.
+/// Splits the lines in parallel, then builds the perfect hash of their terms and
+/// gives each term its id: the short ones numbered as `place_regions` places
+/// their keys, the long ones after them (an id is not a slot). `padded` is the
+/// file and mmap::PAD zero bytes.
 pub fn parse_queries(padded: &'static [u8], threads: usize) -> (Queries, Vocab) {
     let text = &padded[..padded.len() - mmap::PAD];
     // The start of the p-th of `threads` ranges of whole lines.
@@ -172,8 +174,9 @@ fn key_of(file: Long, e: Key) -> u128 {
 /// ShiftRows, SubBytes and MixColumns, then XORs the round key: after two rounds
 /// every output byte depends on every key byte, non-linearly, and a different
 /// first round key (the seed: see SEEDS) gives an unrelated hash. Three
-/// instructions, one cycle of throughput each. The round keys are digits of pi; a loop that
-/// hashes keeps them in registers.
+/// instructions, one cycle of throughput each. The round keys come from the hex
+/// digits of pi (any constants would do); a loop that hashes keeps them in
+/// registers.
 #[inline(always)]
 fn hash(key: __m128i, seed: u64) -> u64 {
     let first = 0x243f6a8885a308d3_13198a2e03707344 ^ seed as u128;
@@ -330,7 +333,8 @@ impl Vocab {
     /// The vocabulary of the query terms in `splits`, with attempt `seed`'s hash,
     /// the term words of each split with their ids, and `splits`; or None when
     /// the build needs another seed: two different keys with one hash, or a
-    /// bucket that finds no pilot. Every third seed also doubles the table
+    /// thread whose regions four placements could not fill (`place_regions`).
+    /// Every third seed also doubles the table
     /// (parse_queries says why the seeds end).
     ///
     /// Each thread takes a range of groups and deduplicates their keys
@@ -347,7 +351,8 @@ impl Vocab {
         let bmask = (total / 16).max(GROUPS).next_power_of_two() as u64 - 1;
         let groups = par(n, &|q| dedup_keys(&splits, q, bmask));
         let distinct: usize = groups.iter().map(Vec::len).sum();
-        // At least 1.5 slots per term; every third seed doubles the table.
+        // At least 1.5 slots per term and 1,024 in all (16 per group); every third
+        // seed doubles the table.
         let bits = (distinct * 3 / 2).max(1024).next_power_of_two().ilog2() + seed as u32 / 3;
         let (slots, shift, region) = (1 << bits, 64 - bits, bits - GROUPS.ilog2());
         let mut long = std::collections::HashMap::new();
@@ -383,11 +388,11 @@ impl Vocab {
             barrier.wait();
             // The info of a key's slot. A slot that holds another key means that
             // two keys have the same hash (dedup_keys keeps one key per hash): the
-            // build then needs another seed. SAFETY: Phf::slot is below
-            // 2^(64 - shift) = slots, so a slot of the table, which no thread writes
-            // any more.
+            // build then needs another seed.
             let mut clash = false;
             let mut info = |key| {
+                // SAFETY: Phf::slot is below 2^(64 - shift) = slots, so a slot of the
+                // table, which no thread writes after the barrier.
                 let slot = unsafe { *table.add(phf.slot(key)) };
                 // SAFETY: __m128i and u128 have the same size, and any bits are valid.
                 clash |= slot & ((1 << 96) - 1) != unsafe { transmute::<__m128i, u128>(key) };
@@ -414,7 +419,7 @@ impl Vocab {
         Some((vocab, ids.into_iter().collect::<Option<_>>()?, splits))
     }
 
-    /// Gives each slot the info the plan gives its id (renumbered, ANCHOR).
+    /// Gives each slot the info the plan gives its id: its new id, ANCHOR and TRIG.
     pub fn finish(&mut self, plan: &Plan) {
         // Empty slots read as id 0 and get id 0's info: harmless, their zero key
         // matches no token. The last slot keeps `count` (the table always has it).

@@ -231,6 +231,7 @@ impl<'a> Scan<'a> {
         }
         // SAFETY: the first len, nt and na entries are written.
         unsafe { (self.toks.set_len(len), self.trig.set_len(nt)) };
+        // SAFETY: as above.
         unsafe { self.anchors.set_len(na) };
         // SAFETY: room for 8 more ids was reserved: `miss`, which no phrase term has.
         unsafe { toks.add(len).cast::<[u32; 8]>().write([miss; 8]) };
@@ -355,10 +356,10 @@ impl<'a> Scan<'a> {
             // padding store, so every index i is below entries.len(). The words 8i to
             // 8i + 5 gathered are inside entries (32 bytes each, see DocEntry), and
             // 8i + 5 fits the gathers' signed 32-bit offsets (at most 6 entries per
-            // query, so below 2^28 for any queries.txt under 300 MB). Entry terms are
-            // below count + 2, and lastdoc has 3 bytes more, so the 4 bytes gathered
-            // from each stamp are inside it. nh <= b < n, so the 8 lanes stored at
-            // hits[nh..] are inside hits, as long as evals.
+            // query, at most 2^16 queries, asserted in main, and 8 padding entries:
+            // 8i + 5 < 2^22). Entry terms are below count + 2, and lastdoc has 3 bytes
+            // more, so the 4 bytes gathered from each stamp are inside it. nh <= b < n,
+            // so the 8 lanes stored at hits[nh..] are inside hits, as long as evals.
             unsafe {
                 let idx = _mm256_loadu_si256(evals.add(b).cast());
                 let word = |k| _mm256_add_epi32(_mm256_slli_epi32::<3>(idx), _mm256_set1_epi32(k));
@@ -420,6 +421,8 @@ impl<'a> Scan<'a> {
 
 /// `len` zeros, written now: a lazily zeroed page that is read first faults
 /// again when written, and that fault flushes the TLB of every thread.
+/// `black_box` keeps LLVM from turning the writes into a lazily zeroed
+/// allocation (calloc).
 fn written_zeros(len: usize) -> Vec<u64> {
     std::iter::repeat_n(std::hint::black_box(0), len).collect()
 }

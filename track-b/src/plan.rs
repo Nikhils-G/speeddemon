@@ -339,7 +339,9 @@ pub fn csr<T, I: DoubleEndedIterator<Item = (u32, T)>>(
         start[k as usize] -= 1;
         values.spare_capacity_mut()[start[k as usize] as usize].write(value);
     });
-    // SAFETY: the counts add up to start[keys], so each of its slots was written once.
+    // SAFETY: `pairs` made the same pairs both times (each caller's closure only
+    // reads data that nothing changes in between), so each key's run was counted,
+    // then filled down from its end: each of the start[keys] slots was written once.
     unsafe { values.set_len(start[keys] as usize) };
     (start, values)
 }

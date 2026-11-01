@@ -40,12 +40,14 @@ static JOB: RwLock<Option<&'static (dyn Fn(usize) + Sync)>> = RwLock::new(None);
 /// Set while a call to `par` runs.
 static BUSY: AtomicBool = AtomicBool::new(false);
 
-/// The number of jobs so far, the number of times a worker has finished one,
-/// and the number of workers.
+/// The number of jobs so far.
 static GENERATION: AtomicUsize = AtomicUsize::new(0);
 
+/// The number of times a worker has finished a job: generation * workers once
+/// every worker has finished the current one.
 static FINISHED: AtomicUsize = AtomicUsize::new(0);
 
+/// The number of workers, set by the first call to `par`.
 static WORKERS: OnceLock<usize> = OnceLock::new();
 
 /// Whether the CPU has WAITPKG (CPUID leaf 7, ECX bit 5), for `wait`.
@@ -63,7 +65,8 @@ fn wait(word: &AtomicUsize, done: impl Fn(usize) -> bool) {
         // unless the word changed meanwhile; neither writes memory.
         unsafe { asm!("umonitor {}", in(reg) word.as_ptr(), options(nostack, preserves_flags)) };
         if !done(word.load(Acquire)) {
-            // SAFETY: as above.
+            // SAFETY: as above. The register operand 0 asks for C0.2, the deeper of
+            // the two states (1 would ask for C0.1).
             unsafe {
                 asm!(
                     "umwait {:e}", in(reg) 0, in("edx") u32::MAX, in("eax") u32::MAX,
@@ -79,9 +82,10 @@ fn wait(word: &AtomicUsize, done: impl Fn(usize) -> bool) {
 
 /// The corpus and the number of equal parts it is mapped in by (main's nominal
 /// number of slices), once known: workers that wait for a job map its pages in
-/// ahead of the scan (`ahead`). And the next chunk to map.
+/// ahead of the scan (`ahead`).
 pub static AHEAD: OnceLock<(&'static [u8], usize)> = OnceLock::new();
 
+/// The next chunk for `ahead` to map.
 static AHEAD_NEXT: AtomicUsize = AtomicUsize::new(0);
 
 /// Maps in the next 64 KB of the corpus, for a worker that waits for a job, so

@@ -74,19 +74,22 @@ const OR: u32 = 3;
 /// first (smallest) FIRST_IDS ids.
 const FIRST_IDS: u64 = 10;
 /// Corpus bytes sampled (spread over the slices) to estimate term frequencies:
-/// about 2,600 documents on seed 1. The better plan pays for the longer sample:
-/// against 1 MB (b-stack-15 + be-2, replica), 2.5 MB ran 0.4-0.7 ms faster on
-/// seeds 1 and 99, 1.5 MB the same, 768 KB 0.4-0.8 ms slower, 512 KB 2 ms slower.
+/// about 2,600 documents on seed 1. The better plan pays for the longer sample.
+/// On the replica (PERF.md, experiments), against 1 MB, 2.5 MB ran 0.44-0.74 ms
+/// faster on seeds 1 and 99, 1.5 MB the same, 768 KB 0.4-0.8 ms slower and
+/// 512 KB 2.1-2.5 ms slower; 2, 3 and 3.5 MB were no faster than 2.5 MB.
 const SAMPLE_BYTES: usize = 5 << 19;
 /// A query whose cover terms are expected in more 64-document blocks than this
 /// (as a share, summed over the terms) is evaluated in every superblock instead
-/// of per document. Chosen on the box: an in-process probe of the per-document
-/// design read 0.30 2.3 ms faster than 0.25 (PERF.md, step 53); the replica could
-/// not tell them apart (−0.33%, 31 pairs), and found 0.20 and 0.35 slower. (On the
-/// earlier block engine 0.25 beat 0.125, 0.30 and 0.5; 512-document superblocks
-/// were 6.5 ms slower.)
+/// of per document. Set in step 53 and kept after a sweep on the replica with
+/// step 66's code (PERF.md, experiments): against 0.30, ALWAYS at 0.25 ran 1.20 ms
+/// slower (it won 2 of 31 pairs), 0.35 0.12 ms, 0.60 0.48 ms and 0.80 1.55 ms
+/// slower. (On the earlier block engine 0.25 beat 0.125, 0.30 and 0.5.)
 const ALWAYS: f64 = 0.30;
-/// Documents per superblock: four blocks of 64.
+/// Documents per superblock: four blocks of 64, one AVX2 vector per row. 128 ran
+/// 12.4% slower on step 66's code (half-empty vectors, evaluated twice as often),
+/// and 512 (two vectors a row) read 6.5 ms slower in a box probe on step 50's
+/// (PERF.md, experiments, and steps 50 and 51).
 const SUPER: u32 = 256;
 /// A thread's sum of matching ids is packed under its count in one u64.
 const SUM_BITS: u32 = 40;
