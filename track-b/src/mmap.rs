@@ -10,8 +10,6 @@ const MAP_PRIVATE: i32 = 0x02;
 const MAP_FIXED: i32 = 0x10;
 const MAP_ANONYMOUS: i32 = 0x20;
 const MADV_DONTNEED: i32 = 4;
-/// x86-64's base page size.
-const PAGE: usize = 4096;
 
 unsafe extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
@@ -65,7 +63,7 @@ pub fn map(path: &str) -> &'static [u8] {
 pub unsafe fn release(slice: &[u8]) {
     // madvise takes a page-aligned start; the end is rounded up to whole pages.
     // The pages at the ends may also hold the neighbouring slices' bytes.
-    let start = slice.as_ptr() as usize / PAGE * PAGE;
+    let start = slice.as_ptr() as usize / 4096 * 4096;
     let len = slice.as_ptr() as usize + slice.len() - start;
     // SAFETY: whole pages of a private, read-only mapping that is never written
     // (the file, then zero pages: the caller's contract); dropping them loses
