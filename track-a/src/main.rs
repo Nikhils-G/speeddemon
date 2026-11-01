@@ -52,6 +52,7 @@ const MIN_LINE: usize = 35;
 const MAX_NAME: usize = 125;
 
 fn main() {
+    let t0 = std::time::Instant::now();
     // Transparent huge pages off: with THP set to "always", touching one byte of a
     // sparse, lazily zeroed table can fault in a whole 2 MB page, so the memory
     // peak would depend on how fragmented the host is that run.
@@ -274,6 +275,11 @@ fn main() {
         let mut runs = Vec::new();
         for (p, part) in parts.iter().enumerate() {
             runs.extend(part.wait().2.windows(2).map(|w| (w[0], p, w[1].1)));
+        }
+        // PROBE: exit with the parse's wall time (main start to all parts in) in 0.1 ms
+        // units. Only on the full dataset: the PGO training run on the sample must exit 0.
+        if len > 100_000_000 {
+            std::process::exit((t0.elapsed().as_micros() / 100).min(255) as i32);
         }
         runs.sort_unstable_by_key(|&((hour, ..), part, _)| (hour, part));
         // The runs of one hour in one part are now adjacent: each such group is one
