@@ -155,9 +155,10 @@ fn main() {
     // One pool of threads, this one included: as many threads as CPUs. (With this
     // thread apart, merging, 13 threads shared 12 CPUs, likely leaving two workers on
     // one CPU for the whole parse (PERF.md, step 38): replica, 300 runs each, 21 to 43
-    // runs over +8% against 6 to 10 now, and a median 0.9% slower.) The last thread to
-    // finish pass 1 merges. The log's address goes as a number: a raw pointer cannot go
-    // to another thread.
+    // runs over +8% against 6 to 10 now, and a median 0.9% slower: PERF.md, step 63.)
+    // The last thread to finish pass 1 merges. `written` is the teardown's barrier
+    // (phase 6). The log's address goes as a number: a raw pointer cannot go to another
+    // thread.
     let (written, base_addr) = (std::sync::Barrier::new(threads), base as usize);
     let total = thread::scope(|s| {
         let work = || {
@@ -210,10 +211,10 @@ fn main() {
             // the output written so far, its own bytes and `held`. Written as soon as its
             // start was known, the output piled up on the records and the values buffers
             // 2-3 ms into pass 2, at the memory peak; gated, the highest of 5 runs is
-            // 0.7 MB lower at equal speed. (All the buffers' room: 0.4 MB lower again, but
-            // 0.9% slower, as more hours are left to write at the end.) A heuristic: two
-            // threads may pass it at once; it changes when an hour is written, never its
-            // bytes.
+            // 0.7 to 0.8 MB lower at equal speed. (All the buffers' room: up to 0.4 MB
+            // lower again, but 0.9% slower, as more hours are left to write at the end.)
+            // A heuristic: two threads may pass it at once; it changes when an hour is
+            // written, never its bytes.
             let flush = |pending: &mut Vec<(usize, usize, Vec<Stats>)>, gated: bool| {
                 pending.retain(|&(hour, len, ref groups)| {
                     let Some(at) = offset(hour) else { return true };
@@ -256,8 +257,8 @@ fn main() {
             while let Some(&(hour, &runs)) = queue.get(next.fetch_add(1, Relaxed)) {
                 // Count per endpoint id, errors in the high half of the same
                 // word (one increment per record), then set start[i + 1] to the
-                // start of id i's group and place each latency at it: start[i]
-                // then runs from id i's first value to its end.
+                // start of id i's group and place each latency at it, moving it
+                // on: afterwards start[i]..start[i + 1] is id i's group.
                 // (Each run is copied at the head of the loop: read in place, its
                 // fields compiled to other instructions in both loops.)
                 for &Run { begin, part, end } in runs {
@@ -297,7 +298,8 @@ fn main() {
                     if last && readers[part].fetch_sub(1, AcqRel) == 1 {
                         given.fetch_add(size_of_val(parsed.records), Relaxed);
                         // SAFETY: anonymous memory (see `free`) that every hour reading
-                        // it has placed, so nothing reads it again.
+                        // it has placed (the AcqRel count orders their loads before this
+                        // call), so nothing reads it again.
                         unsafe { release(parsed.records) };
                     }
                 }
@@ -306,11 +308,12 @@ fn main() {
                 let (mut groups, mut len) = (Vec::with_capacity(endpoints.len()), 0);
                 for &(id, name) in endpoints {
                     let group = &mut values[start[id] as usize..start[id + 1] as usize];
-                    // Taken: zero again for the next hour.
+                    // Taken, so `counts` is all zeros again for the next hour: every id
+                    // a record can hold is in `endpoints`, which lists every id handed out.
                     groups.push(stats(group, (std::mem::take(&mut counts[id]) >> 32) as u32));
                     len += line_len(name, groups.last().unwrap());
                 }
-                lens[hour].set(len).unwrap();
+                lens[hour].set(len).unwrap(); // each hour is taken from the queue once
                 pending.push((hour, len, groups));
                 flush(&mut pending, true);
             }
@@ -356,9 +359,9 @@ fn merge(
     table: &'static Interner,
     output: &File,
 ) -> Merged<'static> {
-    // Every part's runs, in order of hour then part, gathered as the parts come in.
-    // Two adjacent starts of a part make one run, which ends at the second one's
-    // first record.
+    // Every part's runs, in order of hour then part. Every part is in (this is the
+    // last thread to finish pass 1), so no `wait` here blocks. Two adjacent starts
+    // of a part make one run, which ends at the second one's first record.
     let mut runs = Vec::new();
     for (part, p) in parts.iter().enumerate() {
         let ends = p.wait().starts.windows(2).map(|w| (w[0], w[1].at));
@@ -374,11 +377,13 @@ fn merge(
     let same_hour = |a: &Run, b: &Run| a.begin.key == b.begin.key;
     let hours: Vec<&[Run]> = runs.leak().chunk_by(same_hour).collect();
 
-    // (id, name) of every endpoint (ids start at 1), in byte order of the names:
+    // (id, name) of every id handed out (ids start at 1), in byte order of the names:
     // first by the first 32 bytes of the keys as two big-endian numbers, so few
     // comparisons need the names, then by the full bytes on ties. A key has a
     // space after its endpoint, below every endpoint byte, then zeros, so a
-    // proper prefix still sorts first.
+    // proper prefix still sorts first. A spare id that was never published (see
+    // `add`) is listed too, under a copy of a name that a published id holds: no
+    // record holds the spare, so its group is empty in every hour and prints no line.
     // SAFETY: every part is in (waited for above, which orders every parse
     // thread's writes before this), so the parse is over: each id up to `count`
     // has its name written, and nothing writes the table any more.
@@ -534,6 +539,9 @@ unsafe fn parse(chunks: [&[u8]; 2], table: &Interner, free: &mut &'static mut [u
     // - it ends by 91 (28 + 63), not before its start, or in the long way by 218
     //   (93 + 125), where the assert stops an over-125-byte name;
     // - the latency's 16 bytes start by 223 (218 + 5) and end by 239.
+    // The digit tables are read only for count <= 6: 16 of DIGITS.0's 72 bytes from
+    // byte 8 * count (so by byte 64), 8 of DIGITS.1's 36 entries from entry 4 * count
+    // (by entry 32).
     // Records are written within each slice's room (asserted above): at most
     // `most[k]` lines, one record each. `free` is not used meanwhile. The slices may
     // go back to the kernel at the end (the caller's contract): their endpoint names
@@ -576,7 +584,7 @@ unsafe fn parse(chunks: [&[u8]; 2], table: &Interner, free: &mut &'static mut [u
         };
         // The latency: 1 to 10 digits from 5 bytes after the endpoint (its space,
         // the three status digits and a space), to the LF, all within the 16 bytes
-        // from there: up to 6 digits (99% of lines) are converted where they lie, and
+        // from there: up to 6 digits (98.8% of lines) are converted where they lie, and
         // fit a record.
         let to = from.add(len);
         let tail = _mm_loadu_si128(to.add(5).cast());
@@ -659,7 +667,8 @@ fn movemask(v: __m256i) -> u64 {
 
 /// The record's latency for the `count` ASCII digits at `at`, 7 to 10 (1.2% of lines;
 /// the parse converts up to 6 itself): ESCAPE, with the value, converted one digit at a
-/// time, appended to `escapes` (see ESCAPE).
+/// time, appended to `escapes` (see ESCAPE). Out of line: inlined into the parse
+/// loop's cold branch, it measured +0.29% on the replica (PERF.md, experiments).
 ///
 /// The spec guarantees those digits, and nothing checks them here: a latency that
 /// breaks the spec gives a wrong value, never a read out of bounds, as at most the
@@ -683,7 +692,7 @@ unsafe fn parse_digits(at: *const u8, count: usize, escapes: &mut Vec<u32>) -> u
 /// Open-addressing endpoint table shared by the parsing threads: lookups are plain
 /// loads, the rare insert claims its slot by compare-and-swap. A slot holds an id as
 /// a record holds it (`id << ENDPOINT_SHIFT`), so a lookup needs no shift. Ids start
-/// at 1: slot 0 means empty, and id 0's key stays zero, which no endpoint matches.
+/// at 1: a slot holding 0 is empty, and id 0's key stays zero, which no endpoint matches.
 /// Fixed at SLOTS, 8x the most endpoints (an 11% load): ids must fit 11 bits anyway.
 struct Interner {
     slots: [AtomicU32; SLOTS], // 0 = empty, else id << ENDPOINT_SHIFT
@@ -692,9 +701,10 @@ struct Interner {
     count: AtomicUsize,                                         // ids handed out
 }
 
-// SAFETY: an id's key and name are written once, by the thread that took the id,
-// before a slot publishes the id (Release). They are read only once a slot holding
-// the id has been seen (Acquire), or after the parse.
+// SAFETY: an id's key and name are written only by the thread that took the id, and
+// only before a slot publishes the id (Release): a spare id (see `add`) is written
+// again by its thread's next insert, still unpublished. They are read only once a
+// slot holding the id has been seen (Acquire), or after the parse.
 unsafe impl Sync for Interner {}
 
 const SLOTS: usize = 8 * MAX_ENDPOINTS;
@@ -710,8 +720,8 @@ impl Interner {
     /// `id << ENDPOINT_SHIFT` of the endpoint of `len` bytes (0 to 62) at `from`,
     /// followed by a space, whose first 64 bytes are `bytes`, and whether it is in its
     /// home slot. Under 8 bytes the last 8 bytes reach before `from`, into the
-    /// method, so the slot is not the home one: the compare is exact all the same,
-    /// and a miss goes the long way.
+    /// method, so the slot is almost never the home one: the compare is exact all the
+    /// same, and a miss goes the long way.
     ///
     /// # Safety
     ///
@@ -762,7 +772,8 @@ impl Interner {
             // The key: the bytes up to and with the space after the endpoint, then zeros.
             let keep = KEEP.as_ptr().cast::<u8>().add(127 - len);
             let key = std::array::from_fn(|i| _mm256_and_si256(line[i], load(keep.add(32 * i))));
-            // The same bytes as `find` hashes, from 8 bytes up (under 8 it never finds one).
+            // The same bytes as `find` hashes, from 8 bytes up (under 8 it almost never
+            // finds one).
             let at = |i: usize| key.as_ptr().byte_add(i).cast::<u64>().read_unaligned();
             let mut i = Self::home(len, at(0), at(len.max(8) - 8));
             loop {
@@ -911,9 +922,10 @@ fn map(at: *mut u8, len: usize, prot: i32, flags: i32, fd: i32) -> *mut u8 {
 /// Gives the whole pages inside `slice` back to the kernel (MADV_DONTNEED); the
 /// pages it shares with memory around it are kept. Used on the log's slices, on a
 /// part's records once no hour reads them, and on the endpoint keys after the sort.
-/// The parse threads drop the log's pages this way, in parallel: left to the exit,
-/// its 58,000 pages are unmapped one by one on one core (1.3 ms slower overall when
-/// measured, see PERF.md). A failed call only keeps the pages.
+/// The parse threads drop the log's pages this way, in parallel: left to one unmap
+/// (the exit's when measured, the merging thread's `munmap` now), its 58,000 pages go
+/// one by one on one core (1.3 ms slower overall when measured, see PERF.md). A failed
+/// call only keeps the pages.
 ///
 /// # Safety
 ///
