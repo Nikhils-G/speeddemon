@@ -748,7 +748,7 @@ impl<'a> Scan<'a> {
                     // SAFETY: `reserve(32)` above made room for this chunk's tokens.
                     if len <= KEY {
                         let key = key_at(docs, p, len);
-                        let s = phf.slot(key) & ((1 << 15) - 1); // PROBE: a 512k table
+                        let s = phf.slot(key) & ((1 << 13) - 1); // PROBE: a 128k table
                         prefetch(table, s);
                         unsafe { buf.add(n).write((key, s as u64)) };
                     } else {
