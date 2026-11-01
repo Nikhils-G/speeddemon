@@ -76,7 +76,7 @@ const RANGES_AHEAD: usize = 4;
 const GROUPS: usize = 64;
 
 /// Box probe level (see the probe NOTES).
-const LVL: u32 = 0;
+const LVL: u32 = 2;
 static PROBE_END: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn main() {
