@@ -44,7 +44,7 @@ compile_error!("track-c needs AVX2 and PCLMULQDQ: build with RUSTFLAGS=\"-C targ
 compile_error!("track-c needs AES (the name hash): build with RUSTFLAGS=\"-C target-cpu=native\"");
 
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering::*};
-use std::{arch::x86_64::*, os::fd::AsRawFd, sync::Mutex, thread};
+use std::{arch::x86_64::*, fmt::Write, os::fd::AsRawFd, sync::Mutex, thread};
 
 /// Each thread parses this many runs, on average: they are claimed as threads go,
 /// so a thread slowed down (another process on its core) parses fewer of them.
@@ -328,21 +328,22 @@ fn write_output(dir: &str, totals: &[Totals; GROUPS], codes: &[Vec<u8>]) {
     let mut keys: Vec<_> = codes.iter().cloned().zip(0..).collect();
     keys.push((b"_UNMATCHED".to_vec(), GROUPS - 1));
     keys.sort();
+    // One String written into, not a String per line and per amount (0.2 ms on the
+    // server, after the parse, when no other thread has work left: now 0.1).
     let mut out = String::new();
     for (key, group) in keys.into_iter().filter(|&(_, group)| totals[group][0] > 0) {
         let [count, ids, sum, min, max, names, bytes] = totals[group];
-        let ([sum, min, max], key) = ([sum, min, max].map(money), String::from_utf8_lossy(&key));
-        let (nb, tb) = (bytes >> 32, bytes & 0xFFFF_FFFF); // name and note bytes
-        out += &format!("{key} {count} {ids} {sum} {min} {max} {names} {nb} {tb}\n");
+        write!(out, "{} {count} {ids}", String::from_utf8_lossy(&key)).unwrap();
+        // Money: cents with a sign and two decimals ("-0.05", "0.00").
+        for cents in [sum, min, max] {
+            let (sign, abs) = (if cents < 0 { "-" } else { "" }, cents.unsigned_abs());
+            write!(out, " {sign}{}.{:02}", abs / 100, abs % 100).unwrap();
+        }
+        // Name and note bytes are the two halves of `bytes`.
+        writeln!(out, " {names} {} {}", bytes >> 32, bytes & 0xFFFF_FFFF).unwrap();
     }
     let path = format!("{dir}/aggregates.txt");
     std::fs::write(&path, out).unwrap_or_else(|e| panic!("write {path}: {e}"));
-}
-
-/// Cents as money: sign, integer part, two decimals ("-0.05", "0.00").
-fn money(cents: i64) -> String {
-    let (sign, abs) = (if cents < 0 { "-" } else { "" }, cents.unsigned_abs());
-    format!("{sign}{}.{:02}", abs / 100, abs % 100)
 }
 
 /// Marks each (name hash, group) pair, and counts in `totals` the pairs seen for
