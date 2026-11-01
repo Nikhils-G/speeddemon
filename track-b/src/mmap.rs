@@ -10,6 +10,7 @@ const MAP_PRIVATE: i32 = 0x02;
 const MAP_FIXED: i32 = 0x10;
 const MAP_ANONYMOUS: i32 = 0x20;
 const MADV_DONTNEED: i32 = 4;
+const M_MMAP_THRESHOLD: i32 = -3;
 /// x86-64's base page size.
 const PAGE: usize = 4096;
 
@@ -17,14 +18,26 @@ unsafe extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
     fn prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i32;
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+    fn mallopt(param: i32, value: i32) -> i32;
 }
 
-/// Turns off transparent huge pages for this process. With THP set to "always",
-/// touching one byte of a sparse, lazily zeroed table can fault in a whole 2 MB
-/// page, so the memory peak would depend on how fragmented the host is that run.
-pub fn no_huge_pages() {
+/// Sets how this process gets memory:
+/// - No transparent huge pages. With THP set to "always", touching one byte of a
+///   sparse, lazily zeroed table can fault in a whole 2 MB page, so the memory peak
+///   would depend on how fragmented the host is that run.
+/// - Allocations of up to 1 MB come from malloc's heaps, one per thread, instead
+///   of an mmap each, and the threshold stays fixed: by default it rises with the
+///   largest block freed so far, so where each step's tables come from (fresh
+///   pages or reused ones) would depend on what the steps before it freed. The
+///   setup's parallel steps then fault in fewer fresh pages, each in its thread's
+///   own mapping (with this setup: -1.1 ms). Larger blocks, such as the scan's
+///   first-id logs, stay mmaps, whose pages cost nothing until written: from a
+///   heap, calloc would clear them (8 MB more at 32 MB).
+pub fn set_up_memory() {
     // SAFETY: a plain syscall wrapper; failure only means THP stays on.
     unsafe { prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0) };
+    // SAFETY: a libc call that touches no memory of ours; failure keeps the default.
+    unsafe { mallopt(M_MMAP_THRESHOLD, 1 << 20) };
 }
 
 /// Zero bytes mapped after the end of every file: fixed-size loads (64-byte
