@@ -172,7 +172,8 @@ fn main() {
                         // SAFETY: bytes at..at + len of the mapping are this hour's alone, and
                         // at + len <= total <= bound: a line is at most 213 bytes (see bound).
                         let out = unsafe { std::slice::from_raw_parts_mut((file + at) as _, len) };
-                        let head = (hours[hour][0].0.0 << 24).to_be_bytes(); // its first 13 bytes
+                        let ((key, ..), ..) = hours[hour][0];
+                        let head = (key << 24).to_be_bytes(); // the hour key's 13 bytes
                         // Last line first, each one ending where the next one starts.
                         let mut at = len;
                         let named = endpoints.iter().zip(groups).filter(|(_, stat)| stat[0] > 0);
@@ -327,7 +328,8 @@ fn merge(
     // The runs of one hour in one part are now adjacent: each such group is one
     // reader of the part (hour a, part p against hour b, part q).
     for runs in runs.chunk_by(|((a, ..), p, _), ((b, ..), q, _)| (a, p) == (b, q)) {
-        readers[runs[0].1].fetch_add(1, Relaxed);
+        let (_, part, _) = runs[0];
+        readers[part].fetch_add(1, Relaxed);
     }
     // Cut into hours. Leaked: pass 2 reads the runs until the exit.
     let same_hour = |((a, ..), ..): &Run, ((b, ..), ..): &Run| a == b;
@@ -569,8 +571,15 @@ static KEEP: [[u8; 128]; 2] = [[0xFF; 128], [0; 128]];
 /// Row n of the weights: 10, 1 for each pair, then 1 for an odd last digit; row n of
 /// the place values: 10^(n - 2), 10^(n - 4), ... for the pairs, 1 for the last one.
 static DIGITS: ([i8; 72], [i16; 36]) = (
-    [0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 10, 1, 0, 0, 0, 0, 0, 0, 10, 1, 1, 0, 0, 0, 0, 0, 10, 1, 10, 1, 0, 0, 0, 0, 10, 1, 10, 1, 1, 0, 0, 0, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 10, 1, 0, 0, 100, 1, 0, 0, 1000, 10, 1, 0, 10000, 100, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [
+        0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 10, 1, 0, 0, 0, 0, 0, 0, 10, 1, 1, 0, 0, 0,
+        0, 0, 10, 1, 10, 1, 0, 0, 0, 0, 10, 1, 10, 1, 1, 0, 0, 0, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ],
+    [
+        0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 10, 1, 0, 0, 100, 1, 0, 0, 1000, 10, 1, 0, 10000, 100,
+        1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ],
 );
 
 /// An endpoint's identity: its bytes (at most 125), a space, then zeros to 128 bytes.
