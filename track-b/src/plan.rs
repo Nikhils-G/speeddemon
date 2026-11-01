@@ -108,23 +108,26 @@ pub struct Plan {
 
 impl Plan {
     /// `sample_df` counts the documents of each term in a sample of `sampled`
-    /// documents (at least 1). The per-line work runs on `parts` threads, a
-    /// range of lines each.
-    pub fn new((spans, terms): Queries, sample_df: &[u32], sampled: u32, parts: usize) -> Self {
-        let lines = spans.len();
+    /// documents (at least 1). The per-line work runs on one thread per part of
+    /// the queries.
+    pub fn new(queries: Queries, sample_df: &[u32], sampled: u32) -> Self {
+        let parts = queries.len();
         // The expected share of 64-document blocks that contain t: the cost of
         // triggering on it.
         let cost = |t: u32| 1.0 - (1.0 - sample_df[t as usize] as f64 / sampled as f64).powi(64);
         // Per old id: bit 0 for a BOOL term, bit 1 for a term of an `always` query.
         let kind: Vec<AtomicU8> = (0..sample_df.len()).map(|_| AtomicU8::new(0)).collect();
         // Whether each line is a BOOL query evaluated in every superblock.
-        let always_line = |line: usize| {
-            let (start, len, phrase) = spans[line];
-            let words = &terms[start as usize..(start + len) as usize];
-            classify(words, phrase, cost, &kind)
+        let always_part = |p: usize| {
+            let (spans, terms) = &queries[p];
+            let always_line = |&(start, len, phrase): &Span| {
+                let words = &terms[start as usize..(start + len) as usize];
+                classify(words, phrase, cost, &kind)
+            };
+            spans.iter().map(always_line).collect::<Vec<_>>()
         };
-        let always_part = |p| part(lines, p, parts).map(always_line).collect::<Vec<_>>();
         let always_lines = par(parts, &always_part).concat();
+        let lines = always_lines.len();
         let kind: Vec<u8> = kind.into_iter().map(AtomicU8::into_inner).collect();
         let (order, rank) = term_order(&kind, sample_df);
         let bool_terms = kind.iter().filter(|&&k| k > 0).count();
@@ -133,9 +136,10 @@ impl Plan {
         let cost = |t: u32| cost(order[t as usize]);
         // The sampled document frequency of a new id: phrases anchor on their rarest term.
         let df = |t: u32| sample_df[order[t as usize] as usize];
-        let records = |p| {
-            let mine = part(lines, p, parts);
-            records((&spans, &terms), mine, &rank, &df, &cost, &always_lines)
+        let records = |p: usize| {
+            // The number of lines before this part's.
+            let first = queries[..p].iter().map(|q| q.0.len()).sum();
+            records(&queries[p], first, &rank, &df, &cost, &always_lines)
         };
         // Part p's records are out[p]. The entries are grouped by their cover term,
         // the phrases by their anchor.
@@ -213,12 +217,13 @@ struct Records {
     always: Vec<Entry>,
 }
 
-/// The records of `lines` of the queries (`spans`, `terms`), their terms renumbered
-/// by `rank`. By new id, `df` is a term's sampled document frequency and `cost` its
-/// cost (see `cover`); `always_lines` marks the lines evaluated in every superblock.
+/// The records of a part of the queries (`spans`, `terms`), whose lines are numbered
+/// from `first`, their terms renumbered by `rank`. By new id, `df` is a term's
+/// sampled document frequency and `cost` its cost (see `cover`); `always_lines`
+/// marks the lines evaluated in every superblock.
 fn records(
-    (spans, terms): (&[Span], &[u32]),
-    lines: std::ops::Range<usize>,
+    (spans, terms): &(Vec<Span>, Vec<u32>),
+    first: usize,
     rank: &[u32],
     df: impl Fn(u32) -> u32,
     cost: impl Fn(u32) -> f64,
@@ -226,16 +231,12 @@ fn records(
 ) -> Records {
     // Entries are padded with the term after the sink, in no document.
     let pad = rank.len() as u32 + 1;
-    let mut triggered = Vec::with_capacity(MAX_BOOL_TERMS * lines.len());
-    let (mut phrases, mut always) = (Vec::with_capacity(lines.len()), Vec::new());
-    // These lines' terms, renumbered: they follow each other in `terms`.
-    let first = spans.get(lines.start).map_or(terms.len(), |s| s.0 as usize);
-    let end = spans.get(lines.end).map_or(terms.len(), |s| s.0 as usize);
+    let mut triggered = Vec::with_capacity(MAX_BOOL_TERMS * spans.len());
+    let (mut phrases, mut always) = (Vec::with_capacity(spans.len()), Vec::new());
     let renumber = |&word: &u32| rank[(word & TERM) as usize] | word & !TERM;
-    let renumbered: Vec<u32> = terms[first..end].iter().map(renumber).collect();
-    for line in lines {
-        let (start, len, phrase) = spans[line];
-        let words = &renumbered[start as usize - first..(start + len) as usize - first];
+    let renumbered: Vec<u32> = terms.iter().map(renumber).collect();
+    for (line, &(start, len, phrase)) in (first..).zip(spans) {
+        let words = &renumbered[start as usize..(start + len) as usize];
         let answer = line as u32; // until number_answers
         if phrase {
             // The first of the rarest terms (a phrase has at least one).

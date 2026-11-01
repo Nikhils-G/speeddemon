@@ -3,15 +3,16 @@
 
 use super::*;
 
-/// `(spans, terms)`. Per line of queries.txt, its span `(start, len, phrase)`:
-/// its terms `terms[start..start + len]`, and whether it is a phrase. The terms
-/// are BOOL terms as `id | op << 30`, the first with OR, and phrase terms as ids.
-pub type Queries = (Vec<Span>, Vec<u32>);
+/// Per part of queries.txt (a range of its lines, in order), `(spans, terms)`:
+/// per line, its span `(start, len, phrase)`: its terms `terms[start..start + len]`,
+/// and whether it is a phrase. The terms are BOOL terms as `id | op << 30`, the
+/// first with OR, and phrase terms as ids.
+pub type Queries = Vec<(Vec<Span>, Vec<u32>)>;
 
 pub type Span = (u32, u32, bool);
 
 /// Splits `chunk`, whole lines of `padded` (the file and mmap::PAD zero bytes),
-/// into its lines, as in `Queries` but from 0, and their terms: each as its
+/// into its lines, as in `Queries`, and their terms: each as its
 /// offset in `padded` and its length | op << 30 (in a BOOL query). Also the
 /// hashes (attempt `seed`'s: see SEEDS) of the terms' table keys (the zero key
 /// for a long term) with their offsets and key lengths, grouped by hash & 63
@@ -104,14 +105,9 @@ pub fn parse_queries(padded: &'static [u8], threads: usize) -> (Queries, Vocab) 
     // the full seed-1, holdout seed-99, sample seed 1 to 4 and 18 fresh full
     // inputs; over 300 seeds on each of those 24, none needed a second seed.
     let (vocab, ids, splits) = (0..).find_map(|s| Vocab::new(split(s), s, padded)).unwrap();
-    // The spec's 50,000 queries, about 155,000 terms on seed 1: capacities only.
-    let (mut lines, mut terms) = (Vec::with_capacity(50_000), Vec::with_capacity(160_000));
-    for (Split { lines: spans, .. }, ids) in splits.iter().zip(ids) {
-        let base = terms.len() as u32;
-        lines.extend(spans.iter().map(|&(s, n, p)| (base + s, n, p)));
-        terms.extend(ids);
-    }
-    ((lines, terms), vocab)
+    // Each split is a part of the queries, as it is: no copy into one array.
+    let parts = splits.into_iter().map(|s| s.lines).zip(ids).collect();
+    (parts, vocab)
 }
 
 /// The info of `slot` if its key is `key`, else `miss`. A slot is a term's key

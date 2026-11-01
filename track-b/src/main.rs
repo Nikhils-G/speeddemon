@@ -129,7 +129,7 @@ fn main() {
         scan.doc + 1 - first
     });
     let df: Vec<u32> = df.into_iter().map(AtomicU32::into_inner).collect();
-    let plan = Plan::new(queries, &df, sampled.iter().sum::<u32>().max(1), threads);
+    let plan = Plan::new(queries, &df, sampled.iter().sum::<u32>().max(1));
     // An answer number fits the first-id log's 16 bits (see MIN_SLICES).
     assert!(plan.line_of.len() <= 1 << 16, "over 2^16 queries");
     vocab.finish(&plan);
