@@ -338,7 +338,8 @@ fn parse(chunk: &[u8], table: &Interner) -> Part {
         // previous line's hour. Its bytes "MM-DDTHH" decide: every timestamp lies in
         // one 72-hour span (the spec), so lines that share them share the year.
         let mut last = u64::MAX;
-        while line < stop {
+        // PROBE: touch one byte per 64 and nothing else (the floor: DRAM, faults, release).
+        while line < stop { std::hint::black_box(line.read_volatile()); line = line.add(64); continue;
             // Bytes 5..13 of the timestamp, "MM-DDTHH", as one word.
             let hour = line.add(5).cast::<u64>().read_unaligned();
             if hour != last {
