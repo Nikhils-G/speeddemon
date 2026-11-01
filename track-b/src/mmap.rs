@@ -9,7 +9,6 @@ unsafe extern "C" {
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     /// glibc: gives the free memory of every heap back to the system.
     pub fn malloc_trim(pad: usize) -> i32;
-    fn mallopt(param: i32, value: i32) -> i32;
 }
 
 /// Turns off transparent huge pages for this process. With THP set to "always",
@@ -18,15 +17,6 @@ unsafe extern "C" {
 pub fn no_huge_pages() {
     // SAFETY: a plain syscall wrapper; failure only means THP stays on.
     unsafe { prctl(41, 1, 0, 0, 0) }; // PR_SET_THP_DISABLE
-}
-
-/// Serves allocations of up to 32 MB (glibc's largest threshold) from malloc's
-/// heaps instead of an mmap each. The setup's threads allocate and free many
-/// large vectors, and every mmap and munmap takes the address-space lock that
-/// the other threads' page faults wait for.
-pub fn heap_allocations() {
-    // SAFETY: a plain glibc call; failure only keeps the default threshold.
-    unsafe { mallopt(-3, 32 << 20) }; // M_MMAP_THRESHOLD
 }
 
 /// Zero bytes mapped after the end of every file: fixed-size loads (64-byte

@@ -67,7 +67,6 @@ fn main() {
     let data_dir = args.next().unwrap_or_else(|| "/data".into());
     let out_dir = args.next().unwrap_or_else(|| "/out".into());
     mmap::no_huge_pages();
-    mmap::heap_allocations();
     let open = |name: &str| mmap::map(&format!("{data_dir}/{name}"));
     let docs = open("docs.txt");
     let text = &docs[..docs.len() - mmap::PAD];
