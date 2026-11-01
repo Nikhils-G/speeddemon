@@ -493,14 +493,9 @@ unsafe fn parse(chunks: [&[u8]; 2], table: &Interner, free: &mut &'static mut [u
             let v = _mm_madd_epi16(v, _mm_loadu_si128(DIGITS.1.as_ptr().add(4 * count).cast()));
             _mm_cvtsi128_si32(_mm_add_epi32(v, _mm_srli_epi64(v, 32))) as u32
         } else {
-            // A latency that does not fit a record goes to the escapes, and the
-            // record holds ESCAPE.
             let latency;
-            (latency, count) = parse_digits(to.add(5));
-            if latency >= ESCAPE as u64 {
-                escapes[k].push(latency as u32); // exact: latencies fit 32 bits (the spec)
-            }
-            latency.min(ESCAPE as u64) as u32
+            (latency, count) = parse_digits(to.add(5), &mut escapes[k]);
+            latency
         };
         // The status's first digit is right after the endpoint's space; '5' is 5xx.
         let error = ((*to.add(1) == b'5') as u32) << ERROR_SHIFT;
@@ -535,72 +530,49 @@ static KEEP: [[u8; 128]; 2] = [[0xFF; 128], [0; 128]];
 /// values, in two sums then added. Bytes from n on weigh 0, so the digits need no
 /// moving. Entries are 8 bytes apart, for one scaled address: a 16-byte load also
 /// reads the next entry, which only weighs the vector's upper half, not summed.
-static DIGITS: ([i8; 72], [i16; 36]) = {
-    let (mut pairs, mut scale) = ([0; 72], [0; 36]);
-    let mut i = 0;
-    while i < 56 {
-        let (n, j) = (i / 8, i % 8);
-        if j < n {
-            pairs[i] = if j % 2 == 0 && j + 1 < n { 10 } else { 1 };
-        }
-        if j < 4 && 2 * j < n {
-            scale[4 * n + j] = 10i16.pow((n - 2 * j).saturating_sub(2) as u32);
-        }
-        i += 1;
-    }
-    (pairs, scale)
-};
+/// Row n of the weights: 10, 1 for each pair, then 1 for an odd last digit; row n of
+/// the place values: 10^(n - 2), 10^(n - 4), ... for the pairs, 1 for the last one.
+static DIGITS: ([i8; 72], [i16; 36]) = (
+    [0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 10, 1, 0, 0, 0, 0, 0, 0, 10, 1, 1, 0, 0, 0, 0, 0, 10, 1, 10, 1, 0, 0, 0, 0, 10, 1, 10, 1, 1, 0, 0, 0, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 10, 1, 0, 0, 100, 1, 0, 0, 1000, 10, 1, 0, 10000, 100, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+);
 
 /// An endpoint's identity: its bytes (at most 125), a space, then zeros to 128 bytes.
 /// No endpoint byte is a space or zero, so equal keys mean equal endpoints.
 type Key = [__m256i; 4];
 
-/// `vpmovmskb`, kept opaque to the optimizer: LLVM rewrites the intrinsic as a
-/// vector of booleans, and on CPUs without AVX-512 (the scoring box) it then
-/// builds a 64-bit mask from two of them one bit at a time.
+/// `vpmovmskb`: bit i of the mask is the top bit of byte i of `v`.
 #[inline(always)]
 fn movemask(v: __m256i) -> u64 {
-    // Written through the 32-bit register, which clears the upper half: no zero
-    // extension is needed after it.
-    let mask: u64;
-    // SAFETY: AVX2 is enabled for this build; the instruction reads one register.
-    unsafe {
-        std::arch::asm!("vpmovmskb {0:e}, {1}", out(reg) mask, in(ymm_reg) v, options(pure, nomem, nostack))
-    };
-    mask
+    // SAFETY: AVX2 is enabled for this build.
+    unsafe { _mm256_movemask_epi8(v) as u32 as u64 }
 }
 
-/// The value and the number of the 1 to 10 ASCII digits at `at`, which end at an
-/// LF within 16 bytes: they are moved to the end of the vector behind zeros, then
-/// combined pairwise by multiply-adds into two eight-digit halves.
+/// The record's latency and the number of the 7 to 10 ASCII digits at `at` (1.2% of
+/// lines; the parse converts up to 6 itself), one digit at a time up to the LF. A
+/// latency that does not fit a record goes to `escapes`, and the record holds ESCAPE.
 ///
 /// The spec guarantees those digits and that LF, and nothing checks them here: a
-/// check would be a branch per line. A latency that breaks the spec gives a wrong
-/// value, never a read out of bounds: with no LF in the 16 bytes the count is 32,
-/// and the parse goes on 38 bytes after the endpoint, still within its bounds.
+/// latency that breaks the spec gives a wrong value, never a read out of bounds, as
+/// at most the 16 bytes at `at` are read.
 ///
 /// # Safety
 ///
 /// The 16 bytes at `at` must be readable.
-#[inline(always)]
-unsafe fn parse_digits(at: *const u8) -> (u64, usize) {
-    // SAFETY: SSSE3 and SSE4.1 come with AVX2; the 16 bytes at `at` are readable (the
-    // caller's contract).
-    unsafe {
-        let digits = _mm_loadu_si128(at.cast());
-        let lf = _mm_cmpeq_epi8(digits, _mm_set1_epi8(b'\n' as i8));
-        let count = _mm_movemask_epi8(lf).trailing_zeros() as usize;
-        // Byte j takes digit j + count - 16; a negative index makes it zero.
-        let index = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
-        let order = _mm_add_epi8(index, _mm_set1_epi8(count as i8 - 16));
-        let v = _mm_shuffle_epi8(_mm_sub_epi8(digits, _mm_set1_epi8(b'0' as i8)), order);
-        let v = _mm_maddubs_epi16(v, _mm_set1_epi16(0x010A)); // pairs: 10 * a + b
-        let v = _mm_madd_epi16(v, _mm_set1_epi32(0x0001_0064)); // fours: 100 * a + b
-        let v = _mm_packus_epi32(v, v);
-        let v = _mm_madd_epi16(v, _mm_set1_epi32(0x0001_2710)); // eights: 10000 * a + b
-        let both = _mm_cvtsi128_si64(v) as u64;
-        ((both & 0xFFFF_FFFF) * 100_000_000 + (both >> 32), count)
+#[cold]
+#[inline(never)]
+unsafe fn parse_digits(at: *const u8, escapes: &mut Vec<u32>) -> (u32, usize) {
+    let (mut latency, mut count) = (0u64, 0);
+    // SAFETY: count < 16, so each read is one of the 16 readable bytes (the caller's
+    // contract).
+    while count < 16 && unsafe { *at.add(count) } != b'\n' {
+        latency = latency * 10 + unsafe { *at.add(count) }.wrapping_sub(b'0') as u64;
+        count += 1;
     }
+    if latency >= ESCAPE as u64 {
+        escapes.push(latency as u32); // exact: latencies fit 32 bits (the spec)
+    }
+    (latency.min(ESCAPE as u64) as u32, count)
 }
 
 /// Open-addressing endpoint table shared by the parsing threads: lookups are plain
