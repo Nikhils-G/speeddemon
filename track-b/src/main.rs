@@ -46,8 +46,9 @@ const AND: u32 = 0;
 const NOT: u32 = 1;
 const OR: u32 = 3;
 /// Corpus bytes sampled (spread over the slices) to estimate term frequencies:
-/// about 2,065 documents on seed 1.
-const SAMPLE_BYTES: usize = 2 << 20;
+/// about 1,030 documents on seed 1. (2 MB planned no better and took 1.5 ms more;
+/// 512 KB planned worse.)
+const SAMPLE_BYTES: usize = 1 << 20;
 /// A query whose cover terms are expected in more blocks than this (as a share,
 /// summed over the terms) is evaluated in every superblock: one evaluation then
 /// covers four blocks. (0.125 and 0.5 were measured slower.)
