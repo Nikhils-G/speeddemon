@@ -40,8 +40,9 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::*};
 use std::{arch::x86_64::*, fs::File, io::Error, os::fd::AsRawFd, sync::OnceLock, thread};
 
 /// A record is `endpoint id << 21 | error << 20 | latency`: 11 bits of endpoint id,
-/// bit 20 set for a 5xx status, and 20 bits of latency. A latency of ESCAPE or more
-/// is stored as ESCAPE, its value appended to the part's escapes (1.2% of lines).
+/// bit 20 set for a 5xx status, and 20 bits of latency. A latency of 7 or more digits
+/// (1.2% of lines), which may not fit, is stored as ESCAPE, its value appended to the
+/// part's escapes; up to 6 digits always fit, below ESCAPE.
 const ENDPOINT_SHIFT: u32 = 21;
 const ERROR_SHIFT: u32 = 20;
 const ESCAPE: u32 = (1 << ERROR_SHIFT) - 1;
@@ -61,10 +62,10 @@ const LABEL: usize = 21;
 fn main() {
     // The phases, in order:
     // 1. map the log;
-    // 2. start one pool of threads, which runs both passes;
+    // 2. start one pool of threads, this one included, which runs both passes;
     // 3. pass 1, in each thread: parse slices of the log into packed records;
-    // 4. the merge, on this thread meanwhile, once the last slice is in: the hours,
-    //    the endpoints' byte order and the output mapping, handed over at once;
+    // 4. the merge, on the last thread to finish pass 1: the hours, the endpoints'
+    //    byte order and the output mapping, handed over at once;
     // 5. pass 2, in each thread: per hour, group the records by endpoint, compute
     //    the statistics, and write each hour once the earlier ones have lengths and
     //    the records given back make room for it;
@@ -142,9 +143,16 @@ fn main() {
     let (written, share) = (std::sync::Barrier::new(threads), AtomicUsize::new(0));
     // Bytes of records given back so far, and of output written (see `flush`).
     let (given, wrote) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    // One pool of threads, this one included: as many threads as CPUs. (With this
+    // thread apart, merging, 13 threads shared 12 CPUs, and two workers on one CPU
+    // often stayed there for the parse: replica, 300 runs each, 21 to 43 runs over
+    // +8% against 6 to 10 now, and a median 0.9% slower.) The last thread to finish
+    // pass 1 merges. The log's address goes as a number: a raw pointer cannot go to
+    // another thread.
+    let (parsed, base_addr) = (AtomicUsize::new(0), base as usize);
     thread::scope(|s| {
-        for _ in 0..threads {
-            s.spawn(|| {
+        for w in 0..threads {
+            let work = || {
                 // 3. Pass 1.
                 // This thread's records, each part taking the start of what is left.
                 // Room for every line of the log, allocated zeroed: only the pages
@@ -164,6 +172,21 @@ fn main() {
                     // `expect` or an assert here changed the instructions of the parse
                     // loop above.)
                     let _ = (parts[p].set(a), parts[p + 1].set(b));
+                }
+                // 4. The merge, on the last thread to finish pass 1: every part is in.
+                if parsed.fetch_add(1, AcqRel) == threads - 1 {
+                    merged.set(merge(&parts, &readers, table, &output)).ok(); // cannot fail
+                    // The parse threads gave back the log's pages, but not the page
+                    // tables that mapped them (0.5 MB, charged to us): unmapping frees
+                    // those too, while the other threads start pass 2. A failure would
+                    // only keep them.
+                    // SAFETY: every part is in, so nothing reads the log any more: every
+                    // endpoint's bytes and key were copied, and `log` is not used again.
+                    unsafe { munmap(base_addr as *mut u8, len + PAD) };
+                    // SAFETY: the keys (anonymous memory, in the table) are only looked
+                    // up during the parse and the merge, so nothing reads them again;
+                    // names are kept.
+                    unsafe { release(&table.keys[..]) };
                 }
                 // 5. Pass 2, once the merge has handed everything over.
                 let (hours, file, lens, endpoints) = merged.wait();
@@ -300,22 +323,14 @@ fn main() {
                 // written and not touched again. MADV_DONTNEED drops only their
                 // page-table entries: the pages stay in the file.
                 unsafe { madvise(at(k) as *mut u8, at(k + 1) - at(k), MADV_DONTNEED) };
-            });
+            };
+            // The last worker is this thread.
+            if w + 1 < threads {
+                s.spawn(work);
+            } else {
+                work();
+            }
         }
-
-        // 4. The merge.
-        // The merge, on this thread once every part is in (`merge` waits for them).
-        merged.set(merge(&parts, &readers, table, &output)).ok(); // set once, here: it cannot fail
-
-        // Off the critical path, while pass 2 runs: the parse threads gave back the
-        // log's pages, but not the page tables that mapped them (0.5 MB, charged to
-        // us): unmapping frees those too. A failure would only keep them.
-        // SAFETY: every part is in, so nothing reads the log any more: every
-        // endpoint's bytes and key were copied, and `log` is not used again.
-        unsafe { munmap(base, len + PAD) };
-        // SAFETY: the keys (anonymous memory, in the table) are only looked up during
-        // the parse and the sort above, so nothing reads them again; names are kept.
-        unsafe { release(&table.keys[..]) };
     });
     let (_, _, lens, _) = merged.get().unwrap();
     let total: usize = lens.iter().map(|len| len.get().unwrap()).sum();
@@ -556,7 +571,7 @@ unsafe fn parse(chunks: [&[u8]; 2], table: &Interner, free: &mut &'static mut [u
         *line = to.add(5 + count + 1);
         true
     };
-    while step(0) & step(1) {}
+    // One line of each slice in turn until both are done (a done slice just returns false).
     while step(0) | step(1) {}
     // SAFETY: the slices go back to the kernel (the caller's contract); nothing reads
     // them again.
@@ -606,9 +621,9 @@ fn movemask(v: __m256i) -> u64 {
     unsafe { _mm256_movemask_epi8(v) as u32 as u64 }
 }
 
-/// The record's latency from the `count` ASCII digits at `at`, 7 to 10 (1.2% of lines;
-/// the parse converts up to 6 itself), one digit at a time. A latency that does not
-/// fit a record goes to `escapes`, and the record holds ESCAPE.
+/// The record's latency for the `count` ASCII digits at `at`, 7 to 10 (1.2% of lines;
+/// the parse converts up to 6 itself): ESCAPE, with the value, converted one digit at a
+/// time, appended to `escapes` (see ESCAPE).
 ///
 /// The spec guarantees those digits, and nothing checks them here: a latency that
 /// breaks the spec gives a wrong value, never a read out of bounds, as at most the
@@ -625,10 +640,8 @@ unsafe fn parse_digits(at: *const u8, count: usize, escapes: &mut Vec<u32>) -> u
     for &digit in unsafe { std::slice::from_raw_parts(at, count.min(16)) } {
         latency = latency * 10 + digit.wrapping_sub(b'0') as u64;
     }
-    if latency >= ESCAPE as u64 {
-        escapes.push(latency as u32); // exact: latencies fit 32 bits (the spec)
-    }
-    latency.min(ESCAPE as u64) as u32
+    escapes.push(latency as u32); // exact: latencies fit 32 bits (the spec)
+    ESCAPE
 }
 
 /// Open-addressing endpoint table shared by the parsing threads: lookups are plain
