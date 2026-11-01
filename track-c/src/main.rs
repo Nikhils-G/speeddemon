@@ -65,6 +65,9 @@ const GROUPS: usize = 256;
 /// 240 countries), so word 3's bits 49..63 hold 15 more bits
 /// of the name's hash.
 const WORDS: usize = GROUPS / 64;
+/// Entries of the join table, one per region id: listed ids are below 1,000,000
+/// (spec 2.3), and every id above them reads the last entry, which none is.
+const REGION_IDS: usize = 1 << 20;
 /// regions.csv is entered in this many parts, which threads claim as they start,
 /// so the ones that start first do more of it.
 const REGION_CHUNKS: usize = 64;
@@ -203,11 +206,6 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
     let header_end = text.iter().position(|&b| b == b'\n');
     let body_start = 1 + header_end.expect("records.csv: no header line");
     let threads = thread::available_parallelism().map_or(1, |n| n.get());
-    // regions.csv lists its ids in ascending order (spec 2.3), so the last line
-    // has the largest. One entry more, for every id above it.
-    let last_line = lines.trim_ascii_end().rsplit(|&b| b == b'\n').next();
-    // number() skips non-digits, so the ",CCC" after the id adds nothing.
-    let ids = number(last_line.unwrap_or_default()) as usize + 2;
     // The generator's pool has 100,000 names (and 4 more per block of edge cases).
     // A partition's table may fill to 5/8: room for its share (at least one name,
     // so at least 16 slots), plus 8 standard deviations, a power of two. More
@@ -226,9 +224,12 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
     let claim = |next: &AtomicUsize, n: usize| Some(next.fetch_add(1, Relaxed)).filter(|&k| k < n);
     // The join table, dense by region id: the group, or 0 (`_UNMATCHED`) for ids it
     // does not contain. Zeroed by calloc, so the pages fault in on the threads that
-    // fill them.
+    // fill them (an id's page only if a listed id is on it).
     // SAFETY: all zero bits are a valid AtomicU8 (0).
-    let group_of: Box<[AtomicU8]> = unsafe { Box::new_zeroed_slice(ids).assume_init() };
+    let group_of: Box<[AtomicU8; REGION_IDS]> = unsafe { Box::new_zeroed().assume_init() };
+    // The entries a listed id may have: one at or past the last is outside spec 2.3,
+    // and its index panics in `fill`.
+    let listed = &group_of[..REGION_IDS - 1];
     // By country code index (26^3 of them): its group, or 0 while not seen; and the
     // country codes in group order, from group 1 on (see `fill`).
     let (codes, countries): (Vec<AtomicU8>, _) = (many(26 * 26 * 26), Mutex::new(Vec::new()));
@@ -275,7 +276,7 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
         // by a digit or the end, so `run_start` cuts it into whole lines.
         while let Some(k) = claim(&next_chunk, REGION_CHUNKS) {
             let cut = |k| run_start(lines, 0, k, REGION_CHUNKS);
-            fill(&lines[cut(k)..cut(k + 1)], &group_of, &codes, &countries);
+            fill(&lines[cut(k)..cut(k + 1)], listed, &codes, &countries);
             chunks_done.fetch_add(1, Release);
         }
         wait(&chunks_done, REGION_CHUNKS);
@@ -289,8 +290,7 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
             // Each thread finds its own cuts, so their pages fault in in parallel.
             let cut = |k| run_start(text, body_start, k, runs);
             let span = (cut(run_index), cut(run_index + 1));
-            // SAFETY: group_of has ids >= 2 entries.
-            unsafe { parse_run(text, span, &group_of, &mut totals, &mut pairs) };
+            parse_run(text, span, &group_of, &mut totals, &mut pairs);
             // Empty buffers for the next run's pairs, all at once.
             let mut pool = empties.lock().unwrap();
             let n = pool.len().saturating_sub(parts);
@@ -448,7 +448,8 @@ unsafe fn add(table: &mut Table, pairs: &[u64], totals: &mut [Totals; GROUPS]) {
     // that spilled into the next bucket, about 1% of them at 12 threads, is also
     // compared with that bucket's names, which raises the odds by under 2%.)
     let rows_mask = keys.len() as u32 - 1;
-    let bucket_mask = buckets - 1;
+    // A bucket's 8 keys are 32 bytes: its byte offset in `keys` is masked by this.
+    let bucket_bytes = (buckets - 1) * 32;
     // The keys' address in a register: the slice does not change size.
     let keys = keys.as_mut_slice();
     // SAFETY: AVX2 is enabled for this build (see the compile_error); no memory.
@@ -456,16 +457,17 @@ unsafe fn add(table: &mut Table, pairs: &[u64], totals: &mut [Totals; GROUPS]) {
     for &pair in pairs {
         let group = pair as u8 as usize;
         let key = (pair >> 24) as u32 & !rows_mask;
-        let check = (pair >> 21) as u32 & 0x7FFF;
+        // The check bits where a row keeps them, in word 3's bits 49..64.
+        let check = pair << 28;
         // The top hash bits picked the partition; the bits above the group pick a
-        // bucket of 8 slots, compared at once. Slots fill in order and are never
-        // emptied, so a name is in the first bucket of its probe that has a free slot,
-        // or in one before it.
-        let mut bucket = (pair >> 8) as usize & bucket_mask;
+        // bucket of 8 slots, compared at once (its byte offset: those bits times 32).
+        // Slots fill in order and are never emptied, so a name is in the first bucket
+        // of its probe that has a free slot, or in one before it.
+        let mut bucket = (pair >> 3) as usize & bucket_bytes;
         // SAFETY:
         // - buckets is a power of two (the caller's contract), so the mask keeps
-        //   `bucket` below it: the 8 keys at `at` are in `keys`, and a slot is one of
-        //   them (`hits` and `free` have 8 bits);
+        //   `bucket` a multiple of 32 below 32 * buckets: the 8 keys at `at` are in
+        //   `keys`, and a slot is one of them (`hits` and `free` have 8 bits);
         // - a key that is not 0 holds the row + 1 of a row whose WORDS words are in
         //   `seen` (so r * WORDS - 1 is that row's word 3): a new key's row is pushed
         //   right after it, and the assert keeps every row + 1 at or below 5/8 of the
@@ -476,8 +478,9 @@ unsafe fn add(table: &mut Table, pairs: &[u64], totals: &mut [Totals; GROUPS]) {
         // has a free slot.
         unsafe {
             let wanted = _mm256_set1_epi32(key as i32);
-            let row = 'found: loop {
-                let at = keys.as_mut_ptr().add(bucket * 8);
+            // The name's row + 1.
+            let r = 'found: loop {
+                let at = keys.as_mut_ptr().byte_add(bucket);
                 let v = _mm256_loadu_si256(at.cast());
                 let hit = _mm256_cmpeq_epi32(_mm256_and_si256(v, mask), wanted);
                 let mut hits = _mm256_movemask_ps(_mm256_castsi256_ps(hit)) as u32;
@@ -488,9 +491,9 @@ unsafe fn add(table: &mut Table, pairs: &[u64], totals: &mut [Totals; GROUPS]) {
                     if r == 0 {
                         break;
                     }
-                    // Word 3's bits 49..63.
-                    if (*seen.get_unchecked(r * WORDS - 1) >> 49) as u32 == check {
-                        break 'found r - 1;
+                    // Word 3's bits 49..64.
+                    if (*seen.get_unchecked(r * WORDS - 1) ^ check) >> 49 == 0 {
+                        break 'found r;
                     }
                     hits &= hits - 1;
                 }
@@ -498,14 +501,14 @@ unsafe fn add(table: &mut Table, pairs: &[u64], totals: &mut [Totals; GROUPS]) {
                 if free != 0 {
                     assert!(seen.len() < full, "records.csv: too many distinct names");
                     *at.add(free.trailing_zeros() as usize) = key | (seen.len() / WORDS + 1) as u32;
-                    // A new row: WORDS (4) words, the check bits in word 3's bits 49..63.
-                    seen.extend_from_slice(&[0, 0, 0, (check as u64) << 49]);
-                    break 'found seen.len() / WORDS - 1;
+                    // A new row: WORDS (4) words, the check bits in word 3's bits 49..64.
+                    seen.extend_from_slice(&[0, 0, 0, check >> 49 << 49]);
+                    break 'found seen.len() / WORDS;
                 }
-                bucket = (bucket + 1) & bucket_mask;
+                bucket = (bucket + 32) & bucket_bytes;
             };
-            let word = seen.get_unchecked_mut(row * WORDS + group / 64);
-            let bit = 1 << (group % 64);
+            let word = seen.get_unchecked_mut(r * WORDS - WORDS + group / 64);
+            let bit = 1u64.wrapping_shl(pair as u32); // 1 << group % 64
             totals[group][NAMES_DISTINCT] += (*word & bit == 0) as i64;
             *word |= bit;
         }
@@ -524,8 +527,8 @@ fn run_start(text: &[u8], from: usize, k: usize, parts: usize) -> usize {
 
 /// Parses the records in `text[start..end]` into `totals`, and files each
 /// record's (name hash, group) pair under its partition. The last record must end
-/// at `end`. (It takes group_of as a plain slice, not a struct that also holds a
-/// Mutex: through such a struct LLVM could not keep the slice's address in a
+/// at `end`. (It takes group_of by itself, not in a struct that also holds a
+/// Mutex: through such a struct LLVM could not keep the table's address in a
 /// register across the stores into totals, and every record reloaded it.) Out of
 /// line: inlined into the worker, its registers were allocated with the worker's,
 /// and it ran 2-4% slower.
@@ -540,15 +543,11 @@ fn run_start(text: &[u8], from: usize, k: usize, parts: usize) -> usize {
 /// a cut found like the runs' cuts, so the first half must end exactly there.
 /// Every total, the min and max, and the set of pairs do not depend on the order in
 /// which records are counted.
-///
-/// # Safety
-/// `group_of` must not be empty: a region id is clamped to its last entry, which is
-/// then read without a bounds check.
 #[inline(never)]
-unsafe fn parse_run(
+fn parse_run(
     text: &[u8],
     (start, end): (usize, usize),
-    group_of: &[AtomicU8],
+    group_of: &[AtomicU8; REGION_IDS],
     totals: &mut [Totals; GROUPS],
     pairs: &mut [Vec<u64>],
 ) {
@@ -562,18 +561,14 @@ unsafe fn parse_run(
         unsafe { _mm_prefetch::<_MM_HINT_NTA>(text.as_ptr().wrapping_add(i + 1024).cast()) };
         // SAFETY: fast_end is at most text.len() - FAST_MARGIN, or 0, and i >= 8
         // (above).
-        unsafe { fast_record(text, i, fast_end) }.unwrap_or_else(|| walk_record(text, i))
+        unsafe { fast_record(text, i, fast_end) }.unwrap_or_else(|| *walk_record(text, i))
     };
     let mut count = |r: &Record| {
         // Copied out first: read through `r` after the stores into `t` below, the
         // hash was loaded again from memory.
         let (id, region_id, cents, bytes, hash) = (r.id, r.region_id, r.cents, r.bytes, r.hash);
-        // Ids above the table read its last entry, which is 0 (one entry more than
-        // the largest listed id).
-        let k = (region_id as usize).min(group_of.len() - 1);
-        // SAFETY: k <= group_of.len() - 1, and group_of is not empty (the caller's
-        // contract).
-        let group = unsafe { group_of.get_unchecked(k) }.load(Relaxed);
+        // Ids above the table read its last entry, which is 0 (see REGION_IDS).
+        let group = group_of[(region_id as usize).min(REGION_IDS - 1)].load(Relaxed);
         let t = &mut totals[group as usize];
         (t[COUNT], t[ID_SUM], t[AMOUNT_SUM]) =
             (t[COUNT] + 1, t[ID_SUM] + id as i64, t[AMOUNT_SUM] + cents);
@@ -592,7 +587,8 @@ unsafe fn parse_run(
     };
     let mid = run_start(&text[..end], start, 1, 2);
     let (mut i, mut j) = (start, mid);
-    while i < mid && j < end {
+    // Bounded by fast_end too, so that fast_record's own test of it is known true.
+    while i < mid.min(fast_end) && j < fast_end {
         let (a, b) = (record(i), record(j));
         count(&a);
         count(&b);
@@ -646,9 +642,10 @@ unsafe fn fast_record(text: &[u8], i: usize, fast_end: usize) -> Option<Record> 
     let name_end = out.trailing_zeros() as usize; // 64 if none
     out &= out.wrapping_sub(1);
     (name_end < 64).then_some(())?;
-    // Empty, or quoted with every inner quote half of a `""` pair (spec 2.2). (A
-    // one-byte field counts as unquoted, so that the hash's range is never negative.)
-    let name_quoted = (name_end > id_end + 2) as usize;
+    // Empty, or quoted with every inner quote half of a `""` pair (spec 2.2): quoted
+    // if its first byte is inside quotes. (A lone quote, outside spec 2.2, would make
+    // the length below negative, wrapping to far above 32: the walker takes it.)
+    let name_quoted = (inside >> (id_end + 1)) as usize & 1;
     // Inside quotes are a quoted field's opening quote, its bytes and one quote of each
     // `""` (the other flips the state back), so its unescaped length is its count of
     // inside bits less one. The id and the commas are outside.
@@ -682,7 +679,7 @@ unsafe fn fast_record(text: &[u8], i: usize, fast_end: usize) -> Option<Record> 
     let tail = unsafe { _mm256_loadu_si256(p.add(note_end + 1).cast()) };
     let region_len = bytes_eq(tail, b',').trailing_zeros() as usize;
     let dot = bytes_eq(tail, b'.').trailing_zeros() as usize;
-    let negative = bytes_eq(tail, b'-') >> (region_len + 1) & 1 != 0; // a mask bit: no byte load
+    let negative = at(note_end + 2 + region_len) == b'-';
     // The amount ends two digits after its dot (spec 2.2).
     let (region_end, amount_end) = (note_end + 1 + region_len, note_end + 4 + dot);
     let [id, region_id, c] = numbers([load(id_end), load(region_end), load(amount_end)]);
@@ -698,10 +695,12 @@ unsafe fn fast_record(text: &[u8], i: usize, fast_end: usize) -> Option<Record> 
 
 /// Any record of spec 2.2 starting at `i`, field by field: the ones whose name or
 /// note is too long for `fast_record`'s windows, and the last few of the file. Out
-/// of line, so that it does not crowd the registers of the fast path's loop.
+/// of line, so that it does not crowd the registers of the fast path's loop. Boxed:
+/// a Record returned by value is written into the caller's own Record, which then
+/// stays in memory, and the fast path stored every field of every record into it.
 #[cold]
 #[inline(never)]
-fn walk_record(text: &[u8], i: usize) -> Record {
+fn walk_record(text: &[u8], i: usize) -> Box<Record> {
     let mut at = i + (text[i] == 0xEF) as usize * 3; // a BOM is not data
     let [id, name, note, region, amount] = [(); 5].map(|_| field(text, &mut at));
     let cents = number(amount.0) as i64 * if amount.0[0] == b'-' { -1 } else { 1 };
@@ -710,7 +709,7 @@ fn walk_record(text: &[u8], i: usize) -> Record {
     // whatever the input. (This path is rare.)
     let copy = [name.0, &[0; 32]].concat();
     // The values in the order they are computed (cents and next above), not the struct's.
-    Record {
+    Box::new(Record {
         // SAFETY: the copy has 32 bytes after the name.
         hash: unsafe { hash_words(&copy, 0, copy.len() - 32) },
         bytes: name.1 << 32 | note.1,
@@ -718,7 +717,7 @@ fn walk_record(text: &[u8], i: usize) -> Record {
         region_id: number(region.0),
         cents,
         next,
-    }
+    })
 }
 
 /// The field at `*at`, quoted or not, and the byte after it (a comma or the
