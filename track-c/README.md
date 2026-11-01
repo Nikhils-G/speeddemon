@@ -54,23 +54,40 @@ hash's top 40 bits, the name's row of group bits in bits 8..24 and `0xFF` in the
 is never 0, the empty slot). A lookup starts at the bucket picked by hash bits 8 and up, compares
 the 40 bits of 4 slots at once and reads the row from the key it hit, with no second load. Two
 names are confused only if they share those 40 bits and their bucket bits: 50 bits at 12 threads
-(4096-slot tables), 54 on one thread. The partition adds nothing, since it is picked from bits
-that are compared anyway. With the generator's 100,000 names, the chance that any two of them are
-confused is about 4e-6 per dataset at 12 threads (3e-7 on one thread). Before step 29 the tables
-compared all 56 bits and kept the rows in a separate array: about 7e-8.
+(4096-slot tables), 54 on one thread (65,536 slots). The partition adds nothing, since it is picked
+from bits that are compared anyway. With the generator's 100,000 names, the chance that any two of
+them are confused is about C(100000, 2) / 2^50 = 4.4e-6 per dataset at 12 threads, and
+C(100000, 2) / 2^54 = 2.8e-7 on one thread. (The 7e-8 of earlier versions held only until step 29,
+when the tables still compared all 56 bits and kept the rows in a separate array.)
 
 After each run it parses, a thread hands its buffers of pairs to their owners' inboxes, moving
 them rather than copying. Its own 4 tables then take what waits in its inbox. A table's row holds
 a bit per country for each name, and a thread's tables stay in its cache. No two threads ever write the same table, so the hot path has no atomics.
+Emptied buffers go back to one shared pool, from which a filer takes the empties for its next run
+(up to 48 at 12 threads) under one lock. A buffer holds a run's mean share of pairs plus 2 standard
+deviations plus 4 (113 pairs at 12 threads on the full data); one that overflowed grew, and is dropped once
+emptied, so the pool's buffers stay small. The empty name (1% of records) always hashes to the same
+partition, which is the one that overflows.
 
-**No waiting for a slow thread.** The file is cut into 32 runs per thread, which threads claim
+**No waiting for a slow thread.** The file is cut into 64 runs per thread, which threads claim
 one at a time. A thread that loses its core to another process parses fewer runs, and its pairs
 wait in its inbox. No thread waits for another one until the very end. The earlier version had a
 barrier after each of 8 rounds, and one CPU shared with a busy loop made it take twice as long (42
 ms instead of 22 on the test server); now it takes 25. If an inbox grows past a bound because its
 thread fell behind, whoever files into it takes over its tables, so that memory stays bounded too.
 Claims go round the file's stripes, one per thread, so that runs parsed at the same time never share a page
-table, whose lock their page faults would otherwise contend on.
+table, whose lock their page faults would otherwise contend on. The last thread to parse a run of a
+block of 8 drops the block's input pages (`madvise(MADV_DONTNEED)`, about 2 MB per call), in
+parallel instead of in one unmap at exit. Each thread's totals are added to one shared sum as it
+finishes, and the last thread to finish writes the output and exits.
+
+**Memory.** At the end of a 12-thread run (smaps, test server) the program's own data is the region
+table (0.98 MB), the name tables' keys (1.57 MB: 48 tables of 4096 8-byte slots) and the seen rows
+(3.26 MB: 100,000 names of 4 words each, a bit per possible group). The pair buffers wait for about
+one run, so their size follows the run size. They were about 2.9 MB before step 31, whose 64 runs
+per thread (instead of 32) and shared pool cut the peak by about 1.5 MB (PERF.md). About 3.3 MB is
+outside the program's control: about 1 MB already charged when the program starts, about 0.7 MB of
+kernel page tables and stacks, and 1-2 MB of the kernel's per-CPU charge batching.
 
 **Tripwires.** Wherever 2.2 is relied on, input outside it fails loudly instead of giving a wrong
 answer. Each half-run must end exactly at the next cut (`assert_eq!`). If the input breaks 2.2 in a way

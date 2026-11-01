@@ -38,6 +38,7 @@ much higher than the box's, so only the board decided what stayed.
 | 28 | c0b7fbd | Branch-free AES hash of the name: 32-byte blocks masked to the field by a sliding `KEEP` window, three AES rounds, the length mixed in (run in a slow dispatch) | run-58f46f513414 | 0.0225 | 13.19 | 420 | 80.2 |
 | 29 | bb339db | The name's row in bits 8..24 of its table key: the separate id array is gone (no board run of its own: measured with step 30) | | | | 422 | |
 | 30 | 84c8677 | The amount's minus sign from the 32-byte tail compare already loaded, not from a byte load | run-2bd88ce6fc49 | 0.0217 | 12.68 | 422 | 80.7 |
+| 31 | bddc535 | Memory: 64 runs per thread in release blocks of 8; one shared pool of empty pair buffers; buffers sized mean + 2 sd + 4, a grown one dropped once emptied; totals summed as each thread finishes (two board runs of the same code) | run-649a95479a7d, run-0d8cb30b558e | 0.021915, 0.021661 | 10.63, 10.92 | 430 | 81.36, 81.37 |
 
 ## What each step taught
 
@@ -261,8 +262,9 @@ reads 849.5M instructions here, against 854.0M in round 5's session):
   bytes per slot, 384 KB over 48 tables of 4096 slots at 12 threads): memory 13.5 → 12.5–13.3 MB
   on the server. The price is in the hash bits that tell names apart: the 40 compared bits plus the
   bucket bits (hash bits 8 and up, 10 of them in a 4096-slot table), 50 bits at 12 threads instead
-  of all 56. With the generator's 100,000 names the chance that two are confused is about 4e-6 per
-  dataset at 12 threads (3e-7 on one thread), up from 7e-8. The partition does not add bits: it is
+  of all 56. With the generator's 100,000 names the chance that two are confused is about
+  C(100000, 2) / 2^50 = 4.4e-6 per dataset at 12 threads (C(100000, 2) / 2^54 = 2.8e-7 on one
+  thread), up from C(100000, 2) / 2^56 = 7e-8. The partition does not add bits: it is
   picked from the hash's top 32 bits, which are compared anyway. No board run of its own: it went
   to the board with step 30.
 - **Step 30.** The minus sign was a byte load at `note_end + 2 + region_len`, whose address waited
@@ -294,6 +296,52 @@ reverted. Most of the prototype's gain had been against step 24's 2.1 checks, wh
 already removed. Stage A adds about 30 instructions per record, and stage B's three separate
 windows cost about as much as the 64-byte window plus tail compare they replace.
 
+### Step 31 (round 7): memory
+
+Where the memory was before the step, from smaps at the end of a 12-thread run on the server
+(cpuset 0-11):
+
+| What | MB |
+|---|---|
+| Region table (a byte per region id) | 0.98 |
+| Name tables' keys (48 tables of 4096 8-byte slots) | 1.57 |
+| Seen rows (100,000 names x 32 B: 4 words of group bits, enough for the 240 countries) | 3.26 |
+| Pair buffers | ~2.9 |
+| Outside the program's control: ~1 MB charged before it runs, ~0.7 MB kernel page tables and stacks, 1-2 MB per-CPU charge batching | ~3.3 |
+
+The tables and rows are what the 100,000 names need, so the step went after the pair buffers,
+which hold pairs only while they wait for their owner, about one run:
+- **Smaller runs.** 64 runs per thread instead of 32 halve a run, and with it what a buffer has to
+  hold. Release blocks of 8 runs instead of 4 keep the `madvise` calls at 96 (12 x 64 / 8 =
+  12 x 32 / 4), each still about 2 MB, since every call is a round of TLB shootdowns (48 runs per
+  thread in blocks of 4: +0.35 ms). Alone: -0.9 to -1.1 MB, +0.2 ms on the server.
+- **One shared pool of empty buffers** instead of one per owner thread. A filer takes the empties
+  for its next run (up to 48) under one lock. With a pool per owner, buffers sat idle in one pool
+  while a filer made new ones for another: 0.3 MB more, up to 2 MB when a thread fell behind.
+- **Tighter buffers.** The capacity is a run's mean share of pairs plus 2 standard deviations plus
+  4: 113 pairs at 12 threads on the full data, against step 30's mean x 5/4 + 16 = 243 (at 32 runs
+  per thread). The empty name (1% of records) always lands in one partition, whose buffer
+  overflows and grows; a buffer that grew is dropped once emptied, so the pool stays small. Room
+  for nearly every run (3.4 deviations) cost 0.3 MB more.
+- **Totals summed as each thread finishes**, into one shared row per group, instead of one row set
+  per thread summed at output (that `Vec` and its regrowth: 0.2 MB more).
+
+Server, the whole step: memory.peak median 12.91 -> 11.39 MB, time 19.9 -> 20.14 ms (about +1%),
+S 422 -> 430. On the board: M 12.68 -> 10.63 MB (run-649a95479a7d, T 0.021915 s, 81.36 points,
++0.62) and 10.92 MB in a second run of the same Track C code (run-0d8cb30b558e, T 0.021661 s,
+81.37, the best Track C run). The time moved within the board's 3% spread. One run of the same
+code, run-d210144850cf, took 0.0266 s: a noisy run.
+
+Rejected in this round:
+- Name tables at 3/4 load instead of 5/8: -0.33 MB, +0.8% time and worse collision odds.
+- `munmap` of a block's input pages instead of `madvise(MADV_DONTNEED)`: not built. The cut search
+  and the walker can read past a block's end into its neighbour block. After `MADV_DONTNEED` such a
+  read faults the page back in from the page cache; after `munmap` it would crash.
+
+**Lesson.** The memory that is ours (about 8.7 MB in the table above) is mostly what the names
+need. The part that depended on a design choice was how long pairs wait: it follows the run size,
+and halving the runs cost about +1% time once the release calls were kept at 2 MB each.
+
 ## Experiments that did not make it (measured, reverted)
 
 | Experiment | Where measured | Result |
@@ -302,7 +350,7 @@ windows cost about as much as the 64-byte window plus tail compare they replace.
 | A pool of pair sets with a publish log (e1) | server | 22.7 / 30.8 ms (unloaded / loaded): one preempted partition holder stalls the pool |
 | Pairs copied into the inbox | server | flush 1.2 ms per thread vs 0.19 handed over |
 | Buffers returned to the thread that filed them | server | +0.3 ms |
-| 64 runs per thread (8-run release blocks) | server | +0.9 ms, memory 12.9–13.5 MB: the tables take smaller batches and are fetched again more often |
+| 64 runs per thread (8-run release blocks), on an earlier version | server | +0.9 ms, memory 12.9–13.5 MB: the tables take smaller batches and are fetched again more often. Step 31 adopts it, with the shared pool, at +0.2 ms |
 | 16 / 24 runs per thread | server | −0.3 / ±0 ms, memory 16.4 / 14.7 MB |
 | One inbox lock per partition instead of per owner thread (48 lock calls per run) | server | same time |
 | Tables taken from any thread while waiting for the last runs | server | same time; removed (−9 lines) |
