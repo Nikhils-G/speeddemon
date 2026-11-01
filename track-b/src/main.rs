@@ -1336,9 +1336,11 @@ impl<'a> Scan<'a> {
         unsafe { self.work.set_len(m) };
         let state = self.answers.state.as_ptr();
         for (k, &(from, to)) in self.work.iter().enumerate() {
-            // The state of the range RANGES_AHEAD on (entry 0's near the end).
-            let ahead = self.work.get(k + RANGES_AHEAD).map_or(0, |r| r.0) as usize;
-            // SAFETY: an entry of the plan, which the first pass fetched.
+            // The state of the range RANGES_AHEAD on (this one's near the end).
+            let ahead = self.work.get(k + RANGES_AHEAD).map_or(from, |r| r.0) as usize;
+            // SAFETY: entry `ahead` is the first of a trigger term's range, which is
+            // never empty (TRIG is set only then, Plan::new). Its answer is only read,
+            // for a prefetch.
             prefetch(state, unsafe { (*entries.add(ahead)).answer } as usize);
             // SAFETY: group holds ranges of entries.
             for e in unsafe { plan.entries.get_unchecked(from as usize..to as usize) } {
