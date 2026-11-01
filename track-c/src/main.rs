@@ -151,19 +151,22 @@ fn map(path: &str) -> &'static [u8] {
 /// A dropped page faults back in from the page cache with the same bytes if it is
 /// in a private file mapping that is never written, as `map`'s are, and as zeros
 /// otherwise. So either `items` lies in such a mapping, or no thread reads it again.
-unsafe fn drop_pages<T>(items: &[T]) {
-    let start = (items.as_ptr() as usize).next_multiple_of(PAGE);
-    let end = (items.as_ptr() as usize + size_of_val(items)) / PAGE * PAGE;
+/// It takes a raw pointer (callers pass a slice, which coerces), so that no reference
+/// to the memory is live across the call.
+unsafe fn drop_pages<T>(items: *const [T]) {
+    let start = (items.cast::<T>() as usize).next_multiple_of(PAGE);
+    let end = (items.cast::<T>() as usize + items.len() * size_of::<T>()) / PAGE * PAGE;
     // SAFETY: MADV_DONTNEED on the whole pages inside `items` (none if it holds no
     // whole page), which are not read as zeros by the caller's contract.
     unsafe { madvise(start as *mut u8, end.saturating_sub(start), MADV_DONTNEED) };
 }
 
 /// Spins for a while, then yields the core between checks, until `count` reaches
-/// `n`. The waits (for regions.csv, and for the last runs) are short, and waking a
-/// dozen sleeping threads would take a good part of them (std's Barrier between
-/// rounds was about 1 ms slower per run). Yielding after the spin keeps a thread
-/// that lost its core from being starved by spinning siblings.
+/// `n`. The waits (for regions.csv, for the last runs, and for every thread's
+/// totals) are short, and waking a dozen sleeping threads would take a good part
+/// of them (std's Barrier between rounds was about 1 ms slower per run). Yielding
+/// after the spin keeps a thread that lost its core from being starved by spinning
+/// siblings.
 fn wait(count: &AtomicUsize, n: usize) {
     for spin in (0u32..).take_while(|_| count.load(Acquire) < n) {
         std::hint::spin_loop();
@@ -193,8 +196,8 @@ fn main() {
 }
 
 /// Builds the join table from regions.csv, then parses and aggregates every run,
-/// and writes the output. One set of threads does all of it, this one included;
-/// the thread that writes the output exits the process.
+/// and writes the output. One set of threads does all of it, this one included, as
+/// worker 0, which writes the output and exits the process.
 fn run(data_dir: &str, out_dir: &str) -> ! {
     let lines = map(&format!("{data_dir}/regions.csv")).strip_prefix(b"region_id,country\n");
     let lines = lines.expect("regions.csv: the header is not region_id,country");
@@ -302,10 +305,14 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
                 inbox.push(std::mem::replace(buffer, fresh));
                 // A thread that falls behind (it lost its core) would let its inbox,
                 // and the memory peak, grow: past a bound, the filer takes it over.
-                // (Normally an inbox holds a few buffers.)
+                // (Normally an inbox holds a few buffers.) If the owner holds its table
+                // but lost its core to this thread (two threads on one CPU, in about 2%
+                // of runs), yielding gives the core back. Replica, 200 runs: memory
+                // peaks up to 12.0 MB without the yield, 10.9 MB with it.
                 if inbox.len() > 4 * threads {
                     drop(inbox);
                     take(t, &mut totals);
+                    thread::yield_now();
                 }
             }
             // This thread's table, unless another thread holds it.
@@ -347,19 +354,19 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
         let share = |n| part(n, w - 1, threads - 1);
         // SAFETY: no thread reads the tables, the join table or regions.csv again
         // (above), and the input is `map`'s.
-        unsafe { drop_pages(keys) };
-        unsafe { drop_pages(rows) };
+        unsafe { drop_pages(&keys[..]) };
+        unsafe { drop_pages(&rows[..]) };
         unsafe { drop_pages(&group_of[share(REGION_IDS)]) };
         unsafe { drop_pages(&lines[share(lines.len())]) };
         unsafe { drop_pages(&text[early..][share(text.len() - early)]) };
     };
     thread::scope(|s| {
-        // The handles are not needed: the scope joins the threads, and the last
-        // worker exits before that.
+        // The handles are not needed: worker 0, on this thread, writes the output and
+        // exits the process, so the scope never ends.
         (1..threads).for_each(|w| drop(s.spawn(move || worker(w))));
         worker(0);
     });
-    unreachable!("the last worker exits the process")
+    unreachable!("worker 0 exits the process")
 }
 
 /// Enters the `region_id,CCC` LF lines of regions.csv in `lines` (spec 2.3) into
