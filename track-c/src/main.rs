@@ -72,7 +72,7 @@ const REGION_IDS: usize = 1 << 20;
 /// so the ones that start first do more of it.
 const REGION_CHUNKS: usize = 64;
 /// PROBE: (RUNS_PER_THREAD, BLOCK, PARTITIONS_PER_THREAD) per mode.
-const CFG: [(usize, usize, usize); 2] = [(64, 8, 4), (64, 8, 2)];
+const CFG: [(usize, usize, usize); 2] = [(64, 8, 1), (64, 0, 1)];
 /// PROBE modes per pass on input > 100 MB: a warm-up, then ABBA ABBA.
 const MODES: [usize; 9] = [0, 0, 1, 1, 0, 0, 1, 1, 0];
 /// `fast_record` reads up to 196 bytes past a record's start, so it takes only the
@@ -315,8 +315,8 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
             }
             // The last of a block's runs to be parsed drops the block's pages. (A
             // call per run instead: +2 ms, from 8 times the TLB-shootdown rounds.)
-            let block = run_index / blk;
-            if parsed[block].fetch_add(1, AcqRel) == blk - 1 {
+            let block = run_index / blk.max(1);
+            if blk > 0 && parsed[block].fetch_add(1, AcqRel) == blk - 1 {
                 // SAFETY: `text` is `map`'s: a private mapping that is never written.
                 // (The index cannot panic: cuts are monotonic and at most text.len().)
                 unsafe { drop_pages(&text[cut(block * blk)..cut(block * blk + blk)]) };
@@ -331,6 +331,11 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
         // empty).
         flushed.fetch_add(1, Release);
         wait(&flushed, (pass + 1) * threads);
+        if blk == 0 {
+            // PROBE: BLOCK 0 = every thread drops one slice of the input after the parse.
+            let slice = |k| body_start + (text.len() - body_start) * k / threads;
+            unsafe { drop_pages(&text[slice(w)..slice(w + 1)]) };
+        }
         for t in std::iter::once(w).chain(0..threads) {
             take(&mut tables[t].lock().unwrap(), t, &mut totals);
         }
