@@ -11,8 +11,8 @@
 //!    strictly left to right.
 //! 3. A query is evaluated only in blocks that contain one of its cover terms, a
 //!    set of terms every match contains (see `cover`), chosen to be rare from the
-//!    sample. Queries with common covers are evaluated in every superblock of 512
-//!    documents instead, with AVX2 on two vectors of four words per term.
+//!    sample. Queries with common covers are evaluated in every superblock of 256
+//!    documents instead, with AVX2 on four words per term.
 //! 4. Each phrase is anchored on its rarest term and checked against the token
 //!    ids of the document when it ends, while they are still in L1.
 //! 5. Per query and thread, the scan keeps the match count, the sum of the ids
@@ -55,11 +55,10 @@ const OR: u32 = 3;
 const SAMPLE_BYTES: usize = 1 << 20;
 /// A query whose cover terms are expected in more blocks than this (as a share,
 /// summed over the terms) is evaluated in every superblock: one evaluation then
-/// covers eight blocks. (With 256-document superblocks, 0.125 and 0.5 were
-/// measured slower.)
+/// covers four blocks. (0.125 and 0.5 were measured slower.)
 const ALWAYS: f64 = 0.25;
-/// Documents per superblock: eight blocks of 64.
-const SUPER: u32 = 512;
+/// Documents per superblock: four blocks of 64.
+const SUPER: u32 = 256;
 /// A thread's sum of matching ids is packed under its count in one u64.
 const SUM_BITS: u32 = 40;
 
@@ -722,7 +721,7 @@ struct Scan<'a> {
     /// The trigger terms of this document, each once, and their entry ranges.
     trig: Vec<u32>,
     work: Vec<(u32, u32)>,
-    /// Row r < plan.rows: the words of BOOL term r in the 8 blocks of this
+    /// Row r < plan.rows: the words of BOOL term r in the 4 blocks of this
     /// superblock. Row `rows` takes the other terms; row `rows + 1` is all ones.
     wide: Vec<Row>,
     /// This document's tokens to look up: their keys and the byte offsets of
@@ -742,8 +741,8 @@ impl<'a> Scan<'a> {
     fn new(vocab: &'a Vocab, plan: Option<&'a Plan>, df: &'a [AtomicU32]) -> Self {
         let rows = plan.map_or(0, |p| p.rows);
         let answers = plan.map_or(0, |p| p.line_of.len());
-        let mut wide = vec![Row([0; 8]); rows + 2];
-        wide[rows + 1] = Row([!0; 8]);
+        let mut wide = vec![Row([0; 4]); rows + 2];
+        wide[rows + 1] = Row([!0; 4]);
         Scan {
             vocab,
             plan,
@@ -876,7 +875,7 @@ impl<'a> Scan<'a> {
         let (miss, rows, table) = (self.vocab.count, self.wide.len() - 2, self.vocab.table.as_ptr());
         let doc = self.doc;
         // This document's word in each row.
-        let wide = self.wide.as_mut_ptr().cast::<u64>().wrapping_add((doc / 64 % 8) as usize);
+        let wide = self.wide.as_mut_ptr().cast::<u64>().wrapping_add((doc / 64 % 4) as usize);
         self.toks.reserve(self.pending.len());
         self.trig.reserve(self.pending.len());
         self.work.reserve(self.pending.len());
@@ -910,7 +909,7 @@ impl<'a> Scan<'a> {
             let row = min(id, rows);
             unsafe {
                 *lastdoc.add(id) = doc;
-                *wide.add(8 * row) |= bit;
+                *wide.add(4 * row) |= bit;
             }
         }
         self.pending.clear();
@@ -986,31 +985,30 @@ impl<'a> Scan<'a> {
         self.trig.clear();
     }
 
-    /// Evaluates the `always` queries on the superblock of 512 documents from
-    /// `base`, on two vectors of four words at once, then clears it.
+    /// Evaluates the `always` queries on the superblock of 256 documents from
+    /// `base`, like `end_block` but on four words at once, then clears it.
     fn end_super(&mut self, base: u32) {
         let Some(plan) = self.plan else { return };
-        let wide = self.wide.as_ptr().cast::<__m256i>();
+        let wide = self.wide.as_ptr() as *const __m256i;
         for e in &plan.always {
             // For `always` entries, `earlier` holds the number of terms.
             let terms = &e.terms[..e.earlier as usize];
-            // SAFETY: 32-byte loads of the two halves of rows, which are 64-byte
-            // aligned (Row is repr(align(64))); the plan's rows are below
-            // wide.len(). AVX2 is enabled for the whole build.
+            // SAFETY: 32-byte loads of rows, which are 32-byte aligned (Row is
+            // repr(align(32))); the plan's rows are below wide.len(). AVX2 is
+            // enabled for the whole build.
             let hits = unsafe {
-                terms.iter().fold([_mm256_setzero_si256(); 2], |[r0, r1], &word| {
-                    let row = wide.add(2 * (word & TERM) as usize);
-                    let (x0, x1) = (_mm256_load_si256(row), _mm256_load_si256(row.add(1)));
+                terms.iter().fold(_mm256_setzero_si256(), |r, &word| {
+                    let x = _mm256_load_si256(wide.add((word & TERM) as usize));
                     match word >> 30 {
-                        AND => [_mm256_and_si256(r0, x0), _mm256_and_si256(r1, x1)],
-                        NOT => [_mm256_andnot_si256(x0, r0), _mm256_andnot_si256(x1, r1)],
-                        _ => [_mm256_or_si256(r0, x0), _mm256_or_si256(r1, x1)],
+                        AND => _mm256_and_si256(r, x),
+                        NOT => _mm256_andnot_si256(x, r),
+                        _ => _mm256_or_si256(r, x),
                     }
                 })
             };
             self.answers.add_wide(e.answer, hits, base);
         }
-        self.wide[..plan.rows].fill(Row([0; 8]));
+        self.wide[..plan.rows].fill(Row([0; 4]));
     }
 }
 
@@ -1020,10 +1018,10 @@ fn written_zeros(len: usize) -> Vec<u64> {
     std::iter::repeat_n(std::hint::black_box(0), len).collect()
 }
 
-/// One `wide` row: one word per block of the superblock, a cache line.
+/// One `wide` row, aligned for 32-byte loads.
 #[derive(Clone, Copy)]
-#[repr(align(64))]
-struct Row([u64; 8]);
+#[repr(align(32))]
+struct Row([u64; 4]);
 
 /// One thread's answers.
 struct Answers {
@@ -1073,26 +1071,25 @@ impl Answers {
         *s += hit as u64 * (1 << SUM_BITS | doc as u64);
     }
 
-    /// `add` for the 512 documents from `base`, one word of `hits` per 64.
-    fn add_wide(&mut self, answer: u32, hits: [__m256i; 2], base: u32) {
+    /// `add` for the 256 documents from `base`, one word of `hits` per 64.
+    fn add_wide(&mut self, answer: u32, hits: __m256i, base: u32) {
         if self.state[answer as usize] >> SUM_BITS >= 10 {
             let (n, positions) = count_positions(hits);
             self.state[answer as usize] += n << SUM_BITS | (n * base as u64 + positions);
             // SAFETY: AVX2 is enabled for the whole build.
-        } else if unsafe { _mm256_testz_si256(hits[0], hits[0]) & _mm256_testz_si256(hits[1], hits[1]) } == 0 {
+        } else if unsafe { _mm256_testz_si256(hits, hits) } == 0 {
             // Still logging first ids: a word at a time.
-            // SAFETY: [__m256i; 2] and [u64; 8] have the same size, and any bits are valid.
-            let words: [u64; 8] = unsafe { std::mem::transmute(hits) };
-            (0..8).for_each(|i| self.add(answer, words[i], base + 64 * i as u32));
+            // SAFETY: __m256i and [u64; 4] have the same size, and any bits are valid.
+            let words: [u64; 4] = unsafe { std::mem::transmute(hits) };
+            (0..4).for_each(|i| self.add(answer, words[i], base + 64 * i as u32));
         }
     }
 }
 
-/// The number of set bits in the 512 bits of `[v, w]`, and the sum of their
-/// positions, from tables of the 4-bit nibbles: the nibble at bits 4m..4m + 4
-/// adds 4m per set bit, plus its own bit positions; a bit of `w` adds 256 more.
-/// Both vectors share one reduction to a number.
-fn count_positions([v, w]: [__m256i; 2]) -> (u64, u64) {
+/// The number of set bits in `v`, and the sum of their positions, from tables of
+/// the 4-bit nibbles: the nibble at bits 4m..4m + 4 adds 4m per set bit, plus its
+/// own bit positions.
+fn count_positions(v: __m256i) -> (u64, u64) {
     // SAFETY: AVX2 is enabled for the whole build.
     unsafe {
         let table = |t: &[u8; 16]| _mm256_broadcastsi128_si256(_mm_loadu_si128(t.as_ptr().cast()));
@@ -1102,32 +1099,23 @@ fn count_positions([v, w]: [__m256i; 2]) -> (u64, u64) {
         let low = table(&[0, 0, 1, 1, 2, 2, 3, 3, 3, 3, 4, 4, 5, 5, 6, 6]);
         let high = table(&[0, 4, 5, 9, 6, 10, 11, 15, 7, 11, 12, 16, 13, 17, 18, 22]);
         let nibble = _mm256_set1_epi8(0x0F);
-        let split = |x| (_mm256_and_si256(x, nibble), _mm256_and_si256(_mm256_srli_epi16::<4>(x), nibble));
-        let ((lo, hi), (lo2, hi2)) = (split(v), split(w));
-        let look = |t, lo, hi| _mm256_add_epi8(_mm256_shuffle_epi8(t, lo), _mm256_shuffle_epi8(t, hi));
-        let own = |lo, hi| _mm256_add_epi8(_mm256_shuffle_epi8(low, lo), _mm256_shuffle_epi8(high, hi));
-        // Per byte: the set bits of w (up to 8), of both (up to 16), and the own
-        // positions of both (up to 2 * 28).
-        let count2 = look(pop, lo2, hi2);
-        let count = _mm256_add_epi8(look(pop, lo, hi), count2);
-        let own = _mm256_add_epi8(own(lo, hi), own(lo2, hi2));
-        // Byte b adds 8b per set bit: 16-bit sums of byte pairs (below 2^13), then
-        // 32-bit sums. maddubs reads its first operand as unsigned bytes, 0 to 248 here.
+        let (lo, hi) = (_mm256_and_si256(v, nibble), _mm256_srli_epi16::<4>(v));
+        let hi = _mm256_and_si256(hi, nibble);
+        let count = _mm256_add_epi8(_mm256_shuffle_epi8(pop, lo), _mm256_shuffle_epi8(pop, hi));
+        let own = _mm256_add_epi8(_mm256_shuffle_epi8(low, lo), _mm256_shuffle_epi8(high, hi));
+        // Byte b adds 8b per set bit: 16-bit sums of byte pairs, then 32-bit sums,
+        // with the count added at bit 16 (the position sum is below 2^15).
+        // maddubs reads its first operand as unsigned bytes, 0 to 248 here.
         let eight_b = _mm256_loadu_si256(EIGHT_B.as_ptr().cast());
-        let (ones8, ones16, zero) = (_mm256_set1_epi8(1), _mm256_set1_epi16(1), _mm256_setzero_si256());
+        let (ones8, ones16) = (_mm256_set1_epi8(1), _mm256_set1_epi16(1));
         let pos = _mm256_maddubs_epi16(eight_b, count);
-        let pos = _mm256_madd_epi16(_mm256_add_epi16(pos, _mm256_maddubs_epi16(own, ones8)), ones16);
-        // 64-bit lanes: the positions of the lane's two 32-bit sums at bit 0, and
-        // the lane's count at bit 32 (vpsadbw adds the lane's 8 count bytes); then
-        // 256 per set bit of w (whose bytes' counts vpsadbw adds the same way).
-        let pos = _mm256_add_epi64(pos, _mm256_srli_epi64::<32>(pos));
-        let counts = _mm256_slli_epi64::<32>(_mm256_sad_epu8(count, zero));
-        let sums = _mm256_blend_epi32::<0b1010_1010>(pos, counts);
-        let sums = _mm256_add_epi64(sums, _mm256_slli_epi64::<8>(_mm256_sad_epu8(count2, zero)));
-        // The four lanes added up: the position sum stays below 2^17, so it never
-        // carries into the count.
-        let total = std::mem::transmute::<_, [u64; 4]>(sums).iter().sum::<u64>();
-        (total >> 32, total & u32::MAX as u64)
+        let pos = _mm256_add_epi16(pos, _mm256_maddubs_epi16(own, ones8));
+        let counts = _mm256_madd_epi16(_mm256_maddubs_epi16(count, ones8), ones16);
+        let pos = _mm256_madd_epi16(pos, ones16);
+        let sums = _mm256_add_epi32(pos, _mm256_slli_epi32::<16>(counts));
+        // The eight 32-bit sums added up (they cannot overflow 32 bits).
+        let total = std::mem::transmute::<_, [u32; 8]>(sums).iter().sum::<u32>() as u64;
+        (total >> 16, total & 0xFFFF)
     }
 }
 
