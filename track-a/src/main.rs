@@ -70,6 +70,24 @@ fn main() {
     let len @ 1.. = input.metadata().expect("stat the log").len() as usize else {
         return; // the spec's empty input gives an empty summary
     };
+    // PROBE: exit with the host's huge-page settings, only on the full dataset (the
+    // PGO training run on the sample must exit 0). Code = 1 + anon * 24 + shmem * 4 + out,
+    // anon: always 0, madvise 1, never 2; shmem_enabled: always 0, within_size 1,
+    // advise 2, never 3, deny 4, force 5 (6: unreadable); /out's huge= option: none or
+    // never 0, always 1, within_size 2, advise 3.
+    if len > 100_000_000 {
+        let pick = |path: &str, names: &[&str], none: usize| {
+            let text = std::fs::read_to_string(path).unwrap_or_default();
+            names.iter().position(|n| text.contains(&format!("[{n}]"))).unwrap_or(none)
+        };
+        let anon = pick("/sys/kernel/mm/transparent_hugepage/enabled", &["always", "madvise", "never"], 2);
+        let shmem_names = ["always", "within_size", "advise", "never", "deny", "force"];
+        let shmem = pick("/sys/kernel/mm/transparent_hugepage/shmem_enabled", &shmem_names, 6);
+        let mounts = std::fs::read_to_string("/proc/self/mounts").unwrap_or_default();
+        let line = mounts.lines().find(|l| l.split(' ').nth(1) == Some("/out")).unwrap_or("");
+        let out = ["huge=always", "huge=within_size", "huge=advise"].iter().position(|h| line.contains(h)).map_or(0, |i| i + 1);
+        std::process::exit((1 + anon * 24 + shmem * 4 + out) as i32);
+    }
     // The log followed by PAD zero bytes: the whole range is reserved as zero
     // pages, then the file is mapped over its start (the rest of the file's last
     // page reads as zero). The dataset is mounted read-only, so the bytes cannot
@@ -641,63 +659,21 @@ impl Interner {
 }
 
 /// Nearest-rank p50, p95 and p99 (the value at 1-indexed rank ceil(p * n / 100)
-/// in sorted order) of a non-empty group. Groups of up to 64 values (95% of the
-/// groups) count ranks (see `small_ranks`); larger ones select: p50 first, then each
-/// next rank within the part above the last one. Each value is read at once: the
-/// next selection reorders that part, its own slot included.
+/// in sorted order) of a non-empty group, by selection instead of a full sort: p50
+/// first, then each next rank within the part above the last one. Each value is
+/// read at once: the next selection reorders that part, its own slot included.
 fn percentiles(values: &mut [u32]) -> [u32; 3] {
-    let ranks = [50, 95, 99].map(|p| (p * values.len()).div_ceil(100) - 1);
-    match values.len() {
-        ..=8 => small_ranks::<1>(values, ranks),
-        ..=32 => small_ranks::<4>(values, ranks),
-        ..=64 => small_ranks::<8>(values, ranks),
-        _ => {
-            let [r50, r95, r99] = ranks;
-            let p50 = *values.select_nth_unstable(r50).1;
-            let p95 = *values[r50..].select_nth_unstable(r95 - r50).1;
-            [p50, p95, *values[r95..].select_nth_unstable(r99 - r95).1]
-        }
+    let [r50, r95, r99] = [50, 95, 99].map(|p| (p * values.len()).div_ceil(100) - 1);
+    // Most groups are small: 91% have 32 values or fewer (28% of the records). There
+    // the standard library's small-input sort beats three selections; 32 was the
+    // best of 16, 32 and 64 (see PERF.md).
+    if values.len() <= 32 {
+        values.sort_unstable();
+        return [r50, r95, r99].map(|r| values[r]);
     }
-}
-
-/// The values at three ranks (0-indexed, in sorted order) of 1 to 8 * V values,
-/// without sorting or a branch on the values. The value at rank r is the largest
-/// value v with at most r values below v: the r + 1 smallest values are not above
-/// the one at rank r, so a larger v has at least r + 1 values below it. The values
-/// sit in V vectors of eight, zeros past the end (never the largest; never counted,
-/// as only the real values are compared against), and one vector compare per value
-/// and vector counts the values below each lane. (Sorting groups of up to 32 values
-/// took twice as long in a microbenchmark on the groups' real sizes.)
-#[inline(always)]
-fn small_ranks<const V: usize>(values: &[u32], ranks: [usize; 3]) -> [u32; 3] {
-    // SAFETY: AVX2 is enabled for this build. Each masked load reads only the
-    // lanes below values.len() - 8k, which are in the slice; the pointer of a
-    // vector past the end is formed with wrapping_add, and nothing is read there.
-    // Any 32 bytes are a valid [u32; 8].
-    unsafe {
-        let lane = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
-        let n = values.len() as i32;
-        let v: [__m256i; V] = std::array::from_fn(|k| {
-            let mask = _mm256_cmpgt_epi32(_mm256_set1_epi32(n - 8 * k as i32), lane);
-            _mm256_maskload_epi32(values.as_ptr().cast::<i32>().wrapping_add(8 * k), mask)
-        });
-        // Unsigned order as signed order: the top bit flipped.
-        let flip = |x| _mm256_xor_si256(x, _mm256_set1_epi32(i32::MIN));
-        let (x, mut below) = (v.map(flip), [_mm256_setzero_si256(); V]);
-        for &value in values {
-            let value = flip(_mm256_set1_epi32(value as i32));
-            for k in 0..V {
-                // A lane above `value` has one more value below it (true is -1).
-                below[k] = _mm256_sub_epi32(below[k], _mm256_cmpgt_epi32(x[k], value));
-            }
-        }
-        ranks.map(|rank| {
-            let rank = _mm256_set1_epi32(rank as i32 + 1);
-            let held = (0..V).map(|k| _mm256_and_si256(_mm256_cmpgt_epi32(rank, below[k]), v[k]));
-            let most = held.reduce(|a, b| _mm256_max_epu32(a, b)).unwrap();
-            std::mem::transmute::<_, [u32; 8]>(most).into_iter().max().unwrap()
-        })
-    }
+    let p50 = *values.select_nth_unstable(r50).1;
+    let p95 = *values[r50..].select_nth_unstable(r95 - r50).1;
+    [p50, p95, *values[r95..].select_nth_unstable(r99 - r95).1]
 }
 
 // SAFETY: these are the C library's own prototypes on x86-64 Linux, where C's int
