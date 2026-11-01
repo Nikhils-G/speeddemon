@@ -70,24 +70,6 @@ fn main() {
     let len @ 1.. = input.metadata().expect("stat the log").len() as usize else {
         return; // the spec's empty input gives an empty summary
     };
-    // PROBE: exit with the host's huge-page settings, only on the full dataset (the
-    // PGO training run on the sample must exit 0). Code = 1 + anon * 24 + shmem * 4 + out,
-    // anon: always 0, madvise 1, never 2; shmem_enabled: always 0, within_size 1,
-    // advise 2, never 3, deny 4, force 5 (6: unreadable); /out's huge= option: none or
-    // never 0, always 1, within_size 2, advise 3.
-    if len > 100_000_000 {
-        let pick = |path: &str, names: &[&str], none: usize| {
-            let text = std::fs::read_to_string(path).unwrap_or_default();
-            names.iter().position(|n| text.contains(&format!("[{n}]"))).unwrap_or(none)
-        };
-        let anon = pick("/sys/kernel/mm/transparent_hugepage/enabled", &["always", "madvise", "never"], 2);
-        let shmem_names = ["always", "within_size", "advise", "never", "deny", "force"];
-        let shmem = pick("/sys/kernel/mm/transparent_hugepage/shmem_enabled", &shmem_names, 6);
-        let mounts = std::fs::read_to_string("/proc/self/mounts").unwrap_or_default();
-        let line = mounts.lines().find(|l| l.split(' ').nth(1) == Some("/out")).unwrap_or("");
-        let out = ["huge=always", "huge=within_size", "huge=advise"].iter().position(|h| line.contains(h)).map_or(0, |i| i + 1);
-        std::process::exit((1 + anon * 24 + shmem * 4 + out) as i32);
-    }
     // The log followed by PAD zero bytes: the whole range is reserved as zero
     // pages, then the file is mapped over its start (the rest of the file's last
     // page reads as zero). The dataset is mounted read-only, so the bytes cannot
