@@ -66,6 +66,13 @@ const WORDS: usize = GROUPS / 64;
 /// regions.csv is entered in this many parts, which threads claim as they start,
 /// so the ones that start first do more of it.
 const REGION_CHUNKS: usize = 64;
+/// PROBE (box A/B in one process). On input > 100 MB the whole parse (runs, pair
+/// filing, dedupe, totals) runs once per entry: a warm-up pass, then ABBA ABBA
+/// between mode 0 and mode 1. The exit code is 100 + (mean mode-0 pass - mean
+/// mode-1 pass) in 0.1 ms units; the output is the last pass's (mode 0, exact).
+const MODES: [usize; 9] = [0, 0, 1, 1, 0, 0, 1, 1, 0];
+/// Region-table index mask per mode: the whole table, or its first 512 KB.
+const MASK: [usize; 2] = [usize::MAX, 0x7FFFF];
 
 /// A group's columns: count, id_sum, amount_sum, amount_min, amount_max,
 /// names_distinct, and name_bytes << 32 | note_bytes (amounts in cents; every
@@ -213,6 +220,10 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
     // The threads' totals, summed as each one finishes (kept one per thread, with
     // the Vec's regrowth: 0.2 MB more), and how many have.
     let finished = Mutex::new((0, [EMPTY; GROUPS]));
+    // PROBE: passes, threads arrived at a pass's start, and (pass start, summed pass time per mode).
+    let passes = if text.len() > 100 << 20 { MODES.len() } else { 1 };
+    let arrived = AtomicUsize::new(0);
+    let clock = Mutex::new((std::time::Instant::now(), [std::time::Duration::ZERO; 2]));
     let worker = &|w: usize| {
         let mut totals = [EMPTY; GROUPS];
         // This thread's tables and pair buffers: made here, so they are in its cache.
@@ -235,6 +246,21 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
         };
         std::iter::from_fn(|| claim(&next_chunk, REGION_CHUNKS)).for_each(&fill);
         wait(&chunks_done, REGION_CHUNKS);
+        for pass in 0..passes {
+        let mode = MODES[pass];
+        // PROBE: from the second pass on, this thread's tables start empty again (no
+        // other thread can take them now: every inbox is empty until the pass starts).
+        if pass > 0 {
+            for (keys, seen) in tables[w].lock().unwrap().iter_mut() {
+                keys.fill(0);
+                seen.clear();
+            }
+            totals = [EMPTY; GROUPS];
+        }
+        if arrived.fetch_add(1, AcqRel) + 1 == (pass + 1) * threads {
+            clock.lock().unwrap().0 = std::time::Instant::now();
+        }
+        wait(&arrived, (pass + 1) * threads);
         // Runs are claimed one at a time, so a thread slowed down parses fewer of
         // them, and no thread waits for another one until the end.
         while let Some(claim) = claim(&next_run, runs) {
@@ -245,7 +271,7 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
             // Each thread finds its own cuts, so their pages fault in in parallel.
             let cut = |run| run_start(text, body_start, run, runs);
             let span = (cut(run), cut(run + 1));
-            parse_run(text, span, &group_of, &mut totals, &mut pairs);
+            parse_run(text, span, &group_of, MASK[mode], &mut totals, &mut pairs);
             // Empty buffers for the next run's pairs, all at once.
             let mut pool = empties.lock().unwrap();
             let n = pool.len().saturating_sub(parts);
@@ -295,7 +321,7 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
         // Once no thread files pairs any more, every thread's tables take their
         // inbox, this thread's first.
         flushed.fetch_add(1, Release);
-        wait(&flushed, threads);
+        wait(&flushed, (pass + 1) * threads);
         for t in std::iter::once(w).chain(0..threads) {
             take(&mut tables[t].lock().unwrap(), t, &mut totals);
         }
@@ -311,8 +337,25 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
         }
         *done += 1;
         if *done == threads {
-            write_output(out_dir, sums, &keys.lock().unwrap());
-            std::process::exit(0);
+            let mut clock = clock.lock().unwrap();
+            let elapsed = clock.0.elapsed();
+            if pass > 0 {
+                clock.1[mode] += elapsed;
+            }
+            if pass + 1 == passes {
+                write_output(out_dir, sums, &keys.lock().unwrap());
+                if passes > 1 {
+                    // Means over the 4 passes of each mode, in 0.1 ms units.
+                    let [a, b] = clock.1.map(|d| d.as_secs_f64() * 1e4 / 4.0);
+                    std::process::exit((100.0 + a - b).round().clamp(1.0, 255.0) as i32);
+                }
+                std::process::exit(0);
+            }
+            // The next pass starts from nothing: every thread is past its runs.
+            next_run.store(0, Relaxed);
+            parsed.iter().for_each(|p| p.store(0, Relaxed));
+            (*done, *sums) = (0, [EMPTY; GROUPS]);
+        }
         }
     };
     thread::scope(|s| {
@@ -439,6 +482,7 @@ fn parse_run(
     text: &[u8],
     (start, end): (usize, usize),
     group_of: &[AtomicU8],
+    mask: usize,
     totals: &mut [Totals; GROUPS],
     pairs: &mut [Vec<u64>],
 ) {
@@ -456,7 +500,7 @@ fn parse_run(
     let mut count = |r: &Record| {
         let &(id, region_id, cents, bytes, hash, _) = r;
         // The stored group + 1, so 0 (not in the table) wraps to `_UNMATCHED`.
-        let k = (region_id as usize).min(group_of.len() - 1);
+        let k = (region_id as usize).min(group_of.len() - 1) & mask; // PROBE: the mask
         // SAFETY: k is below the length (which is at least 2).
         let stored = unsafe { group_of.get_unchecked(k) }.load(Relaxed);
         let group = stored.wrapping_sub(1);
