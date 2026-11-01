@@ -1,9 +1,10 @@
 # Track B: performance log
 
-**Result.** The reference runs 56.35 s at 2,200 MB and S 91. The submitted code (step 70, 883c315,
-S 1099) ran 0.078573 s on the board (run-aecc0a5f3a09, 32.06 MB, 80.27 points): the fastest Track B
-time and the best Track B points; its second run, 0.093372 s, came in a dispatch where B alone ran
-slow. The steps since 57 ran 0.0786 to 0.0923 s in their clean runs,
+**Result.** The reference runs 56.35 s at 2,200 MB and S 91. The submitted code (step 74, 9db18fc,
+S 1147) is step 73 split into modules, with six review items in the setup and the same machine code
+for the scan; its board run is pending. Step 70's run-aecc0a5f3a09 (0.078573 s, 32.06 MB, S 1099,
+80.27 points) is the fastest Track B time and the best Track B points; step 71, the same code with
+review comments, ran 0.078623 s (80.26 points). The steps since 57 ran 0.0786 to 0.0923 s in their clean runs,
 step 66's unexplained 0.094116 s aside. Three ideas carry it: no
 index at all, every query answered during one parallel scan, so nothing grows with the corpus
 (step 6); a perfect hash that gives each token one probe, built per input on every thread (steps
@@ -11,8 +12,8 @@ index at all, every query answered during one parallel scan, so nothing grows wi
 evaluated once per 256 documents (steps 8 and 49-52). The last steps added a persistent pool of
 threads, whose waiting workers also map the corpus in, a 4-byte first-id log made exact for any
 line lengths, checks for inputs the generator never writes, and the triggered BOOL entries
-evaluated 8 at a time (step 66), and less setup work and a better plan (steps 67 to 70), for 57
-lines more than step 59.
+evaluated 8 at a time (step 66), less setup work and a better plan (steps 67 to 73), and the code
+split into modules (step 74), for 105 lines more than step 59.
 Every run ID below is in the board's history for team SALAAR. A run with "probe" in place of T, or
 a failed run in the probe tables, is a timing build that reports through its exit code.
 
@@ -114,7 +115,11 @@ Before pushing, steps were timed in three ways ("How we measured", near the end)
 | 67 | 1e8c3f0 | b-stack-16: less setup work per term (the truth tables in one pass, the cover cost kept as it goes, no key copies when the lines are split, a counting sort in `dedup_keys`), and malloc's mmap threshold fixed at 1 MB (replica, four A/Bs with two builds a side: mean −1.37 ms; its run in a slow dispatch) | run-a91e7b8576ba | 0.101006 | 32.24 | 1087 | 77.57 |
 | 68 | 83a938d (later runs from 2b59127, 695cd44) | b-stack-17: the tail's page releases moved into one parallel round after the formatting, where the threads wait, and the `always` entries sorted by length, operators and first row, so consecutive entries read neighbouring rows (replica −0.793 and −1.037 ms, 29 and 30 of 31; first and third runs DISTURBED). Its second run had the best Track B points until step 70 | run-62b9b6e108c7, run-fc0b5c2ebe3e, run-c2b88acd45c9 | 0.103242, 0.079675, 0.100641 | 32.68, 31.67, 31.99 | 1096 | 77.31, 80.12, 77.59 |
 | 69 | fc30062 (second run from 5719822) | b-stack-18: half-size intermediates when the plan is built (an entry keeps its cover term in its eighth word), so the plan's serial grouping reads half the bytes (replica −0.528 and −0.634 ms, 26 and 28 of 31). Its second run was the fastest Track B time until step 70 | run-7884f8311d08, run-65df9250e334 | 0.081637, 0.07961 | 32.49, 32.72 | 1099 | 79.85, 80.12 |
-| 70 | 883c315 (second run from a09d036) | b-stack-19: the plan's sample 2.5 MB instead of 1 MB, for better document-frequency estimates, its documents' terms deduplicated by stamps instead of a sort (replica −0.813 and −0.641 ms, 27 and 29 of 31; about −1 ms on holdout 99 and fresh seed 109). **The submitted code**; its first run is the best Track B run, the second came with B alone slow | run-aecc0a5f3a09, run-eb533f034fdc | 0.078573, 0.093372 | 32.06, 31.82 | 1099 | 80.27, 78.39 |
+| 70 | 883c315 (second run from a09d036) | b-stack-19: the plan's sample 2.5 MB instead of 1 MB, for better document-frequency estimates, its documents' terms deduplicated by stamps instead of a sort (replica −0.813 and −0.641 ms, 27 and 29 of 31; about −1 ms on holdout 99 and fresh seed 109). Its first run is the best Track B run, the second came with B alone slow | run-aecc0a5f3a09, run-eb533f034fdc | 0.078573, 0.093372 | 32.06, 31.82 | 1099 | 80.27, 78.39 |
+| 71 | 79fb02b | b-stack-20: review comments only (`trigger`'s SAFETY bounds, `DocEntry`'s layout, `par` under `panic = "abort"`, the module doc, `split_lines`); the token stream is step 70's | run-2a3e7f333147 | 0.078623 | 32.1 | 1099 | 80.26 |
+| 72 | 4134ca1 (run from 14aa7c9) | b-stack-21: the eight padding entries placed by the plan's grouping as one more part, instead of an `extend` that reallocated and copied the 1 MB entries array on the main thread (0.76 → 0.20 ms); the 7+-term BOOL assert moved into `cover`, the first function every BOOL line reaches (replica −0.610 and −0.754 ms, 26 and 28 of 31; its run in a slow window) | run-5e1129bac322 | 0.080472 | 32.49 | 1101 | 80.00 |
+| 73 | f37f273 | b-stack-22: `look_up` keeps the document's anchor positions without a branch, as it does the trigger terms', and the anchor prefetch goes (replica −0.455 and −0.118 ms, 26 and 18 of 31; branch misses −11.8%; its run: B alone slow) | run-8640ff23f7c7 | 0.095266 | 32.38 | 1101 | 78.17 |
+| 74 | 9db18fc | bj-2: the code split into modules (`pool`, `vocab`, `plan`, `scan`; `main.rs` keeps `main`, the slicing and the formatting) and six review items in the setup: the plan's records built by a function returning a named struct (`records`, `Records`), the hash's bucket placement as `place_regions` with bounds-checked stores, a compile-time check of `DocEntry`'s layout, the queries check once after `Plan::new`, the slice check on the slice's own ids, and `place` in plain statements (the scan's functions identical by objdump; replica −0.071 and +0.121 ms, +0.179 ms on holdout 99, against an A/A of +0.033: equal). **The submitted code**; its board run is pending | | | | 1147 | |
 
 **Code-quality pass (5a0612d, step 47; also pushed as 7f08fe7 and 045a6b5), on the box:**
 run-5892b2f7eb00 0.144406 s (a slow dispatch), run-eb924b66b4aa 0.115198 s (runs.log 09:47Z) and
@@ -124,7 +129,34 @@ offsets as step 44's in local PGO, local plain and test-server PGO builds (objdu
 and two PGO builds of each time the same on the test server (medians of 31 interleaved rounds of
 11 runs: 80.90 and 81.02 ms for step 44, 81.05 and 80.89 for the quality pass).
 
-**The submitted code is step 70 (b-stack-19, 883c315), S 1099**: step 69 with a larger sample for
+**The submitted code is step 74 (bj-2, 9db18fc), S 1147**: step 70 with three code steps and one
+of structure, each measured on the replica (ab.sh, 31 pairs, two PGO builds a side).
+- *Step 71 (b-stack-20).* Review comments only; the token stream is step 70's. Board 0.078623 s
+  (run-2a3e7f333147, 80.26 points).
+- *Step 72 (b-stack-21).* The eight padding entries go in through the plan's grouping, as one more
+  part no trigger term reads, instead of an `extend` that reallocated and copied the 1 MB entries
+  array on the main thread (0.76 → 0.20 ms); and the assert for a BOOL query of over 6 terms moved
+  into `cover`, the first function every BOOL line reaches (a 7-term OR used to overrun `cover`'s
+  array first). −0.610 and −0.754 ms. S 1099 → 1101.
+- *Step 73 (b-stack-22).* `look_up` writes every token's position and keeps the anchors' without a
+  branch, as it already did for the trigger terms; the anchor prefetch, which measured no gain, is
+  gone. −0.455 and −0.118 ms; branch misses −11.8%.
+- *Step 74 (bj-2).* The code split into modules: `pool.rs` (`par`, the workers, `wait`, `ahead`),
+  `vocab.rs` (the query split and the perfect hash), `plan.rs` (the plan's entries, `classify`,
+  `cover`, `csr`), `scan.rs` (the scan and the answer states), and `main.rs` (`main`, the slices,
+  the results and their formatting). Items moved with their text and comments; a sorted line-by-line
+  check against the single file finds only the module docs and the `mod`/`use` lines added. With it,
+  six review items in the setup: the plan's records built by a function returning a named struct
+  (`records`, `Records`, instead of a 3-tuple read back as `.0`/`.1`/`.2`); the hash's bucket
+  placement as `place_regions`, whose writes are bounds-checked stores into the thread's own
+  regions; a compile-time check of `DocEntry`'s layout (32 bytes, the truth table at word 5), the
+  one `trigger`'s gathers rely on; the check for at most 2^16 queries once, after `Plan::new`; the
+  slice check on the slice's own ids; and `place` in three plain statements. The scan's functions
+  (`Scan::run`, `look_up`, `end_doc`, `end_super`, `long_run`, `Scan::new`, `masks`) are identical
+  by objdump, and every function's size is the same. Replica −0.071 and +0.121 ms, +0.179 ms on
+  holdout 99, against an A/A of +0.033: equal. S 1101 → 1147. Its board run is pending.
+
+**Step 70 (b-stack-19, 883c315), S 1099**: step 69 with a larger sample for
 the plan, 2.5 MB instead of 1 MB, whose documents' terms are deduplicated by stamps instead of a
 sort. Replica, two PGO builds a side: −0.813 and −0.641 ms (27 and 29 of 31) against step 69; on
 seed 1 −0.794 and −1.001, on holdout 99 −1.012 and −0.989, on fresh seed 109 −1.036 and −1.078 ms.
@@ -601,6 +633,10 @@ step 24 ran without the disturbance.
   2.5 MB sample instead of 1 MB gives better estimates, and deduplicating each sampled document's
   terms by stamps, as the scan does, instead of sorting them, pays for the larger sample. Replica
   −0.813 and −0.641 ms, and about −1 ms on holdout 99 and fresh seed 109. S unchanged.
+- **Steps 71 to 74: smaller setup steps, then the structure.** Two setup costs were left on the main
+  thread's path: a 1 MB copy for the padding entries (step 72) and a branch per token for the
+  anchors (step 73); together about −1 ms. Step 74 then split the file into modules and took six
+  review items, with the scan's machine code unchanged by objdump. S 1099 → 1147.
 
 
 ## Box probes since step 47
@@ -967,7 +1003,8 @@ terms (the second corpus also with repeats, upper case and 1% empty documents). 
 26,029 ranges, every one of over 8 entries (122 and 83 on average), and up to 3,836 entries in one
 document, the same at 1, 3 and 8 threads. Steps 67 to 70 passed the same gate (the 144 runs and
 the 66 hand-made edge runs), with `vpinsrb` at 0; memory, max of 10 runs, 31.53, 31.85, 32.73 and
-31.69 MB.
+31.69 MB. Steps 72 to 74 passed it too (31.81 and 32.07 MB; step 74, max of 5, 31.75 MB); step 71
+changes comments only.
 
 **Robustness runs** (replica, Sun 1 Nov about 17:00 UTC), on the exact Dockerfile build, with data
 generated on the replica by the organisers' generator (it reproduces the official sample seed 1
@@ -1001,7 +1038,8 @@ dispatches, so:
   s, showed their replica gains only in their best runs; steps 57 to 65 ran 0.085425 to 0.092338
   s in twenty clean runs, step 66 0.082048 and 0.082597 s (its second run, 0.094116 s, is
   unexplained: Track A ran slow in all three of its dispatches), steps 68 and 69 0.079675,
-  0.081637 and 0.07961 s, and the submitted step 70 0.078573 s.
+  0.081637 and 0.07961 s, step 70 0.078573 s, steps 71 and 72 0.078623 and
+  0.080472 s, and step 73 0.095266 s with B alone slow; the submitted step 74's run is pending.
 - **Alternating dispatches**, before the replica: candidates pushed in turn, minutes apart, against
   the code they would replace, and a result had to repeat (steps 41 to 44: 0.12433 for the
   sort-free first ids, 0.114997 back on the sort, 0.112506 sort-free again; steps 45, 46b and 47

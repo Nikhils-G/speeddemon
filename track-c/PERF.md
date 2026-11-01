@@ -1,8 +1,9 @@
 # Track C: performance log
 
 **Result.** The reference runs 14.44 s at 367 MB and S 108. The submitted code (step 58, b8b733a,
-S 487) runs 0.0171 to 0.0174 s on the board in its normal runs (run-605bf7359da0, 0.017134 s,
-10.16 MB, 83.82 points; run-8f3d7064f29b, 0.01729 s; run-819427baa4d8, 0.017376 s), and step 57,
+S 487) runs 0.0171 to 0.0174 s on the board in its normal runs (run-aa635b7c5107, 0.017108 s,
+10.68 MB, 83.62 points; run-00bcea1e0afe, 0.017356 s, 9.66 MB, 83.90 points, its best points), and
+step 57,
 the same hot code, 0.0170 to 0.0173 s in its normal runs (run-c56b067ab64d, 0.016978 s, 10.74 MB, 83.71
 points; run-9ac7e3c0222d, 0.017339 s). Three ideas carry it: a simdjson-style parse that never reads a field's bytes
 twice (steps 6-15), cuts and a record path that trust spec 2.2 behind tripwires (step 25), and a
@@ -101,7 +102,7 @@ their own, or their run is not in the log; their numbers are left out rather tha
 | 55 | 2f05cec (second run from 854810e) | c-20: a last record without a terminator, which 2.1 allows, read like any other, with the reference's output; the top comment says exactly what is answered and how (replica +0.33% and −0.10% in two builds: build noise; both runs: C alone slow) | run-d4f9240d849b, run-a968d9c22097 | 0.020511, 0.020647 | 10.06, 10.15 | 471 | 82.02, 81.91 |
 | 56 | ffb2e77 | c-21: after the region wait, a thread that finds another of ours on its CPU moves to the lowest free CPU of its affinity mask (replica −0.39%, 115 of 201; runs over 19.5 ms 9 → 2 and 12 → 6 in two sets of 300 pairs) | run-2fae75090a37 | 0.017003 | 10.38 | 483 | 83.84 |
 | 57 | aa1fe77 (later runs from 5216711, outside the queue, and 97b4897) | c-22: a failed CPU lookup, mask read or move leaves the thread where it is, with nothing asserted (replica +0.16%, 87 of 201: the same speed) | run-9ac7e3c0222d, run-fbcbe364dd0f, run-c56b067ab64d | 0.017339, 0.017057, 0.016978 | 10.31, 10.49, 10.74 | 483 | 83.66, 83.76, 83.71 |
-| 58 | b8b733a (later runs from 3bd65f7, fabe12e, c36861d and 8a293ff) | c-23: the CPU move as a named function (`move_off_shared_cpu`), `mmap` errors that name their cause, `fill` indexing the codes by `(a * 26 + b) * 26 + c`, review comments; the hot code compiles as step 57's (replica −0.11%, 106 of 201; mem.sh, 20 runs, max 10.50 MB). **The submitted code** | run-819427baa4d8, run-42f5d2e69825, run-a9d75c6b2bc1, run-605bf7359da0, run-8f3d7064f29b | 0.017376, 0.020187, 0.018676, 0.017134, 0.01729 | 10.17, 10.92, 10.57, 10.16, 10.29 | 487 | 83.67, 81.73, 82.72, 83.82, 83.67 |
+| 58 | b8b733a (later runs from 3bd65f7, fabe12e, c36861d, 8a293ff, 1e8c3f0, 83a938d, 15388b9, 2b59127, 695cd44, fc30062, 5719822, 883c315, a09d036, 79fb02b, 14aa7c9 and f37f273) | c-23: the CPU move as a named function (`move_off_shared_cpu`), `mmap` errors that name their cause, `fill` indexing the codes by `(a * 26 + b) * 26 + c`, review comments; the hot code compiles as step 57's (replica −0.11%, 106 of 201; mem.sh, 20 runs, max 10.50 MB). **The submitted code** | run-819427baa4d8, run-42f5d2e69825, run-a9d75c6b2bc1, run-605bf7359da0, run-8f3d7064f29b, run-c4b25673c64c, run-bdf126f964ad, run-d7bde7d8656d, run-3d113c993f70, run-dcba3fca36e7, run-b0e267d13ac4, run-f21da2b280f6, run-86571ea432fe, run-aa635b7c5107, run-00bcea1e0afe, run-978986226ae1, run-2549978efa4d | 0.017376, 0.020187, 0.018676, 0.017134, 0.01729, 0.017168, 0.020852, 0.017429, 0.017209, 0.028048, 0.017415, 0.017247, 0.017289, 0.017108, 0.017356, 0.017421, 0.017285 | 10.17, 10.92, 10.57, 10.16, 10.29, 10.24, 10.21, 10.89, 10.54, 10.73, 10.25, 10.67, 10.29, 10.68, 9.66, 10.45, 10.4 | 487 | 83.67, 81.73, 82.72, 83.82, 83.67, 83.77, 81.67, 83.34, 83.61, 78.23, 83.61, 83.54, 83.67, 83.62, 83.90, 83.52, 83.63 |
 
 Two more runs of step 32's code were in a DISTURBED and a SLOW BOX dispatch: run-87e294d71310
 (0.022429 s) and run-dc9ee4598ca3 (0.021796 s, 11.28 MB).
@@ -121,9 +122,10 @@ comment keeps the why, with its measurements in this file (steps 47-48). Against
 `add`, `walk_record`, `write_output`, `run` and `main` compile to the same instructions, and
 `parse_run` to the same 920 but for the usual 4-line block swap between PGO builds. Replica −0.11%
 (106 of 201 pairs); the gate passed, and fresh full seeds 101-105 gave the reference's output as
-root and as uid 65534; mem.sh, 20 runs, max 10.50 MB (step 57: 10.43). Board: run-605bf7359da0,
-0.017134 s, 10.16 MB, 83.82 points; run-8f3d7064f29b, 0.01729 s; run-819427baa4d8, 0.017376 s; and
-0.018676 and 0.020187 s in two slower dispatches.
+root and as uid 65534; mem.sh, 20 runs, max 10.50 MB (step 57: 10.43). Board: 17 runs, 13 of them
+0.017108 to 0.017429 s (run-aa635b7c5107, 0.017108 s, 10.68 MB, 83.62 points; run-00bcea1e0afe,
+0.017356 s, 9.66 MB, 83.90 points, its best points), and 0.018676, 0.020187, 0.020852 and 0.028048 s
+in slower dispatches, the last two DISTURBED.
 
 **Step 57 (c-22, aa1fe77), S 483**: step 55 with step 56's move off a shared
 CPU, and step 57's handling of a failed CPU call (the thread stays where it is). Replica: step 56
@@ -890,7 +892,8 @@ Step 39 also checked `objdump | grep -c vpinsrb` = 0.
   0.018023 s, step 48's two clean runs 0.01758 and 0.017572 s, step 49 ran 0.017192 to 0.018128 s
   in six clean runs, step 51 0.017095 to 0.017418 s in four, step 52 0.017135 to 0.017364 s in three clean runs, step 54 0.017101 to
   0.019528 s in three clean runs, step 55 0.020511 and 0.020647 s, with C alone slow both
-  times, step 57 0.016978 to 0.017339 s (step 56: 0.017003 s), and the submitted step 58 0.017134 to 0.017376 s in three runs, and 0.018676 and 0.020187 s;
+  times, step 57 0.016978 to 0.017339 s (step 56: 0.017003 s), and the submitted step 58 0.017108 to 0.017429 s in thirteen runs, and 0.018676, 0.020187, 0.020852
+  and 0.028048 s;
   run-46d6bf16c5bd
   (84.30 points) is the best Track C run.
 - **Points** are the board's; M counts on this track, so no point value is computed here.

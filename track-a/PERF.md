@@ -2,8 +2,9 @@
 
 **Result.** The reference runs 32.05 s at 228 MB and S 56. The submitted code (step 66, a09d036,
 S 455) is step 63 with the worker defined once, named structs for the parts, run starts and runs,
-and a lines pass in `main`, each measured at the same speed on the replica; its first board run
-took 0.016216 s (run-b46ef564c46b, 18.35 MB, 86.51 points). Step 64, the same engine, has the best Track A run, run-1bda764d4b1e (0.016043 s, 18.67
+and a lines pass in `main`, each measured at the same speed on the replica; its board runs took
+0.016158 s (run-ee262fe95b70, 18.21 MB, 86.59 points) and 0.016216 s, and 0.020944 and 0.02058 s in
+A's slow windows. Step 64, the same engine, has the best Track A run, run-1bda764d4b1e (0.016043 s, 18.67
 MB, S 442, 86.65 points), and step 63 the fastest Track A time, run-219d1a5f89d0 (0.016017 s,
 86.64 points). Six of the twelve board runs of steps 61 to 65 took 0.018 s or more, two of them in
 DISTURBED dispatches, against four of the fifteen of steps 59 and 60. Three
@@ -116,7 +117,7 @@ numbers are left out rather than guessed.
 | 63 | 8a293ff (later runs from 1e8c3f0, 83a938d, 15388b9 and 2b59127) | The main thread is the 12th worker and the last one done with pass 1 merges, so no 13th thread shares the 12 CPUs (the change alone, 300 interleaved runs: runs over +8% 21-43 → 6-10, median −0.9%); every latency of 7 or more digits escapes; one loop runs both slices (replica −1.07% against step 62, 144 of 201 pairs) | run-df6e626d67b9, run-5f20ef221ffb, run-424d169e8d52, run-285034434470, run-219d1a5f89d0 | 0.019571, 0.01964, 0.022344, 0.016107, 0.016017 | 19.18, 18.68, 18.79, 18.55, 18.68 | 445 | 84.35, 84.43, 83.00, 86.61, 86.64 |
 | 64 | 695cd44 (second run from fc30062) | The worker defined once in `main`: threads − 1 are spawned and this thread runs the last one, with the worker's machine code unchanged (first run DISTURBED). Its second run has the best Track A points | run-a1a3f0c0e9f5, run-1bda764d4b1e | 0.019162, 0.016043 | 18.34, 18.67 | 442 | 84.80, 86.65 |
 | 65 | 5719822 (second run from 883c315) | Named structs for the tuple data model (`Part`, `Start`, `Run`): `Part` is `repr(C)`, runs are copied at the loop head and parts built by a small closure, each choice kept for a measured code-generation reason; and 14 review comment fixes (the same code lines as the structs alone; replica equal) | run-1531e5c2ac59, run-aeb5c0425a96 | 0.016109, 0.016208 | 18.49, 18.15 | 462 | 86.50, 86.52 |
-| 66 | a09d036 | A lines pass in `main`: the six shared counters as one array, the room per thread inline, the hour key in one line, `counts` zeroed as each group is taken instead of a 16 KB fill per hour, the scope returning the total (replica −0.04, +0.29, −0.01 and +0.03% over four pairings: equal). **The submitted code** | run-b46ef564c46b | 0.016216 | 18.35 | 455 | 86.51 |
+| 66 | a09d036 (later runs from 79fb02b, 14aa7c9 and f37f273) | A lines pass in `main`: the six shared counters as one array, the room per thread inline, the hour key in one line, `counts` zeroed as each group is taken instead of a 16 KB fill per hour, the scope returning the total (replica −0.04, +0.29, −0.01 and +0.03% over four pairings: equal). **The submitted code** | run-b46ef564c46b, run-ce29fb96c3ac, run-64335e22618d, run-ee262fe95b70 | 0.016216, 0.020944, 0.02058, 0.016158 | 18.35, 18.65, —, 18.21 | 455 | 86.51, 83.67, —, 86.59 |
 
 **The submitted code is step 66 (a-20, a09d036), S 455**: step 63 with three changes that keep its
 speed (replica, PGO, 201 pairs, two builds a side).
@@ -137,7 +138,8 @@ speed (replica, PGO, 201 pairs, two builds a side).
   peaks over 40 rounds, 18.49 and 18.37 MB (two builds) against 18.38. S 462 → 455.
 - *Board.* Step 64 ran 0.016043 s (run-1bda764d4b1e, 18.67 MB, 86.65 points), the best Track A
   points, and 0.019162 s in a DISTURBED dispatch (C's unchanged code ran 0.028048 s); step 65
-  0.016109 and 0.016208 s (run-aeb5c0425a96, 18.15 MB, 86.52 points). Step 66 ran 0.016216 s (run-b46ef564c46b, 18.35 MB, 86.51 points).
+  0.016109 and 0.016208 s (run-aeb5c0425a96, 18.15 MB, 86.52 points). Step 66 ran 0.016158 s (run-ee262fe95b70, 18.21 MB, 86.59 points) and 0.016216 s, and 0.020944 s
+  with B and C normal and 0.02058 s.
 
 **Step 63 (a-17, 8a293ff), S 445**: step 60 with three changes, each
 measured on the replica (ab.sh, 201 pairs unless noted).
@@ -177,6 +179,20 @@ measured on the replica (ab.sh, 201 pairs unless noted).
   12-19, at most two builds at a time), while runs go strictly one at a time (the organisers'
   board README): those builds share the memory and the L3. The final scoring has the box to itself
   (the organisers' FINAL_SCORING.md).
+
+**Where a slow run loses its time** (replica, builds frozen). A probe build of step 66 exits with
+the time from `main`'s start until every part is parsed; 150 runs on full seed 1 at 12 CPUs, each
+timed exec to exit by the board's timer:
+
+| Runs | Exec to exit | Parse end | Pass 2 and exit |
+|---|---|---|---|
+| 147 normal | median 16.88 ms | median 10.2 ms | median 6.67 ms |
+| 3 slow (over 1.08× the median) | 18.75, 18.99, 20.47 ms | 11.9, 12.2, 13.5 ms | 6.85, 6.79, 6.97 ms |
+
+The slow runs are slow parses, the part whose floor is memory-bound (step 47); pass 2 stays within
+0.3 ms of normal. That fits the contention hypothesis above, though it does not prove it: on the
+board, A ran slow with B and C normal twice (step 63's 0.019571 s and step 66's 0.020944 s), and its
+other slow runs came while B was slow too.
 
 **Step 60 (a-15, 3aa95c6), S 449**: step 59 with the source rustfmt-clean
 and named patterns for the hour key and the part, the same at run time (replica: +0.52%, −0.18%,
@@ -955,7 +971,7 @@ The gate is a shell script kept outside the repo (scc would count it as code): f
   three runs, 0.01795 s and 0.021609 s, step 60 0.016292 to 0.019578 s in ten runs, step 63 0.016017
   s (run-219d1a5f89d0, 86.64 points) and 0.016107 s, and 0.019571 to 0.022344 s in three slower
   runs, step 64 0.016043 s (run-1bda764d4b1e, 86.65 points, the best Track A points) and 0.019162
-  s, step 65 0.016109 and 0.016208 s, and the submitted step 66 0.016216 s.
+  s, step 65 0.016109 and 0.016208 s, and the submitted step 66 0.016158 and 0.016216 s, and 0.020944 and 0.02058 s.
 - **Alternating dispatches**, before the replica: a candidate and the code it would replace were
   pushed in turn, a few minutes apart, so both met the same box state, and a result counted only
   if it repeated. Example (runs.log 08:10Z): step 37, step 39, step 37, step 39, step 37 gave

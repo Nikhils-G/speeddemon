@@ -22,8 +22,8 @@ percentiles need every latency of a group, not a running summary.
 
 The reference runs 32.05 s at 228 MB and S 56. The submitted code (PERF.md step 66, a09d036, S
 455) is step 63's engine with the worker defined once, named structs and a lines pass in `main`, at
-the same speed on the replica; its first board run took 0.016216 s (run-b46ef564c46b, 18.35 MB,
-86.51 points). Step 64, the same engine, has the best
+the same speed on the replica; its board runs took 0.016158 s (run-ee262fe95b70, 18.21 MB,
+86.59 points) and 0.016216 s, and 0.020944 and 0.02058 s in A's slow windows. Step 64, the same engine, has the best
 Track A run (run-1bda764d4b1e, 0.016043 s, 18.67 MB, 86.65 points), and step 63 the fastest Track
 A time (run-219d1a5f89d0, 0.016017 s, 86.64 points). Step 60 ran 0.0163 to 0.0172 s in its normal runs (run-252c6a84434b, 0.016292 s, 19.61 MB,
 86.22 points; run-4f8350fdbe1a, 0.016341 s, 86.32 points) (details: PERF.md, steps 51-66). On the replica of

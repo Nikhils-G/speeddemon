@@ -20,8 +20,9 @@ and CRLF and LF terminators mixed. Distinct names must be counted per country ov
 ## Where the time goes on the box
 
 The reference runs 14.44 s at 367 MB and S 108. The submitted code (PERF.md step 58, b8b733a,
-S 487) runs 0.0171 to 0.0174 s on the board in its normal runs (run-605bf7359da0, 0.017134 s,
-10.16 MB, 83.82 points; run-8f3d7064f29b, 0.01729 s; run-819427baa4d8, 0.017376 s), and step 57,
+S 487) runs 0.0171 to 0.0174 s on the board in its normal runs (run-aa635b7c5107, 0.017108 s,
+10.68 MB, 83.62 points; run-00bcea1e0afe, 0.017356 s, 9.66 MB, 83.90 points, its best points), and
+step 57,
 the same hot code, 0.0170 to 0.0173 s in its normal runs (run-c56b067ab64d, 0.016978 s, 10.74 MB, 83.71
 points; run-9ac7e3c0222d, 0.017339 s) (details: PERF.md, steps 49-58).
 

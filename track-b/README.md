@@ -56,11 +56,12 @@ PERF.md, "Where the scan's time goes"):
 
 37% of the tokens are of no row term and go to one sink row, whose word every such token ORs.
 
-The reference runs 56.35 s at 2,200 MB and S 91. The submitted code (PERF.md step 70, 883c315,
-S 1099) ran 0.078573 s on the board (run-aecc0a5f3a09, 32.06 MB, 80.27 points): the fastest Track B
-time and the best Track B points; its second run, 0.093372 s, came with B alone slow. On the replica step 66 runs in about 81.0 ms and steps 67 to 70
+The reference runs 56.35 s at 2,200 MB and S 91. The submitted code (PERF.md step 74, 9db18fc,
+S 1147) is step 73 split into modules, with the scan's machine code unchanged; its board run is
+pending. Step 70's run-aecc0a5f3a09 (0.078573 s, 32.06 MB, S 1099, 80.27 points) is the fastest
+Track B time and the best Track B points. On the replica step 66 runs in about 81.0 ms and steps 67 to 70
 about 3.6 ms less, against 83.7 ms for step 65, 90.6 ms for step 53 and 97.2 ms for step 49
-(details: PERF.md, steps 52-70).
+(details: PERF.md, steps 52-74).
 
 ## The design
 
@@ -258,12 +259,17 @@ names the cost it attacks, what the code does, and why the output stays the same
 
 ### Index
 
-One line per technique: what, where in `src/main.rs`, and why the output stays exact. The table
-above groups them by bottleneck.
+One line per technique: what, where in the code, and why the output stays exact. The table above
+groups them by bottleneck. The code is in five modules: `main.rs` (`main`, the slices, the results
+and their formatting), `pool.rs` (`par`, the workers, `wait`, `ahead`), `vocab.rs` (the query split
+and the perfect hash: `split_lines`, `Vocab`, `Phf`, `place_regions`, `hash`, `probe`), `plan.rs`
+(`Plan`, `DocEntry`, `records`, `classify`, `cover`, `csr`) and `scan.rs` (`Scan` with `look_up`,
+`end_doc`, `trigger` and `end_super`, `Answers`, `count_positions`), with the system calls in
+`mmap.rs`.
 
 1. No index: queries read first, all answered in one scan (`main`). Exact: every query is evaluated on every document that can match it.
 2. Memory-mapped files with a 256-byte zero pad (`mmap::map`): full-width loads at any offset. Exact: zero is a separator, never a token byte.
-3. Transparent huge pages off (`mmap::no_huge_pages`): a stable memory peak. Exact: no effect on the bytes.
+3. Transparent huge pages off and malloc's mmap threshold fixed at 1 MB (`mmap::set_up_memory`): a stable memory peak. Exact: no effect on the bytes.
 4. Slices of whole lines, one per thread (`slices`, `line_after`). Exact: every cut follows an LF, so each document is in one slice, and each slice's last id must meet the next slice's first.
 5. Query lines split in parallel into pre-sized 8- and 16-byte records (`split_lines`). Exact: each key is reloaded from its own bytes.
 6. Operator from the low two bits of its first byte (`A`, `N`, `O`; `split_lines`). Exact: the grammar has only these three words.
@@ -470,9 +476,8 @@ Errors are panics with a message, and the build aborts on panic, so the exit sta
 - a slice whose last id does not meet the next slice's first;
 - more than 2^16 queries (the 4-byte first-id log's limit; the spec's inputs have 50,000);
 - a phrase of over 8 terms (the spec's have 2 to 8);
-- a BOOL query of over 6 terms (the spec's have 1 to 6): one whose cover reaches 7 terms (7
-  distinct terms joined by OR, for example) stops on an array bound in `cover`, any other on an
-  assert;
+- a BOOL query of over 6 terms (the spec's have 1 to 6), checked by an assert at the start of
+  `cover`, the first function every BOOL line reaches;
 - a second call to `par` while one runs (the program calls it from the main thread only).
 
 A line that starts with a separator byte (an empty id, for example) has no id token: its text
