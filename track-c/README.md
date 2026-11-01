@@ -26,22 +26,42 @@ a record start.
 compares give a bitmap of `"` and one of `,`; a carry-less multiply of the quote bits by all ones
 gives, for every byte, whether it is inside quotes (`masks()` returns all three bitmaps), and what is left of the comma bitmap are exactly
 the field separators. Counting quote bits between separators gives each text field's unescaped
-length (`""` is one byte) without looking at its bytes. One 32-byte compare finds the region's comma
-and the amount's dot, and one AVX2 pass converts the three numbers. About 10% of records need a
-second 64-byte window for the note, still on the fast path. A record whose name or note runs past
+length (`""` is one byte) without looking at its bytes. One 32-byte load of the tail
+(`region_id,amount`) gives, by three compares, the region's comma, the amount's dot and its minus
+sign (a bit of the `-` bitmap, so no byte load waits on the comma), and one AVX2 pass converts the
+three numbers. About 10% of records need a second 64-byte window for the note, still on the fast
+path. A record whose name or note runs past
 both windows, and the last records of the file, go through a short walker: one `field()` scan
 reads each of the five fields (quoted or not), and a digit fold gives the numbers, an amount's
 digits without its sign and dot being its cents. Each run is parsed as two halves at
 once, so that two records' region-table loads are in flight together.
 
-**Distinct names per country.** A name is identified by a hash of its raw bytes between the quotes:
-inside quotes `""` maps one to one to the unescaped value, and the empty name is empty whether it
-is quoted or not, so equal values have equal raw bytes. The hash has 56 bits: the chance that two of
-the generator's 100,000 names share one is about 7e-8. Parsing files a (hash, country) pair under
-one of 4 partitions per thread, chosen by the hash. After each run it parses, a thread hands its
-buffers of pairs to their owners' inboxes, moving them rather than copying. Its own 4 tables then
-take what waits in its inbox. A table holds a bit per country for each name, and a thread's tables
-stay in its cache. No two threads ever write the same table, so the hot path has no atomics.
+**Distinct names per country.** A name is identified by its raw bytes between the quotes: inside
+quotes `""` maps one to one to the unescaped value, and the empty name is empty whether it is quoted
+or not, so equal values have equal raw bytes. `hash_words` hashes them 32 bytes at a time without a
+branch on the length. Each block is loaded whole and ANDed with 32 bytes taken from a sliding
+window into `KEEP` (32 bytes of ones, then 32 of zeros), so that bytes past the name count as
+zeros. The block then goes through three AES rounds: the state starts as the name's length, the
+first 16 bytes are XORed into it and the next 16 are the first round's key, so every output byte
+depends on every input byte. Names over 32 bytes, which are rare, loop over further blocks. The
+walker hashes a copy of the name followed by 32 zero bytes, so that its loads stay in bounds;
+since the mask zeroes everything past the name anyway, both paths give the same name the same
+hash. A `compile_error!` stops any build without AES, as for AVX2 and PCLMULQDQ.
+
+Parsing files a pair (the hash's top 56 bits, and the country's group in the low byte) under one
+of 4 partitions per thread, chosen by the hash's top 32 bits. A partition's table key holds the
+hash's top 40 bits, the name's row of group bits in bits 8..24 and `0xFF` in the low byte (so a key
+is never 0, the empty slot). A lookup starts at the bucket picked by hash bits 8 and up, compares
+the 40 bits of 4 slots at once and reads the row from the key it hit, with no second load. Two
+names are confused only if they share those 40 bits and their bucket bits: 50 bits at 12 threads
+(4096-slot tables), 54 on one thread. The partition adds nothing, since it is picked from bits
+that are compared anyway. With the generator's 100,000 names, the chance that any two of them are
+confused is about 4e-6 per dataset at 12 threads (3e-7 on one thread). Before step 29 the tables
+compared all 56 bits and kept the rows in a separate array: about 7e-8.
+
+After each run it parses, a thread hands its buffers of pairs to their owners' inboxes, moving
+them rather than copying. Its own 4 tables then take what waits in its inbox. A table's row holds
+a bit per country for each name, and a thread's tables stay in its cache. No two threads ever write the same table, so the hot path has no atomics.
 
 **No waiting for a slow thread.** The file is cut into 32 runs per thread, which threads claim
 one at a time. A thread that loses its core to another process parses fewer runs, and its pairs
@@ -75,6 +95,8 @@ removed (PERF.md, step 25).
 ## Dependencies
 
 None: the Rust standard library only, with `mmap`, `madvise`, `mallopt` and `prctl` declared by hand.
+The build needs AVX2, PCLMULQDQ and AES (the Dockerfile builds with `target-cpu=native`); without
+them a `compile_error!` stops it.
 
 ## With another 24 hours
 

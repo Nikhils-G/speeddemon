@@ -35,6 +35,9 @@ much higher than the box's, so only the board decided what stayed.
 | 25 | e99accf | Trust spec 2.2 (what the generator writes): the 2.1 parser, the one-run second pass and the per-record validation removed; a 2.2 walker for long fields and the file's end; panics as tripwires | run-d1003468b70d | 0.0229 | 13.3 | 445 | 79.8 |
 | 26 | 7a72ab7 | Fewer lines: one field walker for all five fields, `masks` returns the inside-quotes mask, the own inbox taken in the filing loop. Equal on the server, 10% slower on the box: reverted to step 25 (0cc7815) | run-5b165ed65fa8, run-cb0af101a699 | 0.0253, 0.0252 | | 407 | |
 | 27 | 80fbcfd | Step 26 without its two suspects: the regions fill keeps its digit loop, and a thread takes its own inbox after the block release, as in step 25 | run-0495510fc87f | 0.0229 | 13.35 | 418 | 80.0 |
+| 28 | c0b7fbd | Branch-free AES hash of the name: 32-byte blocks masked to the field by a sliding `KEEP` window, three AES rounds, the length mixed in (run in a slow dispatch) | run-58f46f513414 | 0.0225 | 13.19 | 420 | 80.2 |
+| 29 | bb339db | The name's row in bits 8..24 of its table key: the separate id array is gone (no board run of its own: measured with step 30) | | | | 422 | |
+| 30 | 84c8677 | The amount's minus sign from the 32-byte tail compare already loaded, not from a byte load | run-2bd88ce6fc49 | 0.0217 | 12.68 | 422 | 80.7 |
 
 ## What each step taught
 
@@ -225,6 +228,53 @@ guessed cut sent the whole file through a second pass. Neither can happen on gen
 - The spec's RULES fixture (`tests/test_c_join.py`) is valid 2.1 input but not 2.2 input. It now
   exits nonzero with a message, by design. The WORKED example is 2.2 input and passes.
 
+### Steps 28–30 (round 6): stalls in the single-thread loop
+
+Three cuts aimed at what a single thread waits on in the hot loop: a mispredicted branch in the
+name hash, a second dependent load after the name-table probe, and a byte load that waited on the
+region comma's position. Server, PGO docker builds, all four versions in one session (so step 27
+reads 849.5M instructions here, against 854.0M in round 5's session):
+
+| Version | Instructions:u (1 thread) | Cycles (1 thread) | 12 threads, median (ms) |
+|---|---|---|---|
+| step 27 (80fbcfd) | 849.5M | ~331M | 20.1–20.4 |
+| step 28 (c0b7fbd), AES hash | 834.4M | ~312M | 19.71 |
+| step 29 (bb339db), row in the key | 828.0M | ~303M | 19.66 |
+| step 30 (84c8677), sign from the tail | 821.4M | ~301.5M | 19.29 |
+
+- **Step 28.** The earlier hash (wyhash-style, a 64x64→128 multiply per 8-byte word) looped over
+  words while more than 16 bytes were left, and that branch mispredicted on the 11% of names of
+  17–24 bytes. The new hash takes 32 bytes at a time: the block is loaded whole and ANDed with a
+  sliding window into `KEEP` (32 bytes of ones, then 32 of zeros), so bytes past the name count as
+  zeros, then goes through three AES rounds (two for its bytes 16..32, which are the first round's
+  key), the length in the starting state. A name over 32 bytes takes another block in a loop. The
+  walker hashes a copy of the name followed by 32 zero bytes: its loads stay in bounds, and since
+  the mask zeroes every byte past the name, it gets the fast path's hash. A `compile_error!` stops
+  a build without AES. A multiply-mix version of the branch-free hash cost +30M instructions and was
+  rejected. Single thread: -15M instructions, cycles -6%; 12 threads -2.1%. On the board 0.02291 →
+  0.022525 s and +0.22 points, in a slow dispatch (the same dispatch ran A in 0.0212 s against its
+  best 0.0193, and B in 0.1271 against 0.1199), so the gain is probably understated.
+- **Step 29.** After a probe hit, the row of group bits was found through a separate `u16` id per
+  slot: a second load that depended on the probe. The row now sits in bits 8..24 of the key itself
+  (a table holds at most 40,960 names, below 2^16), with `0xFF` in the low byte so that a key is
+  never 0, and the probe compares only the hash bits above it. This also drops the id arrays (2
+  bytes per slot, 384 KB over 48 tables of 4096 slots at 12 threads): memory 13.5 → 12.5–13.3 MB
+  on the server. The price is in the hash bits that tell names apart: the 40 compared bits plus the
+  bucket bits (hash bits 8 and up, 10 of them in a 4096-slot table), 50 bits at 12 threads instead
+  of all 56. With the generator's 100,000 names the chance that two are confused is about 4e-6 per
+  dataset at 12 threads (3e-7 on one thread), up from 7e-8. The partition does not add bits: it is
+  picked from the hash's top 32 bits, which are compared anyway. No board run of its own: it went
+  to the board with step 30.
+- **Step 30.** The minus sign was a byte load at `note_end + 2 + region_len`, whose address waited
+  on the comma's position. It is now bit `region_len + 1` of a third compare of the tail register
+  already loaded for the comma and the dot. On the board, steps 29 and 30 together: 0.022525 →
+  0.021739 s, M 13.19 → 12.68, +0.54 points: the best Track C run, 80.74.
+- **Lesson.** These were single-thread stall and branch cuts, and they transferred to the box:
+  the server's 12-thread median went from 20.1–20.4 to 19.29 ms (about -5%), and the box from
+  0.02291 to 0.021739 s (-5.1%). Step 26's line cuts were neutral on the server and cost 10% on the
+  box. Cuts that remove work from the single-thread critical path (a branch miss, a dependent load)
+  moved both machines the same way.
+
 **Step 2 of the plan, killed: a dot-anchored kernel.** Under 2.2 a record's only `.` is its
 amount's, and the record ends 4 or 5 bytes after it. Stage A finds every dot of a 2 KB chunk from
 64-byte bitmaps. Stage B then parses each record from its start and its dot: the id's comma from 32
@@ -292,6 +342,7 @@ windows cost about as much as the 64-byte window plus tail compare they replace.
 | Unchecked partition index on top of that | server | 972M instructions; 22.73 ms, within noise |
 | cmov min/max instead of branches | server | +10M instructions, +0.4 ms |
 | First hash round always taken (no branch for 17–24-byte names) | server | branch misses 960k → 571k, but +30M instructions (+57M under PGO), +0.3 ms |
+| Branch-free name hash with multiply mixing instead of AES rounds (round 6) | server | +30M instructions against the AES version: rejected |
 
 ## Correctness checks run before every push
 
