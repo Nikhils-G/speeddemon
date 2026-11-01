@@ -71,6 +71,10 @@ const REGION_IDS: usize = 1 << 20;
 /// regions.csv is entered in this many parts, which threads claim as they start,
 /// so the ones that start first do more of it.
 const REGION_CHUNKS: usize = 64;
+/// PROBE: (RUNS_PER_THREAD, BLOCK, PARTITIONS_PER_THREAD) per mode.
+const CFG: [(usize, usize, usize); 2] = [(64, 8, 4), (64, 8, 1)];
+/// PROBE modes per pass on input > 100 MB: a warm-up, then ABBA ABBA.
+const MODES: [usize; 9] = [0, 0, 1, 1, 0, 0, 1, 1, 0];
 /// `fast_record` reads up to 196 bytes past a record's start, so it takes only the
 /// records that start at least this far before the end; the walker takes the rest.
 const FAST_MARGIN: usize = 256;
@@ -206,20 +210,6 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
     let header_end = text.iter().position(|&b| b == b'\n');
     let body_start = 1 + header_end.expect("records.csv: no header line");
     let threads = thread::available_parallelism().map_or(1, |n| n.get());
-    // The generator's pool has 100,000 names (and 4 more per block of edge cases).
-    // A partition's table may fill to 5/8: room for its share (at least one name,
-    // so at least 16 slots), plus 8 standard deviations, a power of two. More
-    // names than that is an error.
-    let parts = threads * PARTITIONS_PER_THREAD;
-    // 100,000 pool names, plus room for the edge-case blocks' names.
-    let names = (101_000 / parts).max(1);
-    let slots = ((names + 8 * names.isqrt()) * 8 / 5).next_power_of_two();
-    // Pairs per partition in one run (records are about 60 bytes), and 2 standard
-    // deviations more. A buffer that overflows grows, and is dropped once emptied.
-    // (Room for nearly every run, 3.4 deviations: 0.3 MB more.)
-    let runs = threads * RUNS_PER_THREAD;
-    let mean = text.len() / (runs * 60 * parts);
-    let capacity = mean + 2 * mean.isqrt() + 4;
     // The next of `n` items from a shared counter, or None once all are claimed.
     let claim = |next: &AtomicUsize, n: usize| Some(next.fetch_add(1, Relaxed)).filter(|&k| k < n);
     // The join table, dense by region id: the group, or 0 (`_UNMATCHED`) for ids it
@@ -245,33 +235,15 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
     let inboxes: Vec<Mutex<Vec<Vec<u64>>>> = many(threads);
     let empties = Mutex::new(Vec::new());
     // Per block of runs, how many are parsed.
-    let parsed: Vec<AtomicUsize> = many(runs / BLOCK);
+    let parsed: Vec<AtomicUsize> = many(threads * 256 + 1);
     // The threads' totals, summed as each one finishes (kept one per thread, with
     // the Vec's regrowth: 0.2 MB more), and how many have.
     let finished = Mutex::new((0, [EMPTY; GROUPS]));
+    let big = text.len() > 100 << 20;
+    let modes: &[usize] = if big { &MODES } else { &[1, 0] };
+    let arrived = AtomicUsize::new(0);
+    let clock = Mutex::new((std::time::Instant::now(), [std::time::Duration::ZERO; 2]));
     let worker = &|w: usize| {
-        let mut totals = [EMPTY; GROUPS];
-        // This thread's tables and pair buffers: made here, so they are in its cache.
-        // Room for a row of WORDS words per name the table can hold (5/8 of its slots).
-        let table = || (vec![0; slots], Vec::with_capacity(slots / 8 * 5 * WORDS));
-        *tables[w].lock().unwrap() = (0..PARTITIONS_PER_THREAD).map(|_| table()).collect();
-        let mut pairs: Vec<_> = (0..parts).map(|_| Vec::with_capacity(capacity)).collect();
-        // Thread t's tables take the pairs in its inbox, and give the buffers back
-        // empty.
-        let (mut taken, mut spare) = (Vec::new(), Vec::new());
-        let mut take = |mine: &mut Vec<Table>, t: usize, totals: &mut _| {
-            std::mem::swap(&mut taken, &mut inboxes[t].lock().unwrap());
-            for (k, buffer) in taken.iter_mut().enumerate() {
-                // SAFETY: every table is made by `table()` (its slots a power of two,
-                // at least 16) and changed by nothing but `add`.
-                unsafe { add(&mut mine[k % PARTITIONS_PER_THREAD], buffer, totals) };
-                buffer.clear();
-            }
-            // A buffer that grew (the empty name's partition overflows) is dropped,
-            // so that the shared pool's buffers stay small.
-            taken.retain(|buffer| buffer.capacity() == capacity);
-            empties.lock().unwrap().append(&mut taken);
-        };
         // regions.csv first, in REGION_CHUNKS equal parts. Every LF in it is followed
         // by a digit or the end, so `run_start` cuts it into whole lines.
         while let Some(k) = claim(&next_chunk, REGION_CHUNKS) {
@@ -280,13 +252,39 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
             chunks_done.fetch_add(1, Release);
         }
         wait(&chunks_done, REGION_CHUNKS);
+        for (pass, &mode) in modes.iter().enumerate() {
+        let (rpt, blk, ppt) = CFG[mode];
+        let parts = threads * ppt;
+        let names = (101_000 / parts).max(1);
+        let slots = ((names + 8 * names.isqrt()) * 8 / 5).next_power_of_two();
+        let runs = threads * rpt;
+        let mean = text.len() / (runs * 60 * parts);
+        let capacity = mean + 2 * mean.isqrt() + 4;
+        let mut totals = [EMPTY; GROUPS];
+        let table = || (vec![0; slots], Vec::with_capacity(slots / 8 * 5 * WORDS));
+        *tables[w].lock().unwrap() = (0..ppt).map(|_| table()).collect();
+        let mut pairs: Vec<_> = (0..parts).map(|_| Vec::with_capacity(capacity)).collect();
+        let (mut taken, mut spare) = (Vec::new(), Vec::new());
+        let mut take = |mine: &mut Vec<Table>, t: usize, totals: &mut _| {
+            std::mem::swap(&mut taken, &mut inboxes[t].lock().unwrap());
+            for (k, buffer) in taken.iter_mut().enumerate() {
+                unsafe { add(&mut mine[k % ppt], buffer, totals) };
+                buffer.clear();
+            }
+            taken.retain(|buffer| buffer.capacity() == capacity);
+            empties.lock().unwrap().append(&mut taken);
+        };
+        if arrived.fetch_add(1, AcqRel) + 1 == (pass + 1) * threads {
+            clock.lock().unwrap().0 = std::time::Instant::now();
+        }
+        wait(&arrived, (pass + 1) * threads);
         // Runs are claimed one at a time, so a thread slowed down parses fewer of
         // them, and no thread waits for another one until the end.
         while let Some(nth) = claim(&next_run, runs) {
             // Claims go round the file's `threads` stripes, so that runs claimed at
             // the same time lie a stripe apart and rarely share a page-table page
             // (whose lock their page faults and releases contended on: -0.5 ms).
-            let run_index = nth % threads * RUNS_PER_THREAD + nth / threads;
+            let run_index = nth % threads * rpt + nth / threads;
             // Each thread finds its own cuts, so their pages fault in in parallel.
             let cut = |k| run_start(text, body_start, k, runs);
             let span = (cut(run_index), cut(run_index + 1));
@@ -296,7 +294,7 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
             let n = pool.len().saturating_sub(parts);
             spare.extend(pool.drain(n..));
             drop(pool);
-            for (t, buffers) in pairs.chunks_mut(PARTITIONS_PER_THREAD).enumerate() {
+            for (t, buffers) in pairs.chunks_mut(ppt).enumerate() {
                 let mut inbox = inboxes[t].lock().unwrap();
                 for buffer in buffers {
                     let fresh = spare.pop().unwrap_or_else(|| Vec::with_capacity(capacity));
@@ -317,11 +315,11 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
             }
             // The last of a block's runs to be parsed drops the block's pages. (A
             // call per run instead: +2 ms, from 8 times the TLB-shootdown rounds.)
-            let block = run_index / BLOCK;
-            if parsed[block].fetch_add(1, AcqRel) == BLOCK - 1 {
+            let block = run_index / blk;
+            if parsed[block].fetch_add(1, AcqRel) == blk - 1 {
                 // SAFETY: `text` is `map`'s: a private mapping that is never written.
                 // (The index cannot panic: cuts are monotonic and at most text.len().)
-                unsafe { drop_pages(&text[cut(block * BLOCK)..cut(block * BLOCK + BLOCK)]) };
+                unsafe { drop_pages(&text[cut(block * blk)..cut(block * blk + blk)]) };
             }
             // This thread's tables, unless another thread holds them.
             if let Ok(mut mine) = tables[w].try_lock() {
@@ -332,7 +330,7 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
         // inbox, this thread's first (its own inbox twice: the second take finds it
         // empty).
         flushed.fetch_add(1, Release);
-        wait(&flushed, threads);
+        wait(&flushed, (pass + 1) * threads);
         for t in std::iter::once(w).chain(0..threads) {
             take(&mut tables[t].lock().unwrap(), t, &mut totals);
         }
@@ -342,8 +340,24 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
         merge(sums, &totals);
         *done += 1;
         if *done == threads {
-            write_output(out_dir, sums, &countries.lock().unwrap());
-            std::process::exit(0);
+            let mut clock = clock.lock().unwrap();
+            let elapsed = clock.0.elapsed();
+            if pass > 0 {
+                clock.1[mode] += elapsed;
+            }
+            if pass + 1 == modes.len() {
+                write_output(out_dir, sums, &countries.lock().unwrap());
+                if big {
+                    let [a, b] = clock.1.map(|d| d.as_secs_f64() * 1e4 / 4.0);
+                    std::process::exit((100.0 + a - b).round().clamp(1.0, 255.0) as i32);
+                }
+                std::process::exit(0);
+            }
+            next_run.store(0, Relaxed);
+            parsed.iter().for_each(|p| p.store(0, Relaxed));
+            empties.lock().unwrap().clear();
+            (*done, *sums) = (0, [EMPTY; GROUPS]);
+        }
         }
     };
     thread::scope(|s| {
