@@ -57,7 +57,7 @@ const SAMPLE_BYTES: usize = 1 << 20;
 /// A query whose cover terms are expected in more blocks than this (as a share,
 /// summed over the terms) is evaluated in every superblock: one evaluation then
 /// covers four blocks. (0.125 and 0.5 were measured slower.)
-const ALWAYS: f64 = 0.20;
+const ALWAYS: f64 = 0.25;
 /// Documents per superblock: four blocks of 64.
 const SUPER: u32 = 256;
 /// A thread's sum of matching ids is packed under its count in one u64.
@@ -698,7 +698,8 @@ impl Plan {
         let by_trigger: Vec<_> = out.iter_mut().map(|o| take(&mut o.0)).collect();
         let by_anchor: Vec<_> = out.iter_mut().map(|o| take(&mut o.1)).collect();
         let mut always: Vec<_> = out.iter().flat_map(|o| o.2.iter().copied()).collect();
-        let terms: Vec<_> = out.iter().flat_map(|o| o.3.iter().copied()).collect();
+        // 8 ids of padding after the last phrase, for `end_doc`'s 32-byte compares.
+        let terms: Vec<_> = out.iter().flat_map(|o| o.3.iter().copied()).chain([0; 8]).collect();
         let mut plan = Plan::default();
         // The anchors are grouped and the `always` entries sorted on a second
         // thread, while this one groups the entries.
@@ -818,6 +819,8 @@ struct Scan<'a> {
     n: usize,
     /// The entry ranges `(start, end)` of the touched slots that trigger any.
     work: Vec<(u32, u32)>,
+    /// A block's nonzero results `(answer, hits)`, added up after the evaluation.
+    hits: Vec<(u32, u64)>,
     /// Row r < plan.rows: the words of BOOL term r in the 4 blocks of this
     /// superblock. Row `rows` takes the other terms; row `rows + 1` is all ones.
     wide: Vec<Row>,
@@ -848,6 +851,7 @@ impl<'a> Scan<'a> {
             touched: vec![0; bool_terms + 2],
             n: 0,
             work: Vec::with_capacity(bool_terms + 2),
+            hits: Vec::with_capacity(plan.map_or(0, |p| p.entries.len())),
             wide,
             pending: Vec::new(),
             toks: Vec::new(),
@@ -1036,7 +1040,21 @@ impl<'a> Scan<'a> {
                     let (answer, offset, start, len) = plan.anchored[i];
                     let phrase = &plan.terms[start as usize..(start + len) as usize];
                     let from = (at as usize).checked_sub(offset as usize);
-                    let hit = from.and_then(|f| self.toks.get(f..f + phrase.len())) == Some(phrase);
+                    let hit = match from {
+                        // Up to 8 ids with 8 tokens left: one masked 32-byte compare
+                        // (the plan's terms end with 8 ids of padding), not a memcmp call.
+                        Some(f) if len <= 8 && f + 8 <= self.toks.len() => {
+                            // SAFETY: 8 ids from f in toks (checked) and from start in
+                            // plan.terms (padded); AVX2 and BMI2 are enabled for the build.
+                            unsafe {
+                                let a = _mm256_loadu_si256(self.toks.as_ptr().add(f).cast());
+                                let b = _mm256_loadu_si256(plan.terms.as_ptr().add(start as usize).cast());
+                                let need = _bzhi_u32(!0, 4 * len);
+                                movemask(_mm256_cmpeq_epi32(a, b)) & need == need
+                            }
+                        }
+                        _ => from.and_then(|f| self.toks.get(f..f + phrase.len())) == Some(phrase),
+                    };
                     if hit && self.last[i] != doc {
                         self.last[i] = doc;
                         // SAFETY: a phrase's answer is an answer number, below state.len().
@@ -1084,7 +1102,8 @@ impl<'a> Scan<'a> {
             }
             // SAFETY: the first `kept` ranges were written.
             unsafe { self.work.set_len(kept) };
-            let state = self.answers.state.as_ptr();
+            let (state, hits) = (self.answers.state.as_ptr(), self.hits.as_mut_ptr());
+            let mut h = 0;
             for (k, &(from, to)) in self.work.iter().enumerate() {
                 let next = self.work.get(k + RANGES_AHEAD).map_or(0, |r| r.0);
                 // SAFETY: an entry of the plan (entry 0 at the end), which the
@@ -1111,10 +1130,20 @@ impl<'a> Scan<'a> {
                     let word = |k: usize| presence[(entry.terms[k] & TERM) as usize];
                     let present = |k| word(k) & bit(entry.earlier_or_len >> k) != 0;
                     let seen = entry.earlier_or_len != 0 && (0..MAX_BOOL_TERMS).any(present);
-                    let hits = if seen { 0 } else { r };
-                    // SAFETY: an entry's answer is an answer number, below state.len().
-                    unsafe { self.answers.add(entry.answer, hits, base) };
+                    let r = if seen { 0 } else { r };
+                    // Branch-free: always written, kept only when nonzero (about
+                    // half), so `add` runs only for the results that count.
+                    // SAFETY: hits has room for every entry, and a block evaluates
+                    // each entry at most once (a slot is touched once per block).
+                    unsafe { hits.add(h).write((entry.answer, r)) };
+                    h += (r != 0) as usize;
                 }
+            }
+            // SAFETY: the first h results were written.
+            unsafe { self.hits.set_len(h) };
+            for &(answer, r) in &self.hits {
+                // SAFETY: an entry's answer is an answer number, below state.len().
+                unsafe { self.answers.add(answer, r, base) };
             }
         }
         // `block`: which of the superblock's 4 blocks this is.
