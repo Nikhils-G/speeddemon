@@ -20,8 +20,9 @@ and CRLF and LF terminators mixed. Distinct names must be counted per country ov
 ## Where the time goes on the box
 
 The reference runs 14.44 s at 367 MB and S 108. The submitted code (PERF.md step 58, b8b733a,
-S 487) ran 0.017376 s on the board (run-819427baa4d8, 10.17 MB, 83.67 points), and step 57, the
-same hot code, 0.0170 to 0.0173 s in its normal runs (run-c56b067ab64d, 0.016978 s, 10.74 MB, 83.71
+S 487) runs 0.0171 to 0.0174 s on the board in its normal runs (run-605bf7359da0, 0.017134 s,
+10.16 MB, 83.82 points; run-8f3d7064f29b, 0.01729 s; run-819427baa4d8, 0.017376 s), and step 57,
+the same hot code, 0.0170 to 0.0173 s in its normal runs (run-c56b067ab64d, 0.016978 s, 10.74 MB, 83.71
 points; run-9ac7e3c0222d, 0.017339 s) (details: PERF.md, steps 49-58).
 
 Per record, step 46 executed about 193 instructions in all, parse and deduplication together
@@ -203,7 +204,10 @@ outside the program's control (measured before step 46): about 1 MB already char
 program starts, about 0.7 MB of kernel page tables and stacks, and 1-2 MB of the kernel's per-CPU
 charge batching. On the replica (mem.sh): step 58, 20 runs, max 10.50 MB; step 57, 20 runs, 9.30
 to 10.43 MB; step 56, the same
-logic, 200 runs, median 10.11 MB, max 10.99 MB.
+logic, 200 runs, median 10.11 MB, max 10.99 MB. At the parse-end peak (smaps, step 58, three runs)
+anonymous memory is 7.3 to 8.1 MB: the join table's 0.98 MB, 12 malloc arenas of 0.38 to 0.78 MB
+each (one run had a 1.4 MB arena, the pair-buffer pool at its peak) and 12 thread stacks of 20 KB;
+on top come 0.5 MB of page tables and 1.5 to 2.4 MB of the kernel's per-CPU charge stock.
 
 ## Techniques
 

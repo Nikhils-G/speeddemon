@@ -1,8 +1,9 @@
 # Track C: performance log
 
 **Result.** The reference runs 14.44 s at 367 MB and S 108. The submitted code (step 58, b8b733a,
-S 487) ran 0.017376 s on the board (run-819427baa4d8, 10.17 MB, 83.67 points), and step 57, the
-same hot code, 0.0170 to 0.0173 s in its normal runs (run-c56b067ab64d, 0.016978 s, 10.74 MB, 83.71
+S 487) runs 0.0171 to 0.0174 s on the board in its normal runs (run-605bf7359da0, 0.017134 s,
+10.16 MB, 83.82 points; run-8f3d7064f29b, 0.01729 s; run-819427baa4d8, 0.017376 s), and step 57,
+the same hot code, 0.0170 to 0.0173 s in its normal runs (run-c56b067ab64d, 0.016978 s, 10.74 MB, 83.71
 points; run-9ac7e3c0222d, 0.017339 s). Three ideas carry it: a simdjson-style parse that never reads a field's bytes
 twice (steps 6-15), cuts and a record path that trust spec 2.2 behind tripwires (step 25), and a
 join and a distinct-name count with no shared state, whose one random load is prefetched a whole
@@ -100,7 +101,7 @@ their own, or their run is not in the log; their numbers are left out rather tha
 | 55 | 2f05cec (second run from 854810e) | c-20: a last record without a terminator, which 2.1 allows, read like any other, with the reference's output; the top comment says exactly what is answered and how (replica +0.33% and −0.10% in two builds: build noise; both runs: C alone slow) | run-d4f9240d849b, run-a968d9c22097 | 0.020511, 0.020647 | 10.06, 10.15 | 471 | 82.02, 81.91 |
 | 56 | ffb2e77 | c-21: after the region wait, a thread that finds another of ours on its CPU moves to the lowest free CPU of its affinity mask (replica −0.39%, 115 of 201; runs over 19.5 ms 9 → 2 and 12 → 6 in two sets of 300 pairs) | run-2fae75090a37 | 0.017003 | 10.38 | 483 | 83.84 |
 | 57 | aa1fe77 (later runs from 5216711, outside the queue, and 97b4897) | c-22: a failed CPU lookup, mask read or move leaves the thread where it is, with nothing asserted (replica +0.16%, 87 of 201: the same speed) | run-9ac7e3c0222d, run-fbcbe364dd0f, run-c56b067ab64d | 0.017339, 0.017057, 0.016978 | 10.31, 10.49, 10.74 | 483 | 83.66, 83.76, 83.71 |
-| 58 | b8b733a | c-23: the CPU move as a named function (`move_off_shared_cpu`), `mmap` errors that name their cause, `fill` indexing the codes by `(a * 26 + b) * 26 + c`, review comments; the hot code compiles as step 57's (replica −0.11%, 106 of 201; mem.sh, 20 runs, max 10.50 MB). **The submitted code** | run-819427baa4d8 | 0.017376 | 10.17 | 487 | 83.67 |
+| 58 | b8b733a (later runs from 3bd65f7, fabe12e, c36861d and 8a293ff) | c-23: the CPU move as a named function (`move_off_shared_cpu`), `mmap` errors that name their cause, `fill` indexing the codes by `(a * 26 + b) * 26 + c`, review comments; the hot code compiles as step 57's (replica −0.11%, 106 of 201; mem.sh, 20 runs, max 10.50 MB). **The submitted code** | run-819427baa4d8, run-42f5d2e69825, run-a9d75c6b2bc1, run-605bf7359da0, run-8f3d7064f29b | 0.017376, 0.020187, 0.018676, 0.017134, 0.01729 | 10.17, 10.92, 10.57, 10.16, 10.29 | 487 | 83.67, 81.73, 82.72, 83.82, 83.67 |
 
 Two more runs of step 32's code were in a DISTURBED and a SLOW BOX dispatch: run-87e294d71310
 (0.022429 s) and run-dc9ee4598ca3 (0.021796 s, 11.28 MB).
@@ -120,8 +121,9 @@ comment keeps the why, with its measurements in this file (steps 47-48). Against
 `add`, `walk_record`, `write_output`, `run` and `main` compile to the same instructions, and
 `parse_run` to the same 920 but for the usual 4-line block swap between PGO builds. Replica −0.11%
 (106 of 201 pairs); the gate passed, and fresh full seeds 101-105 gave the reference's output as
-root and as uid 65534; mem.sh, 20 runs, max 10.50 MB (step 57: 10.43). Board: run-819427baa4d8,
-0.017376 s, 10.17 MB, 83.67 points.
+root and as uid 65534; mem.sh, 20 runs, max 10.50 MB (step 57: 10.43). Board: run-605bf7359da0,
+0.017134 s, 10.16 MB, 83.82 points; run-8f3d7064f29b, 0.01729 s; run-819427baa4d8, 0.017376 s; and
+0.018676 and 0.020187 s in two slower dispatches.
 
 **Step 57 (c-22, aa1fe77), S 483**: step 55 with step 56's move off a shared
 CPU, and step 57's handling of a failed CPU call (the thread stays where it is). Replica: step 56
@@ -617,7 +619,19 @@ The last three run one copy of the code with different constants, so they carry 
 | Each thread pinned to its own CPU at its start, never released (step 56 work) | replica, 300 pairs against step 55 | 18 slow runs against 4, median 17.31 against 17.25 ms |
 | The main thread pins itself to CPU w before spawning thread w, so that the child starts there; and the same with every thread released after the region wait (step 56 work) | replica, 300 pairs against step 55 | 1 slow run against 5 and 0 against 2, but medians +1.2% (17.45 against 17.24 and 17.43 against 17.23 ms): the main thread's 11 migrations make the spawn loop 0.53 ms longer |
 | Each child started on {the main thread's CPU, its own} (step 56 work) | replica, 300 pairs against step 55 | 166 slow runs against 0, median 20.26 ms |
-| Two or four malloc arenas | replica | 2 arenas: median −0.5 MB but T +1.07%; 4 arenas: −0.15 MB, +0.39% |
+| Fewer malloc arenas (`M_ARENA_MAX`) | replica, 40 runs each in 4 interleaved rounds, the expected max of 5 by bootstrap | Step 58: median 10.11 MB, expected max of 5 10.37 MB. 3 arenas 9.91 / 10.19 MB (−0.18), T +0.79% (61 of 201); 6 arenas 9.87 / 10.19 MB (−0.18), T +0.24% (89 of 201); 2 arenas T +0.97% (41 of 201), and on step 57 median −0.5 MB, T +1.07%; 4 arenas −0.15 MB, +0.39%. Two 10-run screens had suggested −0.6 to −0.7 MB on the max; 40 runs shrank it to −0.18 MB |
+| Each thread's own inbox taken before its hand-off, so the buffer pool refills before fresh buffers are allocated (on step 58) | replica | Median 10.14-10.16 MB against 10.15-10.18, max 10.34 and 10.62 against 10.52 and 10.41: no change |
+| The input's page tables freed during the parse, by `munmap` of fully parsed whole 2 MB stretches | analysis, not built | At most −0.35 MB at the parse-end peak, for 15 to 20 lines, and `munmap` takes the mapping's write lock, stalling every thread's page faults; dropping pages progressively (96 calls) had already measured slower than the drop at the end |
+| Constants swept on step 58 (rows below): non-PGO screens with the Dockerfile's flags minus the profile, then two PGO builds a side for anything that might pass; every variant gave the reference output | replica | Kept as they are: 64 runs a thread, a takeover bound of 4 × threads, the prefetch 1 KB ahead, the buffer margin, 64 region chunks |
+| 48 runs a thread instead of 64 | replica | T −0.38% (127 of 201), but memory up: max of 20 runs 11.19 against 10.44 MB, median +0.34 MB |
+| 96 or 128 runs a thread | replica, 2 PGO builds a side | 96: T +0.70 to +0.75%, expected max of 5 10.02 against 10.37 MB, about +0.07 points net, under our bar of +0.1 for a constant; 128: T +2.21% and +2.37%, 9.70 MB, about +0.03 points |
+| A takeover bound of 2 × or 8 × threads buffers instead of 4 × | replica | −0.14% (114 of 201) and −0.07% (106 of 201); memory equal |
+| The non-temporal prefetch 256, 512, 768 or 2,048 bytes ahead instead of 1,024 | replica, PGO for 512 to 2,048 | 512: non-PGO −0.91% (166 of 201), but PGO +0.07 to +0.30% over 2 × 2 builds: the faster PGO loop needs the longer distance, so a non-PGO screen misleads for this knob; 768: −0.28% and −0.32%, about +0.03 points; 2,048: +1.53% and +1.59%; 256: non-PGO +5.69% |
+| 96 runs a thread with the prefetch 512 bytes ahead | replica, PGO | T +0.81% and +1.16%, expected max of 5 9.95 and 9.99 MB: about +0.06 points net |
+| The pair-buffer margin at mean + 1 sd + 4, or mean + 3 sd | replica | + 1 sd + 4: T +0.49% (60 of 201) and expected max of 5 10.91 against 10.30 MB, as more buffers overflow and regrow; + 3 sd: −0.17%, 10.20 MB: equal |
+| `madvise(MADV_POPULATE_READ)` on each run's bytes before `parse_run`, from the run's start rounded down to a page; or on a thread's whole stripe at its first claim (on step 58) | replica, PGO builds, 201 pairs | Per run: minor faults 4,927 → 2,620, T +1.95% (won 10 of 201), as in an earlier measurement (+1.96%); per stripe: faults → 1,882, T +3.28% (won 5 of 201). The fault-around traps halve, but their mapping work still happens inside the call, which stalls the parse instead of letting the faults land as the stream reaches them; per stripe, the first runs also wait for 16.8 MB to be mapped |
+| 32 or 128 regions.csv chunks instead of 64 | replica | −0.15% (107 of 201) and +0.04% (95 of 201): equal |
+| A compact join table read with one load (64 ids in 32 bytes: a bitmap and 24 inline group bytes, 500 KB) | analysis, not built | The footprint probe gives at most −0.31% at 512 KB, and the lookup costs about 10 instructions per record; the 18-instruction rank table measured +6.6% |
 | Threads drop their tables before the last one exits (02a535c) | board run-60031508190b | 0.025472 s against 0.025101 for step 24b: no gain, reverted in 98e7cb6 |
 | The end phase reordered: takes and merge first, then the writer writes while the others drop the input in claimed slices, and exits once all are dropped (step 51 work) | replica | +0.48% (88 of 201) with 4 × threads slices, +0.27% (91 of 201) with 2 ×, +0.45% (90 of 201) with 8 × |
 | The join table's shares dropped before the takes, on the critical path (step 51 work) | replica | +0.29% (89 of 201) |
@@ -876,7 +890,8 @@ Step 39 also checked `objdump | grep -c vpinsrb` = 0.
   0.018023 s, step 48's two clean runs 0.01758 and 0.017572 s, step 49 ran 0.017192 to 0.018128 s
   in six clean runs, step 51 0.017095 to 0.017418 s in four, step 52 0.017135 to 0.017364 s in three clean runs, step 54 0.017101 to
   0.019528 s in three clean runs, step 55 0.020511 and 0.020647 s, with C alone slow both
-  times, step 57 0.016978 to 0.017339 s (step 56: 0.017003 s), and the submitted step 58 0.017376 s; run-46d6bf16c5bd
+  times, step 57 0.016978 to 0.017339 s (step 56: 0.017003 s), and the submitted step 58 0.017134 to 0.017376 s in three runs, and 0.018676 and 0.020187 s;
+  run-46d6bf16c5bd
   (84.30 points) is the best Track C run.
 - **Points** are the board's; M counts on this track, so no point value is computed here.
 
