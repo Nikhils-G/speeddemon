@@ -10,6 +10,7 @@ const MAP_PRIVATE: i32 = 0x02;
 const MAP_FIXED: i32 = 0x10;
 const MAP_ANONYMOUS: i32 = 0x20;
 const MADV_DONTNEED: i32 = 4;
+const M_MMAP_THRESHOLD: i32 = -3;
 /// x86-64's base page size.
 const PAGE: usize = 4096;
 
@@ -17,14 +18,26 @@ unsafe extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
     fn prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i32;
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+    fn mallopt(param: i32, value: i32) -> i32;
 }
 
-/// Turns off transparent huge pages for this process. With THP set to "always",
-/// touching one byte of a sparse, lazily zeroed table can fault in a whole 2 MB
-/// page, so the memory peak would depend on how fragmented the host is that run.
-pub fn no_huge_pages() {
+/// Sets how this process gets memory:
+/// - No transparent huge pages. With THP set to "always", touching one byte of a
+///   sparse, lazily zeroed table can fault in a whole 2 MB page, so the memory peak
+///   would depend on how fragmented the host is that run.
+/// - Allocations of up to 1 MB come from malloc's heaps, one per thread, instead
+///   of an mmap each, and the threshold stays fixed: by default it rises with the
+///   largest block freed so far, so where each step's tables come from (fresh
+///   pages or reused ones) would depend on what the steps before it freed. The
+///   setup's parallel steps then fault in fewer fresh pages, each in its thread's
+///   own mapping (with this setup: -1.1 ms). Larger blocks, such as the scan's
+///   first-id logs, stay mmaps, whose pages cost nothing until written: from a
+///   heap, calloc would clear them (8 MB more at 32 MB).
+pub fn set_up_memory() {
     // SAFETY: a plain syscall wrapper; failure only means THP stays on.
     unsafe { prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0) };
+    // SAFETY: a libc call that touches no memory of ours; failure keeps the default.
+    unsafe { mallopt(M_MMAP_THRESHOLD, 1 << 20) };
 }
 
 /// Zero bytes mapped after the end of every file: fixed-size loads (64-byte
@@ -53,22 +66,18 @@ pub fn map(path: &str) -> &'static [u8] {
     unsafe { std::slice::from_raw_parts(base, len + PAD) }
 }
 
-/// Drops this process's page-table entries for the pages that `slice` touches, a
-/// part of a read-only file mapping that is done with. At exit the kernel would
-/// otherwise unmap the 62,000 pages of the input one by one, on one core; this
-/// does the same work in each scanning thread, in parallel. Reading the bytes
-/// again is still correct: the page faults back in from the page cache.
+/// Gives the whole pages inside `slice` back to the kernel (MADV_DONTNEED), so
+/// that the exit, on one core, has fewer to unmap and free. A file mapping's pages
+/// would fault back in from the page cache if read again; anonymous memory would
+/// read as zero.
 ///
 /// # Safety
 ///
-/// Only for slices of a mapping made by `map`: on heap memory it would zero live data.
-pub unsafe fn release(slice: &[u8]) {
-    // madvise takes a page-aligned start; the end is rounded up to whole pages.
-    // The pages at the ends may also hold the neighbouring slices' bytes.
-    let start = slice.as_ptr() as usize / PAGE * PAGE;
-    let len = slice.as_ptr() as usize + slice.len() - start;
-    // SAFETY: whole pages of a private, read-only mapping that is never written
-    // (the file, then zero pages: the caller's contract); dropping them loses
-    // nothing.
-    unsafe { madvise(start as *mut u8, len, MADV_DONTNEED) };
+/// Nothing reads or writes `slice` again: the process is about to exit.
+pub unsafe fn release<T>(slice: &[T]) {
+    let start = (slice.as_ptr() as usize).next_multiple_of(PAGE);
+    let end = (slice.as_ptr() as usize + size_of_val(slice)) / PAGE * PAGE;
+    // SAFETY: whole pages inside the slice (none if end <= start), never used
+    // again (the caller's contract).
+    unsafe { madvise(start as *mut u8, end.saturating_sub(start), MADV_DONTNEED) };
 }

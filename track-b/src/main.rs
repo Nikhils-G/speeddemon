@@ -97,7 +97,7 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let data_dir = args.next().unwrap_or_else(|| "/data".into());
     let out_dir = args.next().unwrap_or_else(|| "/out".into());
-    mmap::no_huge_pages();
+    mmap::set_up_memory();
     let open = |name: &str| mmap::map(&format!("{data_dir}/{name}"));
     let docs = open("docs.txt");
     // The corpus: `docs` without the mmap::PAD zero bytes that follow it.
@@ -136,10 +136,6 @@ fn main() {
             let scan = unsafe { Scan::new(&vocab, Some(&plan), &[]).run(docs, start, end, first) };
             (scan.answers, scan.doc)
         };
-        // Drop the slice's pages now, in parallel, instead of the kernel
-        // unmapping all 62,000 at exit on one core.
-        // SAFETY: docs[start..end] is part of the mapping made by mmap::map.
-        unsafe { mmap::release(&docs[start..end]) };
         // The ids go on in the next slice, and stay below MAX_DOCS.
         let next = slices.get(i + 1).map_or(doc + 1, |s| s.2);
         // A slice's ids, and the queries, also fit the first-id log (see MIN_SLICES).
@@ -173,10 +169,28 @@ fn main() {
     });
 
     // Formatted in parallel, one range of lines per thread, then written in order.
-    let mut file = std::fs::File::create(format!("{out_dir}/results.txt")).expect("results.txt");
-    for chunk in par(parts, &|p| format_part(&plan, &results, p, parts)) {
-        std::io::Write::write_all(&mut file, &chunk).expect("write results.txt");
-    }
+    let file = std::fs::File::create(format!("{out_dir}/results.txt")).expect("results.txt");
+    let chunks = par(parts, &|p| format_part(&plan, &results, p, parts));
+    // This thread writes them while the workers drop the corpus's pages and give
+    // the big tables back to the kernel, none of which is read any more: the exit,
+    // on one core, then has fewer pages to unmap and free.
+    par(parts, &|p| {
+        if p == 0 {
+            for chunk in &chunks {
+                std::io::Write::write_all(&mut &file, chunk).expect("write results.txt");
+            }
+            return;
+        }
+        let share = |len| part(len, p - 1, parts - 1);
+        // SAFETY: none of these is read again before the process exits.
+        unsafe { mmap::release(&text[share(text.len())]) };
+        // SAFETY: as above.
+        unsafe { mmap::release(&results[p].state) };
+        // SAFETY: as above.
+        unsafe { mmap::release(&results[p].ends) };
+        // SAFETY: as above.
+        unsafe { mmap::release(&vocab.table[share(vocab.table.len())]) };
+    });
     // Done: exit without freeing the tables and logs, one free at a time.
     std::process::exit(0)
 }
@@ -347,7 +361,7 @@ fn split_lines(chunk: &'static [u8], padded: &'static [u8], seed: u64) -> Split 
     let seed = seed.wrapping_mul(SEEDS);
     let most = chunk.len() / 2 + 1;
     let (mut lines, mut long) = (Vec::with_capacity(most / 3), Vec::new());
-    let (mut terms, mut keys) = (Vec::with_capacity(most), Vec::with_capacity(most));
+    let mut terms = Vec::with_capacity(most);
     // Every line is a query of the spec's grammar (2.3) and ends with LF.
     for line in chunk.split_inclusive(|&b| b == b'\n') {
         let (start, phrase) = (terms.len(), line[0] == b'P');
@@ -360,10 +374,6 @@ fn split_lines(chunk: &'static [u8], padded: &'static [u8], seed: u64) -> Split 
                 let at = (word.as_ptr() as usize - padded.as_ptr() as usize) as u32;
                 terms.push((at, word.len() as u32 | op << 30));
                 long.extend((word.len() > KEY).then_some(word));
-                // Key length 0 gives the zero key, which marks a long term.
-                let len = word.len() as u32 * (word.len() <= KEY) as u32;
-                let h = hash(checked_key(padded, at as usize, len as usize), seed);
-                keys.push(Key { hash: h, at, len });
             } else {
                 // `AND`, `NOT` and `OR` start with bytes ending in binary 01, 10 and 11.
                 // queries.txt is trusted (spec 2.3): any other word reads as AND
@@ -373,14 +383,19 @@ fn split_lines(chunk: &'static [u8], padded: &'static [u8], seed: u64) -> Split 
         }
         lines.push((start as u32, (terms.len() - start) as u32, phrase));
     }
-    // Grouped by hash & 63, the hash group.
-    let by_group = keys.iter().map(|&k| ((k.hash & 63) as u32, k)).collect();
-    let (starts, grouped) = csr(&[by_group], GROUPS);
+    // The terms' keys grouped by hash & 63, the hash group. Key length 0 gives
+    // the zero key, which marks a long term.
+    let key = |&(at, len): &Term| {
+        let len = (len & TERM) * ((len & TERM) as usize <= KEY) as u32;
+        let hash = hash(checked_key(padded, at as usize, len as usize), seed);
+        ((hash & 63) as u32, Key { hash, at, len })
+    };
+    let (starts, keys) = csr(|| terms.iter().map(key), GROUPS);
     Split {
         lines,
         terms,
         starts,
-        keys: grouped,
+        keys,
         long,
     }
 }
@@ -579,23 +594,23 @@ fn place(h: u64, pilot: u64, shift: u32) -> usize {
 }
 
 /// Thread q's keys for `Vocab::new`: those of its range of the hash groups,
-/// from every split, sorted by bucket and then hash, one per hash; or None when
-/// two different keys have the same hash. A bucket's hashes share their low bits,
-/// so it lies in one group (hash & 63).
-fn dedup_keys(splits: &[Split], q: usize, bmask: u64, file: Long) -> Option<Vec<Key>> {
+/// from every split, sorted by bucket and then hash, one per hash. A bucket's
+/// hashes share their low bits, so it lies in one group (hash & 63).
+fn dedup_keys(splits: &[Split], q: usize, bmask: u64) -> Vec<Key> {
     let g = part(GROUPS, q, splits.len());
-    let total: usize = splits.iter().map(|s| s.keys.len()).sum();
-    // Twice a thread's mean share of keys, plus slack: a capacity only.
-    let mut keys = Vec::with_capacity(2 * total / splits.len() + 64);
-    for s in splits {
-        keys.extend_from_slice(&s.keys[s.starts[g.start] as usize..s.starts[g.end] as usize]);
+    let range = |s: &Split| s.starts[g.start] as usize..s.starts[g.end] as usize;
+    let mine = || splits.iter().flat_map(|s| &s.keys[range(s)]);
+    // The buckets of these groups numbered in order from 0: the bucket's bits
+    // above the group's, then its group.
+    let bucket =
+        |e: &Key| ((e.hash & bmask) >> 6) as usize * g.len() + (e.hash & 63) as usize - g.start;
+    let buckets = (bmask as usize + 1) / GROUPS * g.len();
+    let (start, mut keys) = csr(|| mine().map(|e| (bucket(e) as u32, *e)), buckets);
+    for b in 0..buckets {
+        keys[start[b] as usize..start[b + 1] as usize].sort_unstable_by_key(|e| e.hash);
     }
-    // By bucket, then hash: the rotation puts the bucket bits on top.
-    keys.sort_unstable_by_key(|e| e.hash.rotate_right(bmask.count_ones()));
-    let no_clash = |w: &[Key]| w[0].hash != w[1].hash || key_of(file, w[0]) == key_of(file, w[1]);
-    let ok = keys.windows(2).all(no_clash);
     keys.dedup_by_key(|e| e.hash);
-    ok.then_some(keys)
+    keys
 }
 
 /// The first pilot whose slots for `bucket` are all free, claimed one at a time
@@ -631,8 +646,7 @@ impl Vocab {
         // One bucket per 16 term occurrences (about 4.6 distinct terms each on
         // seed 1), and at least one per group.
         let bmask = (total / 16).max(GROUPS).next_power_of_two() as u64 - 1;
-        let groups = par(n, &|q| dedup_keys(&splits, q, bmask, file));
-        let groups: Vec<_> = groups.into_iter().collect::<Option<_>>()?;
+        let groups = par(n, &|q| dedup_keys(&splits, q, bmask));
         let distinct: usize = groups.iter().map(Vec::len).sum();
         // At least 1.5 slots per term; every third seed doubles the table.
         let bits = (distinct * 3 / 2).max(1024).next_power_of_two().ilog2() + seed as u32 / 3;
@@ -695,9 +709,18 @@ impl Vocab {
             });
             // The ids need every thread's pilots and slots.
             barrier.wait();
-            // SAFETY: Phf::slot is below 2^(64 - shift) = slots, so a slot of the
-            // table, which no thread writes any more.
-            let info = |key| (unsafe { *table.add(phf.slot(key)) } >> 96) as u32;
+            // The info of a key's slot. A slot that holds another key means that
+            // two keys have the same hash (dedup_keys keeps one key per hash): the
+            // build then needs another seed. SAFETY: Phf::slot is below
+            // 2^(64 - shift) = slots, so a slot of the table, which no thread writes
+            // any more.
+            let mut clash = false;
+            let mut info = |key| {
+                let slot = unsafe { *table.add(phf.slot(key)) };
+                // SAFETY: __m128i and u128 have the same size, and any bits are valid.
+                clash |= slot & ((1 << 96) - 1) != unsafe { transmute::<__m128i, u128>(key) };
+                (slot >> 96) as u32
+            };
             // Only long terms are in `long`: a lookup there hashes all the bytes.
             // Every long term is in it, so the index does not fail.
             let id = |&(at, len): &Term| {
@@ -707,7 +730,8 @@ impl Vocab {
                     _ => long[&file[at..at + len]],
                 }
             };
-            placed.then(|| splits[q].terms.iter().map(id).collect())
+            let ids = placed.then(|| splits[q].terms.iter().map(id).collect());
+            ids.filter(|_| !clash)
         });
         let vocab = Vocab {
             phf,
@@ -779,31 +803,30 @@ fn doc_entry(words: &[u32], c: u32, earlier: &[u32], answer: u32, pad: u32) -> D
             (terms[k], k) = (t, k + 1);
         }
     }
-    // Whether term t is present in the documents of `a`'s set bits.
-    let present = |t: u32, a: u32| {
-        t == c
-            || terms[..k]
-                .iter()
-                .position(|&o| o == t)
-                .is_some_and(|i| a >> i & 1 != 0)
-    };
-    let truth = (0..1u32 << k).map(|a| {
-        let r = words.iter().fold(false, |r, &w| {
-            let p = present(w & TERM, a);
-            match w >> 30 {
-                AND => r & p,
-                NOT => r & !p,
-                _ => r | p,
-            }
-        });
-        ((r && !earlier.iter().any(|&e| present(e, a))) as u32) << a
+    // A term's presence in all 32 assignments at once, bit a for assignment a, so
+    // the query is evaluated on all of them in one pass: c, the one word not in
+    // `terms`, is in every document. (The padding terms are never present, so
+    // the table's bits from 2^k on, a copy of the first 2^k, are never read.)
+    let index = |t: u32| terms[..k].iter().position(|&o| o == t);
+    let present = |t: u32| index(t).map_or(!0, |i| PRESENT[i]);
+    let r = words.iter().fold(0, |r, &w| {
+        let p = present(w & TERM);
+        match w >> 30 {
+            AND => r & p,
+            NOT => r & !p,
+            _ => r | p,
+        }
     });
     DocEntry {
         terms,
-        truth: truth.sum(),
+        truth: earlier.iter().fold(r, |r, &e| r & !present(e)),
         answer,
     }
 }
+
+/// Bit a of PRESENT[i] is bit i of a: where term i of a DocEntry is present.
+const PRESENT: [u32; MAX_BOOL_TERMS - 1] =
+    [0xaaaaaaaa, 0xcccccccc, 0xf0f0f0f0, 0xff00ff00, 0xffff0000];
 
 /// A phrase as its anchor term finds it: its term ids (the spec's phrases have 2
 /// to 8 terms), its answer, the anchor's position in it, and its length. One
@@ -894,17 +917,13 @@ impl Plan {
                 assert!(words.len() <= 6, "queries.txt: a BOOL of over 6 terms");
                 if always_lines[line] {
                     // end_super reads only the first len terms: the rest stay 0.
-                    let mut entry = Entry {
-                        terms: [0; MAX_BOOL_TERMS],
-                        answer,
-                        len,
-                    };
-                    entry.terms[..words.len()].copy_from_slice(words);
-                    always.push(entry);
+                    let mut terms = [0; MAX_BOOL_TERMS];
+                    terms[..words.len()].copy_from_slice(words);
+                    always.push(Entry { terms, answer, len });
                     continue;
                 }
                 // Padded with the term after the sink, in no document.
-                let (cover, n) = cover(words, cost);
+                let (cover, n, _) = cover(words, cost);
                 for (i, &c) in cover[..n].iter().enumerate() {
                     by_trigger.push((
                         c,
@@ -924,15 +943,14 @@ impl Plan {
         // thread, while this one groups the entries.
         let (always, entries, anchors) = (Mutex::new(always), OnceLock::new(), OnceLock::new());
         par(2, &|i| match i {
-            0 => _ = entries.set(csr(&by_trigger, bool_terms + 1)),
+            0 => _ = entries.set(csr(|| by_trigger.iter().flatten().copied(), bool_terms + 1)),
             _ => {
                 // By length and operators, so that `end_super` predicts its branches.
                 always.lock().unwrap().sort_unstable_by_key(|e| {
-                    e.terms
-                        .iter()
-                        .fold(e.len, |key, &word| key << 2 | word >> 30)
+                    let ops = e.terms.iter().fold(e.len, |key, &w| key << 2 | w >> 30);
+                    (ops, e.terms[0] & TERM)
                 });
-                _ = anchors.set(csr(&by_anchor, order.len()));
+                _ = anchors.set(csr(|| by_anchor.iter().flatten().copied(), order.len()));
             }
         });
         (plan.group, plan.entries) = entries.into_inner().unwrap();
@@ -980,8 +998,7 @@ impl Plan {
 /// of the blocks, summed). A BOOL line's terms get kind bit 0, and bit 1 too when
 /// it is such a query; a phrase's terms get nothing here.
 fn classify(words: &[u32], phrase: bool, cost: impl Fn(u32) -> f64, kind: &[AtomicU8]) -> bool {
-    let (cover, n) = cover(words, &cost);
-    let always = !phrase && cover[..n].iter().map(|&t| cost(t)).sum::<f64>() > ALWAYS;
+    let always = !phrase && cover(words, &cost).2 > ALWAYS;
     for &word in words.iter().filter(|_| !phrase) {
         kind[(word & TERM) as usize].fetch_or(1 | (always as u8) << 1, Relaxed);
     }
@@ -1000,8 +1017,8 @@ fn term_order(kind: &[u8], sample_df: &[u32]) -> (Vec<u32>, Vec<u32>) {
         0 => 2 * most,
         k => (3 - k as u32) / 2 * most + most - 1 - sample_df[t],
     };
-    let keyed = (0..sample_df.len()).map(|t| (key(t), t as u32)).collect();
-    let (_, order) = csr(&[keyed], 2 * most as usize + 1);
+    let keyed: Vec<_> = (0..sample_df.len()).map(|t| (key(t), t as u32)).collect();
+    let (_, order) = csr(|| keyed.iter().copied(), 2 * most as usize + 1);
     let mut rank = vec![0; order.len()];
     (0..order.len()).for_each(|id| rank[order[id] as usize] = id as u32);
     (order, rank)
@@ -1010,35 +1027,39 @@ fn term_order(kind: &[u8], sample_df: &[u32]) -> (Vec<u32>, Vec<u32>) {
 /// A set of terms of which every match contains at least one, built left to
 /// right: after `AND t` every match contains t, so {t} replaces the set when it
 /// is cheaper; after `OR t` a match contains t or a term of the set; `NOT`
-/// only removes matches. Returns the set in an array, and its size.
-fn cover(terms: &[u32], cost: impl Fn(u32) -> f64) -> ([u32; MAX_BOOL_TERMS], usize) {
-    let (mut cover, mut n) = ([0; MAX_BOOL_TERMS], 0);
+/// only removes matches. Returns the set in an array, its size and its cost (the
+/// sum of its terms' costs, kept as the set changes).
+fn cover(terms: &[u32], cost: impl Fn(u32) -> f64) -> ([u32; MAX_BOOL_TERMS], usize, f64) {
+    let (mut cover, mut n, mut sum) = ([0; MAX_BOOL_TERMS], 0, 0.0);
     for &word in terms {
         let t = word & TERM;
         match word >> 30 {
-            OR if !cover[..n].contains(&t) => (cover[n], n) = (t, n + 1),
-            AND if cost(t) < cover[..n].iter().map(|&c| cost(c)).sum() => (cover[0], n) = (t, 1),
+            OR if !cover[..n].contains(&t) => (cover[n], n, sum) = (t, n + 1, sum + cost(t)),
+            AND if cost(t) < sum => (cover[0], n, sum) = (t, 1, cost(t)),
             _ => {}
         }
     }
-    (cover, n)
+    (cover, n, sum)
 }
 
 /// Groups values by key: values of key k are `values[start[k]..start[k + 1]]`,
-/// in their original order (the parts' pairs one part after another).
-fn csr<T: Copy>(parts: &[Vec<(u32, T)>], keys: usize) -> (Vec<u32>, Vec<T>) {
+/// in their original order. `pairs` makes the (key, value) pairs, the same ones
+/// at each call: they are counted, then placed (so nothing copies them first).
+fn csr<T, I: DoubleEndedIterator<Item = (u32, T)>>(
+    pairs: impl Fn() -> I,
+    keys: usize,
+) -> (Vec<u32>, Vec<T>) {
     // The end of each key's run, then each value put before it, last value first:
     // the ends step down to the starts.
     let mut start = vec![0u32; keys + 1];
-    for &(k, _) in parts.iter().flatten() {
-        start[k as usize] += 1;
-    }
+    // for_each, not a for loop: a flat_map then loops over each slice directly.
+    pairs().for_each(|(k, _)| start[k as usize] += 1);
     (1..=keys).for_each(|k| start[k] += start[k - 1]);
     let mut values = Vec::with_capacity(start[keys] as usize);
-    for &(k, value) in parts.iter().flatten().rev() {
+    pairs().rev().for_each(|(k, value)| {
         start[k as usize] -= 1;
         values.spare_capacity_mut()[start[k as usize] as usize].write(value);
-    }
+    });
     // SAFETY: the counts add up to start[keys], so each of its slots was written once.
     unsafe { values.set_len(start[keys] as usize) };
     (start, values)
