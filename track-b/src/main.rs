@@ -83,9 +83,10 @@ const SUM_BITS: u32 = 40;
 /// MAX_DOCS^2 / 2 = 2^39, which fits in SUM_BITS.
 const MAX_DOCS: u32 = 1 << 20;
 /// A first-id log entry is `answer << 16 | id`, the id's low 16 bits, so an answer
-/// is below 2^16 (the spec has 50,000 queries) and a slice holds fewer than 2^16
-/// documents: the corpus is cut into at least this many slices (run in turns on
-/// fewer threads), about 31,000 documents each at the spec's 250,000.
+/// is below 2^16 (the spec has 50,000 queries) and a slice holds at most 2^16
+/// documents (`slices`): the corpus is cut into at least this many slices (run in
+/// turns on fewer threads), at most about 31,000 documents each at the spec's
+/// 250,000 when the lines are about equally long.
 const MIN_SLICES: usize = 8;
 /// How far ahead `end_doc` prefetches the state that the first entry of a
 /// trigger term's range updates, in ranges (1 and 4 measured the same).
@@ -1550,20 +1551,38 @@ fn movemask(v: __m256i) -> u32 {
     m
 }
 
-/// Splits the corpus into about `parts` ranges of whole lines. A block or
-/// superblock may straddle two slices: each thread sees the other's documents
-/// as containing no term, so they match nothing there.
+/// Splits the corpus into about `parts` ranges of whole lines, and a range of
+/// more than 2^16 documents (short lines) into more: a slice holds at most 2^16
+/// (MIN_SLICES). A block or superblock may straddle two slices: each thread sees
+/// the other's documents as containing no term, so they match nothing there.
 /// Returns (start, end, first id) per slice.
 fn slices(text: &[u8], parts: usize) -> Vec<(usize, usize, u32)> {
     // The cuts from 0 to text.len(), without repeats: slices are never empty.
     let cut = |p: usize| line_after(text, text.len() * p / parts);
     let mut cuts: Vec<usize> = (0..=parts).map(cut).collect();
     cuts.dedup();
-    let id = |at: usize| {
-        let tab = text[at..].iter().position(|&b| b == b'\t');
-        parse_id(&text[at..at + tab.expect("docs.txt: a line without a TAB")])
+    let id = |line: &[u8]| {
+        let tab = line.iter().position(|&b| b == b'\t');
+        parse_id(&line[..tab.expect("docs.txt: a line without a TAB")])
     };
-    cuts.windows(2).map(|c| (c[0], c[1], id(c[0]))).collect()
+    // The number of lines: the last line's id + 1.
+    let last = text.rsplit(|&b| b == b'\n').nth(1);
+    let lines = last.map_or(0, |line| id(line) + 1);
+    let mut out = Vec::new();
+    for c in cuts.windows(2) {
+        let (mut start, mut first) = (c[0], id(&text[c[0]..]));
+        // The next range's first id, or the number of lines after the last range.
+        let rest = &text[c[1]..];
+        let end = if rest.is_empty() { lines } else { id(rest) };
+        while end > first + (1 << 16) {
+            let next = text[start..].split_inclusive(|&b| b == b'\n').take(1 << 16);
+            let cut = start + next.map(<[u8]>::len).sum::<usize>();
+            out.push((start, cut, first));
+            (start, first) = (cut, first + (1 << 16));
+        }
+        out.push((start, c[1], first));
+    }
+    out
 }
 
 /// The start of the line after the one that holds byte `at`, or the end of
