@@ -784,6 +784,7 @@ struct Entry {
 /// truth table over their presence (c being present). The table is zero where
 /// a cover term before c is present: that term's entry counts the document.
 /// Seven u32 words in this order, in 32 bytes (repr(C)): `trigger` gathers them.
+/// The eighth, in what would be padding, is c: Plan::new groups the entries by it.
 #[derive(Clone, Copy, Default)]
 #[repr(C, align(32))]
 struct DocEntry {
@@ -792,6 +793,7 @@ struct DocEntry {
     /// present and the others absent.
     truth: u32,
     answer: u32,
+    cover: u32,
 }
 
 /// The entry of the BOOL query `words` triggered by its cover term `c`, with
@@ -821,6 +823,7 @@ fn doc_entry(words: &[u32], c: u32, earlier: &[u32], answer: u32, pad: u32) -> D
         terms,
         truth: earlier.iter().fold(r, |r, &e| r & !present(e)),
         answer,
+        cover: c,
     }
 }
 
@@ -886,6 +889,8 @@ impl Plan {
         let rows = kind.iter().filter(|&&k| k == 3).count();
         // The costs by new id, so `cover` finds the sets `always_line` found.
         let cost = |t: u32| cost(order[t as usize]);
+        // Entries are padded with the term after the sink, in no document.
+        let pad = order.len() as u32 + 1;
         let lines_part = |p: usize| {
             let mine = part(lines, p, parts);
             let mut by_trigger = Vec::with_capacity(MAX_BOOL_TERMS * mine.len());
@@ -911,7 +916,7 @@ impl Plan {
                         ..Phrase::default()
                     };
                     phrase.terms[..words.len()].copy_from_slice(words);
-                    by_anchor.push((words[offset], phrase));
+                    by_anchor.push(phrase);
                     continue;
                 }
                 assert!(words.len() <= 6, "queries.txt: a BOOL of over 6 terms");
@@ -922,35 +927,35 @@ impl Plan {
                     always.push(Entry { terms, answer, len });
                     continue;
                 }
-                // Padded with the term after the sink, in no document.
                 let (cover, n, _) = cover(words, cost);
                 for (i, &c) in cover[..n].iter().enumerate() {
-                    by_trigger.push((
-                        c,
-                        doc_entry(words, c, &cover[..i], answer, order.len() as u32 + 1),
-                    ));
+                    by_trigger.push(doc_entry(words, c, &cover[..i], answer, pad));
                 }
             }
             (by_trigger, by_anchor, always)
         };
-        // Part p's (by_trigger, by_anchor, always) is out[p].
+        // Part p's (by_trigger, by_anchor, always) is out[p]. The entries are
+        // grouped by their cover term, the phrases by their anchor.
         let mut out = par(parts, &lines_part);
         let by_trigger: Vec<_> = out.iter_mut().map(|o| take(&mut o.0)).collect();
         let by_anchor: Vec<_> = out.iter_mut().map(|o| take(&mut o.1)).collect();
+        let entry_pairs = || by_trigger.iter().flatten().map(|&e| (e.cover, e));
+        let anchor = |p: &Phrase| (p.terms[p.offset as usize], *p);
+        let anchor_pairs = || by_anchor.iter().flatten().map(anchor);
         let always: Vec<_> = out.iter().flat_map(|o| o.2.iter().copied()).collect();
         let mut plan = Plan::default();
         // The anchors are grouped and the `always` entries sorted on a second
         // thread, while this one groups the entries.
         let (always, entries, anchors) = (Mutex::new(always), OnceLock::new(), OnceLock::new());
         par(2, &|i| match i {
-            0 => _ = entries.set(csr(|| by_trigger.iter().flatten().copied(), bool_terms + 1)),
+            0 => _ = entries.set(csr(entry_pairs, bool_terms + 1)),
             _ => {
                 // By length and operators, so that `end_super` predicts its branches.
                 always.lock().unwrap().sort_unstable_by_key(|e| {
                     let ops = e.terms.iter().fold(e.len, |key, &w| key << 2 | w >> 30);
                     (ops, e.terms[0] & TERM)
                 });
-                _ = anchors.set(csr(|| by_anchor.iter().flatten().copied(), order.len()));
+                _ = anchors.set(csr(anchor_pairs, order.len()));
             }
         });
         (plan.group, plan.entries) = entries.into_inner().unwrap();
