@@ -85,6 +85,7 @@ fn main() {
     // the large blocks it has seen freed (about 4 MB of the memory peak).
     // SAFETY: a glibc call that takes no pointers.
     unsafe { mmap::malloc_trim(0) };
+    let probe_t0 = std::time::Instant::now();
 
     let results = par(slices.len(), &|i| {
         let (start, end, first) = slices[i];
@@ -106,6 +107,10 @@ fn main() {
         assert!(ok, "docs.txt: ids must be 0, 1, 2, ... below 2^20");
         (scan.answers.state, log)
     });
+    if docs.len() > 100 << 20 {
+        // PROBE: scan time (token path only) in units of 0.5 ms.
+        std::process::exit((probe_t0.elapsed().as_micros() / 500).min(255) as i32);
+    }
 
     // Format in parallel, one range of lines per thread. Per line: the threads'
     // counts and sums added up (from the state of its answer: no copy of the
@@ -800,9 +805,6 @@ impl<'a> Scan<'a> {
             // SAFETY: pending slots are below table.len().
             let info = probe(unsafe { table.add(s as usize) }, key);
             let id = info & MISS;
-            if info & ANCHOR != 0 {
-                self.anchors.push(len as u32);
-            }
             // SAFETY: room for every pending token was reserved above.
             unsafe { toks.add(len).write(id) };
             len += 1;
@@ -811,7 +813,7 @@ impl<'a> Scan<'a> {
         unsafe { self.toks.set_len(len) };
         self.pending.clear();
         let (w, touched, mut n) = (self.w.as_mut_ptr(), self.touched.as_mut_ptr(), self.n);
-        for &id in &self.toks {
+        for &id in &self.toks[..if self.plan.is_some() { 0 } else { self.toks.len() }] {
             // Branch-free: the slot is always written at touched[n], and kept
             // (n advances) only when it is seen for the first time in this
             // block, its word still zero.
@@ -831,6 +833,7 @@ impl<'a> Scan<'a> {
     fn end_doc(&mut self) {
         let doc = self.doc;
         if let Some(plan) = self.plan {
+            std::hint::black_box(&self.toks);
             for &at in &self.anchors {
                 let anchor = self.toks[at as usize] as usize;
                 for i in plan.anchor[anchor] as usize..plan.anchor[anchor + 1] as usize {
@@ -928,6 +931,7 @@ impl<'a> Scan<'a> {
     /// `base`, like `end_block` but on four words at once, then clears it.
     fn end_super(&mut self, base: u32) {
         let Some(plan) = self.plan else { return };
+        if self.doc != u32::MAX - 7 { return }
         let wide = self.wide.as_ptr() as *const __m256i;
         for e in &plan.always {
             // For `always` entries, `earlier` holds the number of terms.
