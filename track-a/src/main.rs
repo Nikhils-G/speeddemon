@@ -78,74 +78,46 @@ fn main() {
     // SAFETY: all-zero bytes are an empty table (every field is valid as zeros).
     // Allocated zeroed, its pages are mapped as the parse first touches them.
     let table: &Interner = Box::leak(unsafe { Box::new_zeroed().assume_init() });
-    let parts: Vec<Part> = thread::scope(|s| {
-        let spawn = |p| s.spawn(move || parse(&log[cut(p)..cut(p + 1)], table));
-        let handles: Vec<_> = (0..threads).map(spawn).collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-
-    // (id, name) of every endpoint, in byte order of the names: first by the first
-    // 16 bytes as one number, so few comparisons need the bytes themselves, then
-    // by the full bytes on ties.
-    // SAFETY: the parse is over, so nothing writes the table any more.
-    let count = table.count.load(Relaxed);
-    let names = table.names[..count].iter().map(|n| unsafe { &**n.get() });
-    let mut endpoints: Vec<_> = names.enumerate().collect();
-    endpoints.sort_by_cached_key(|&(_, name)| (sort_key(name), name));
-
-    // Every part's runs as ((hour key, first record, first escape), part, end
-    // record), in order of hour then part, cut into hours.
-    let mut runs = Vec::new();
-    for (p, (_, _, heads)) in parts.iter().enumerate() {
-        runs.extend(heads.windows(2).map(|w| (w[0], p, w[1].1)));
-    }
-    runs.sort_unstable_by_key(|run| (run.0.0, run.1));
-    let hours: Vec<&[_]> = runs.chunk_by(|a, b| a.0.0 == b.0.0).collect();
+    // One pool of threads for both passes: each parses its slice, then waits for
+    // the merge below (done on this thread once every part is in) and goes on with
+    // pass 2, so no thread is joined or started between the passes.
+    let parts: Vec<OnceLock<Part>> = (0..threads).map(|_| OnceLock::new()).collect();
+    let (merged, order): (OnceLock<Merged>, OnceLock<Vec<(usize, &[u8])>>) = Default::default();
     // How many hours still read each part's records: the hour that brings its
     // part's count to zero gives the rest of them back.
     let readers: Vec<AtomicUsize> = parts.iter().map(|_| AtomicUsize::new(0)).collect();
-    for runs in runs.chunk_by(|a, b| (a.0.0, a.1) == (b.0.0, b.1)) {
-        readers[runs[0].1].fetch_add(1, Relaxed);
-    }
-
-    // The output is mapped shared at a size no output can exceed, and cut to its
-    // length at the end. On tmpfs, where /out is, one write call per hour would
-    // serialise on the file's lock; page faults on the mapping do not. A line is
-    // the 21-byte hour label and its space, the name (at most 125 bytes, checked by
-    // the parse), six numbers of at most 10 digits after a space each, and LF.
-    let bound = hours.len() * endpoints.len() * (21 + 1 + 125 + 6 * 11 + 1);
-    output.set_len(bound as u64).expect("size the summary");
-    // Kept as an address: a raw pointer could not be shared by the threads below,
-    // which each write only their own hours' bytes.
-    let file = map(null_mut(), bound, 3, 1, output.as_raw_fd()) as usize; // READ | WRITE; SHARED
-    // Where an hour's output starts, once the lengths of all earlier hours are known.
-    let lens: Vec<OnceLock<usize>> = hours.iter().map(|_| OnceLock::new()).collect();
-    let offset = |hour| lens[..hour].iter().try_fold(0, |at, n| Some(at + n.get()?));
-    // Writes the pending hours whose start is known.
-    let flush = |pending: &mut Vec<(usize, usize, Vec<(&[u8], Stats)>)>| {
-        pending.retain(|&(hour, len, ref groups)| {
-            let Some(at) = offset(hour) else { return true };
-            // SAFETY: bytes at..at + len of the mapping are this hour's alone, and
-            // at + len <= bound: every line is at most 214 bytes.
-            let out = unsafe { std::slice::from_raw_parts_mut((file + at) as _, len) };
-            let head = (hours[hour][0].0.0 << 24).to_be_bytes(); // its first 13 bytes
-            let mut written = 0;
-            for &(name, stat) in groups {
-                written += write(&head, name, stat, &mut out[written..]);
-            }
-            assert_eq!(written, len, "hour length");
-            false
-        })
-    };
-
-    // Pass 2, parallel over hours: each thread takes the next hour, gathers its
-    // records from every part, groups them by endpoint id, computes each group's
-    // statistics and the hour's length, then writes each of its hours once the
-    // earlier hours' lengths are known, taking further hours meanwhile.
     let next = AtomicUsize::new(0);
     thread::scope(|s| {
-        for _ in 0..threads {
-            s.spawn(|| {
+        for p in 0..threads {
+            let (parts, merged, order, readers, next) = (&parts, &merged, &order, &readers, &next);
+            s.spawn(move || {
+                let _ = parts[p].set(parse(&log[cut(p)..cut(p + 1)], table));
+                let ((runs, file, lens), endpoints) = (merged.wait(), order.get().unwrap());
+                let parts: Vec<&Part> = parts.iter().map(|part| part.get().unwrap()).collect();
+                let hours = hours_of(runs);
+                // Where an hour's output starts, once the lengths of all earlier hours are known.
+                let offset = |hour| lens[..hour].iter().try_fold(0, |at, n| Some(at + n.get()?));
+                // Writes the pending hours whose start is known.
+                let flush = |pending: &mut Vec<(usize, usize, Vec<(&[u8], Stats)>)>| {
+                    pending.retain(|&(hour, len, ref groups)| {
+                        let Some(at) = offset(hour) else { return true };
+                        // SAFETY: bytes at..at + len of the mapping are this hour's alone, and
+                        // at + len <= bound: every line is at most 214 bytes.
+                        let out = unsafe { std::slice::from_raw_parts_mut((file + at) as _, len) };
+                        let head = (hours[hour][0].0.0 << 24).to_be_bytes(); // its first 13 bytes
+                        let mut written = 0;
+                        for &(name, stat) in groups {
+                            written += write(&head, name, stat, &mut out[written..]);
+                        }
+                        assert_eq!(written, len, "hour length");
+                        false
+                    })
+                };
+
+                // Pass 2, parallel over hours: each thread takes the next hour, gathers its
+                // records from every part, groups them by endpoint id, computes each group's
+                // statistics and the hour's length, then writes each of its hours once the
+                // earlier hours' lengths are known, taking further hours meanwhile.
                 let (mut start, mut counts) = ([0u32; MAX_ENDPOINTS + 1], [0u64; MAX_ENDPOINTS]);
                 let (mut values, mut pending) = (Vec::new(), Vec::new());
                 loop {
@@ -200,7 +172,7 @@ fn main() {
                     }
                     // The groups in byte order of their names.
                     let (mut groups, mut len) = (Vec::with_capacity(endpoints.len()), 0);
-                    for &(id, name) in &endpoints {
+                    for &(id, name) in endpoints {
                         let group = &mut values[start[id] as usize..start[id + 1] as usize];
                         if !group.is_empty() {
                             let [p50, p95, p99] = percentiles(group);
@@ -221,8 +193,44 @@ fn main() {
                 }
             });
         }
+
+        // (id, name) of every endpoint, in byte order of the names: first by the first
+        // 16 bytes as one number, so few comparisons need the bytes themselves, then
+        // by the full bytes on ties.
+        let parts: Vec<&Part> = parts.iter().map(OnceLock::wait).collect();
+        // SAFETY: the parse is over, so nothing writes the table any more.
+        let count = table.count.load(Relaxed);
+        let names = table.names[..count].iter().map(|n| unsafe { &**n.get() });
+        let mut endpoints: Vec<_> = names.enumerate().collect();
+        endpoints.sort_by_cached_key(|&(_, name)| (sort_key(name), name));
+
+        // Every part's runs, in order of hour then part.
+        let mut runs = Vec::new();
+        for (p, (_, _, heads)) in parts.iter().enumerate() {
+            runs.extend(heads.windows(2).map(|w| (w[0], p, w[1].1)));
+        }
+        runs.sort_unstable_by_key(|run| (run.0.0, run.1));
+        let hours = hours_of(&runs).len();
+        for runs in runs.chunk_by(|a, b| (a.0.0, a.1) == (b.0.0, b.1)) {
+            readers[runs[0].1].fetch_add(1, Relaxed);
+        }
+
+        // The output is mapped shared at a size no output can exceed, and cut to its
+        // length at the end. On tmpfs, where /out is, one write call per hour would
+        // serialise on the file's lock; page faults on the mapping do not. A line is
+        // the 21-byte hour label and its space, the name (at most 125 bytes, checked by
+        // the parse), six numbers of at most 10 digits after a space each, and LF.
+        let bound = hours * endpoints.len() * (21 + 1 + 125 + 6 * 11 + 1);
+        output.set_len(bound as u64).expect("size the summary");
+        // Kept as an address: a raw pointer could not be shared by the threads,
+        // which each write only their own hours' bytes.
+        let file = map(null_mut(), bound, 3, 1, output.as_raw_fd()) as usize; // READ | WRITE; SHARED
+        let lens = (0..hours).map(|_| OnceLock::new()).collect();
+        order.set(endpoints).ok();
+        merged.set((runs, file, lens)).ok();
     });
-    let total = offset(hours.len()).unwrap();
+    let lens = &merged.get().unwrap().2;
+    let total: usize = lens.iter().map(|len| len.get().unwrap()).sum();
     output.set_len(total as u64).expect("size the summary");
     // The output is complete in the page cache. Exit now: dropping the tables
     // above, one free at a time, took a few milliseconds on the scoring box.
@@ -288,6 +296,20 @@ static PAIRS: &[u8; 200] = b"000102030405060708091011121314151617181920212223242
 /// each run of lines in one hour starts, as (hour key, first record, first
 /// escape), then an end marker.
 type Part = (Vec<u32>, Vec<u32>, Vec<(u128, usize, usize)>);
+
+/// A run of one part's records in one hour: ((hour key, first record, first
+/// escape), part, end record).
+type Run = ((u128, usize, usize), usize, usize);
+
+/// The runs, in order of hour then part, cut into hours.
+fn hours_of(runs: &[Run]) -> Vec<&[Run]> {
+    runs.chunk_by(|a, b| a.0.0 == b.0.0).collect()
+}
+
+/// What the merge between the passes hands to pass 2 besides the endpoint order:
+/// all runs in order of hour then part, the output mapping's address and each
+/// hour's output length once known.
+type Merged = (Vec<Run>, usize, Vec<OnceLock<usize>>);
 
 /// Parses the lines of `chunk`, a slice of the mapped log, which goes on with PAD
 /// zero bytes, then gives the chunk's pages back. Every line is
