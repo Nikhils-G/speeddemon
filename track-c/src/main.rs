@@ -49,7 +49,7 @@ compile_error!("track-c needs AVX2 and PCLMULQDQ: build with RUSTFLAGS=\"-C targ
 #[cfg(not(target_feature = "aes"))]
 compile_error!("track-c needs AES (the name hash): build with RUSTFLAGS=\"-C target-cpu=native\"");
 
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering::*};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering::*};
 use std::{arch::x86_64::*, fmt::Write, os::fd::AsRawFd, ptr::null_mut, sync::Mutex, thread};
 
 /// Each thread parses this many runs, on average: they are claimed as threads go,
@@ -119,6 +119,9 @@ unsafe extern "C" {
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     fn mallopt(param: i32, value: i32) -> i32;
     fn prctl(option: i32, ...) -> i32;
+    fn sched_getcpu() -> i32;
+    fn sched_getaffinity(pid: i32, size: usize, mask: *mut u64) -> i32;
+    fn sched_setaffinity(pid: i32, size: usize, mask: *const u64) -> i32;
 }
 
 // Their constants, from the Linux and glibc headers.
@@ -239,6 +242,11 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
     let countries = Mutex::new(vec![b"_UNMATCHED".to_vec()]);
     // regions.csv chunks claimed and entered, runs claimed, threads done filing pairs.
     let [next_chunk, chunks_done, next_run, flushed]: [AtomicUsize; 4] = Default::default();
+    // The CPUs the threads found themselves on after regions.csv, a bit each, and the
+    // ones they may use (CPUs 0 to 63; none if there are more, or the call fails).
+    let (on, mut allowed) = (AtomicU64::new(0), 0);
+    // SAFETY: a system call that writes the 8 bytes of `allowed`.
+    unsafe { sched_getaffinity(0, 8, &mut allowed) };
     // Each thread's table (its partition), and its inbox: buffers of pairs filed
     // under it that it has not taken yet. Buffers are handed over, not copied (copying
     // them: +1.2 ms). Emptied buffers go to one pool that every filer draws from
@@ -286,6 +294,21 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
             chunks_done.fetch_add(1, Release);
         }
         wait(&chunks_done, REGION_CHUNKS);
+        // Two threads can start on one CPU while another one idles, and the scheduler
+        // then leaves them there for most of the run (+20% in about 1 board run in 4).
+        // The second one to get here moves to a CPU it may use that no thread has
+        // claimed, if any.
+        // SAFETY: a libc call that touches no memory of ours.
+        let cpu = unsafe { sched_getcpu() } as u32 % 64;
+        let seen = on.fetch_or(1 << cpu, AcqRel);
+        // The lowest CPU it may use that no thread has claimed (0 if none is left).
+        let free = !seen & allowed;
+        let bit = free & free.wrapping_neg();
+        if seen >> cpu & 1 == 1 && bit != 0 && on.fetch_or(bit, AcqRel) & bit == 0 {
+            // SAFETY: a system call that reads the 8 bytes of `bit`; a failure keeps the
+            // thread where it is.
+            unsafe { sched_setaffinity(0, 8, &bit) };
+        }
         // Runs are claimed one at a time, so a thread slowed down parses fewer of
         // them, and no thread waits for another one until the end.
         while let Some(nth) = claim(&next_run, runs) {
