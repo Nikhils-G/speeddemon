@@ -91,16 +91,17 @@ fn main() {
     // cut is the end of the log, which ends with an LF). Cuts never decrease, so the
     // slices hold every line once; two cuts in one line give an empty slice.
     let threads = thread::available_parallelism().map_or(1, |n| n.get());
-    // Four pairs of slices per thread, taken in file order from a shared counter.
+    // Two pairs of slices per thread, taken in file order from a shared counter.
     // With one slice each, the scheduler sometimes put two threads on one CPU and
     // they kept it for the whole parse (4 of 30 runs on the test server, dev build):
     // the last thread finished its parse 4.9 to 8.0 ms after the first, and the run
     // took 18.1-20.8 ms against 14.6-15.6 ms (PERF.md, step 38). Now a slowed thread
-    // just parses fewer slices. (Eight slices: 0.47 ms slower, from the per-slice
-    // work; pinning each thread to a CPU instead: worse, a pinned thread cannot
+    // just parses fewer slices. (Four pairs a thread: 0.3 ms slower on the test
+    // server, 61 interleaved runs, from the per-slice work, mostly each slice's
+    // release; pinning each thread to a CPU instead: worse, a pinned thread cannot
     // leave a CPU that something else is using.) A pair is parsed side by side (see
     // `parse`); the count is even, so a pair's second slice always exists.
-    let slices = threads * 8;
+    let slices = threads * 4;
     // cut(p) may read the end of slice p - 1 after its pages were released: they
     // fault back in from the page cache unchanged (see release).
     let lf = |p| log[..len * p / slices].iter().rposition(|&b| b == b'\n');
@@ -440,15 +441,10 @@ unsafe fn parse(chunks: [&[u8]; 2], table: &Interner, free: &mut &'static mut [u
     // `most[k]` lines, one record each. `free` is not used meanwhile. The slices may
     // go back to the kernel at the end (the caller's contract): their endpoint names
     // were copied (see Interner::add).
-    // Written as a macro, not a closure, so that the line's code is always in the
-    // loop (a closure this size was not inlined once the long way was).
-    macro_rules! step {
-        ($k:expr) => {{
-            let k = $k;
-            'step: {
+    let mut step = |k: usize| unsafe {
         let line = &mut line[k];
         if *line >= stop[k] {
-            break 'step false;
+            return false;
         }
         // Lines from one shard arrive in time order, so most lines repeat the
         // previous line's hour. Its bytes "MM-DDTHH" (5..13) decide: every timestamp
@@ -512,14 +508,9 @@ unsafe fn parse(chunks: [&[u8]; 2], table: &Interner, free: &mut &'static mut [u
         record[k] = record[k].add(1);
         *line = to.add(5 + count + 1);
         true
-            }
-        }};
-    }
-    // SAFETY: see above.
-    unsafe {
-        while step!(0) & step!(1) {}
-        while step!(0) | step!(1) {}
-    }
+    };
+    while step(0) & step(1) {}
+    while step(0) | step(1) {}
     // SAFETY: the slices go back to the kernel (the caller's contract); nothing reads
     // them again.
     chunks.iter().for_each(|chunk| unsafe { release(*chunk) });
@@ -675,7 +666,8 @@ impl Interner {
     /// # Safety
     ///
     /// The 128 bytes from `from` must be readable.
-    #[inline(always)]
+    #[cold]
+    #[inline(never)]
     unsafe fn id(&self, from: *const u8) -> (u32, usize) {
         // SAFETY: AVX2 and SSE4.2 are enabled; the reads stay within the 128 bytes
         // from `from` (the caller's contract) and within KEEP (len <= 125, asserted).
