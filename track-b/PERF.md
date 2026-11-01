@@ -39,14 +39,20 @@ box, so no decision rests on one run.
 | 28 | 841e809 | The block end in two passes (README, design 3): ranges gathered and prefetched first, then words and state fetched 4 ranges ahead of the evaluation (test server −4.5 to −5.7%); the formatter reads each thread's state through `answer_of` instead of a copy (M back to 39 MB). Rerun on 2515d02, run-65497002e714: 0.1381 s, 38.68 MB, 74.88 | run-3814466b62c2 | 0.1374 | 39.22 | 875 | 74.94 |
 | 29 | 7fc8af9 | Fewer lines with the hot loops unchanged (Rust 864 → 778 code lines, the token and LF masks from one load; test server −1.3%), and the PGO training run with LLVM's atomic profile counters (fb34663, all tracks) | run-59b2e0a8fdd5 | 0.1353 | | 789 | 75.44 |
 | 30 | 31cbd48 | Query parsing relies on the spec's query grammar (2.3) instead of re-checking it; malformed lines still abort on a slice bound. Neutral on the test server | run-ff1d9b72da23 | 0.1338 | 39.21 | 781 | 75.60 |
-| 31 | 776e1dc | A perfect hash of the query terms instead of the 4-way bucket table (README, design 2): two AES rounds as the hash, one 16-byte slot per term, a branch-free probe, built on 12 threads. Test server −8.4%, 12-thread cycles −11%; box −10.4%. Rerun run-6471e474f20a: 0.1231 s, 39.55 MB, 76.35 | run-4a28a650e9ac | 0.1199 | 39.62 | 818 | 76.64 |
-| 32 | bdf6d27 | Fewer lines in cold code only: the hot functions compile to the same instructions as step 31's. Test server: two PGO builds 84.96 and 85.28 ms (median of 31 runs, mean of 3 interleaved rounds) against step 31's three builds 85.98, 85.25 and 85.96 | run-0741f63811ab | 0.1205 | 39.67 | 796 | 76.67 |
+| 31 | 776e1dc | A perfect hash of the query terms instead of the 4-way bucket table (README, design 2): two AES rounds as the hash, one 16-byte slot per term, a branch-free probe, built on 12 threads. Test server −8.4%, 12-thread cycles −11%; box −10.4%. | run-4a28a650e9ac | 0.1199 | 39.62 | 818 | 76.64 |
+| 32 | bdf6d27 | Fewer lines in cold code only: the hot functions compile to the same instructions as step 31's. Test server: two PGO builds 84.96 and 85.28 ms (median of 31 runs, mean of 3 interleaved rounds) against step 31's three builds 85.98, 85.25 and 85.96. Rerun on bbdb79e (B unchanged), run-a361a4d1c316: 0.1189 s, 40.13 MB, 76.82, the best B run | run-0741f63811ab | 0.1205 | 39.67 | 796 | 76.67 |
+| 33 | ecc8c7d | Setup in compact pre-sized records (README, design 1): 8- and 16-byte split records that never grow, grouped by `csr`; the long-term map asked only about terms over 12 bytes; the plan's kind bits, term order and renumbering in parallel or by counting sort; `malloc_trim` before the scan. Test server 86.8/87.2 → 83.8/83.8 ms (21 interleaved runs, two rounds), setup 16.8 → 11.6 ms. C ran slow in the same dispatch (0.0252 s against 0.0217 to 0.0221) | run-c9888b108142 | 0.1252 | 41.48 | 847 | 76.06 |
+| 34 | c43ef66 | A 1 MB sample instead of 2 MB. Test server 84.0/83.7/84.0 → 82.5/82.2/82.9 ms (3 × 21 interleaved runs); 512 KB planned worse (87.1 and 87.2 ms against 83.4 and 83.0 for 1 MB in the same rounds) | run-ffe904556c9a | 0.1174 | 41.76 | 847 | 76.75 |
+| 35 | b25326b | Hot loops aligned to 64 bytes (`-C llvm-args=-align-loops=64`) in the profile-use build of A, B and C; B's code unchanged. B slower than step 34's 0.1174, so B's Dockerfile dropped the flag in step 36 | run-178d358d9dc4 | 0.1206 | | 847 | 76.47* |
+| 36 | 250436c | Fewer lines in setup and the plan only (S 847 → 817), without loop alignment. A slow-box dispatch: A, unchanged, ran 0.0260 s against its best 0.0189 | run-39e2a79a78c4 | 0.1479 | | 817 | 74.36* |
+| 37 | a02cacb | Step 36 with loop alignment back on (test server: with the flag, step 36 times the same as step 34; without it, 1.5 to 2.5 ms slower). A slow-box dispatch again: A, unchanged, ran 0.0266 s. Rerun on f8206db (B unchanged), run-00e91f7a4d7b: 0.1203 s, 42.16 MB, 76.60 | run-b2ce4f101146 | 0.1313 | | 817 | 75.66* |
 
-Step 32 is the current code. S is the harness's `static_axes.py` count, which matches the board for
+Step 37 is the current code. S is the harness's `static_axes.py` count, which matches the board for
 every run where the board's S was logged. M is blank where it was not logged. Points marked * are
 computed from T and S with the board's formula: every M logged since step 6 is under the 44 MB cap
 (26.8 to 41.7 MB) except step 26's 44.09 MB, which costs 0.01 points, and the formula reproduces every
-logged point value to within 0.01. M is blank for step 29 because runs.log did not record it.
+logged point value to within 0.01. M is blank for steps 29 and 35 to 37 because runs.log did not
+record it; steps 33 to 37 are at 41.5 to 42.2 MB wherever it was logged.
 Steps 24 and 27 are the round's reverted experiments; step 23 was
 kept because its server gain was clear and the box did not show it slower than step 22 once
 step 24 ran without the disturbance.
@@ -139,6 +145,41 @@ step 24 ran without the disturbance.
   storage landed. A plain build of the final cut ran 3.4% slower than a plain build of step 31, also
   with identical hot instructions, while its PGO builds tied. The cut was taken on the identical hot
   code and the PGO tie, and the board run is the check.
+- **Timing probes on the box, again** (steps 31 and 32's code). Two builds of step 31 stopped at the
+  end of the scan, one with the BOOL evaluation turned off: run-dec0ff56b77b exited with 118 (ms) and
+  run-9ce29e8f1465 with 79, so the BOOL evaluation costs about 39 ms on the box, twice its 19 ms on
+  the test server, and the token path is the larger part. A build of step 32 stopped at the end of
+  setup: run-dbda057bda65 exited with 165 (units of 0.1 ms), so setup took 16.5 ms, the same as the
+  test server's 16.4 to 16.8 ms. That made the test server's setup numbers usable for step 33.
+- **Step 33: what parallel setup waits on is the kernel.** With setup already on twelve threads, a
+  test-server profile of a build that stops after setup showed the time going to kernel spin locks and
+  page faults, and even after step 33 the setup spends more CPU time in the kernel than in the program
+  (34.6 of 58 ms): page faults of freshly allocated, growing vectors, and the mmap lock that
+  their reallocations and the thread spawns take. Smaller records (8 and 16 bytes instead of 48 and
+  32) that never grow, a counting sort instead of a comparison sort for the grouping and the term
+  order, and no merge copies cut setup from 16.8 to 11.6 ms. One cut was a plain bug: every term's id
+  was read through the map of long terms first, which hashes all of a term's bytes with SipHash,
+  though only terms over 12 bytes are in it. A thread pool and threads spawned in a tree, aimed at
+  the spawn stagger (the twelfth thread started about 1 ms after the first), gave nothing.
+  `malloc_trim(0)` is needed because of the pre-sized vectors: once glibc has seen large blocks
+  freed it keeps freed memory resident, and the peak rose from 39.4 to 44.6 MB until the trim
+  brought it back to 41.5 MB (12-CPU container on the test server).
+- **Step 34: a smaller sample plans as well.** 1 MB (about 1,030 documents) gives the same plan
+  quality as 2 MB for 1.4 ms less setup on the test server; 512 KB plans worse (about +4 ms in
+  total).
+- **Steps 35 to 37: loop alignment and layout.** Without the flag, step 36's build ran 84.0 to 85.3 ms
+  on the test server against step 34's 82.4 to 82.8, with the same instruction count (5.250G) and
+  1.7% more task-clock, and every edited variant we bisected landed at 83.6 to 86 ms: step 34's build
+  was a lucky layout. With `-align-loops=64` both builds time the same (medians of 3 × 21 interleaved
+  runs: step 34 82.2, 83.1 and 82.3 ms; step 36 82.2, 82.2 and 82.8). On the box the picture is not
+  settled: step 35 (flag on, code of step 34) ran 0.1206 s against 0.1174 without, and steps 36 and 37
+  fell on slow-box dispatches (A, unchanged, 37 to 41% over its best); the clean rerun of step 37
+  gave 0.1203 s.
+- **Steps 36–37: lines from setup and the plan.** S 847 → 817 with no hot function touched: an
+  operator lookup from the low bits of its first byte (`A`, `N`, `O` end in binary 01, 10, 11), split
+  types rustfmt keeps on one line, a shorter grouping and key-length expression, a u32 counting-sort
+  key and the parts' results merged with `unzip` instead of a loop. The harness counts rustfmt's
+  output, so only real simplifications count; re-wrapping lines does not.
 - **A measurement bug**: some test-server A/B comparisons after step 11 compared a stale binary,
   because copied source files kept older modification times and cargo did not rebuild. It was found
   and fixed; every keep-or-revert decision above rests on board runs, not on those comparisons.
@@ -165,6 +206,20 @@ Board-measured reverts are in the table above (steps 11, 12, 14, 24 and 27). The
 | An intermediate version of step 32 (S 802, hot code identical too) | test server +1.1% against step 31 in one session (two builds each, 3 rounds of 21 runs) and +0.35% in the next; its PGO builds also moved `end_block` 16 bytes off step 31's 64-byte alignment. The final set (S 796) moves it too and ties, so the alignment is not the cause; the spread is the build-to-build variance of step 32's note |
 | Bucket count from the distinct terms instead of the term occurrences | not built: at full scale the two give the same 16,384 buckets; it would only spare the tiny inputs their re-seeds (README, design 2) |
 | Document frequencies sampled into 2^16 hashed u16 counters, to overlap the sample with query parsing | simulated on seed 1: hash collisions move queries to the superblock path (5,882 → about 8,530), +138M instructions in total; not built |
+| A per-segment index (1,024 documents, built at block ends, every non-`always` BOOL query checked per segment, after the box probe showed 39 ms of BOOL work) | exact; four versions +20, +15, +16 and +12 ms on the test server (86 ms base, 12 threads). One thread, version 4 against today's block path (0.28G cycles): recording and regrouping the 10.4M (term, block) words alone 0.17G, the checks 0.03G, the 2.14M live evaluations 0.29G. Killed |
+| An index built inside the scan (bitsets for the top 180 terms, u16 document lists) | C microbenchmark on one laptop thread (i5-11320H, 1.25 MB L2 like the box), full corpus: tokenize + hash + probe 10.0 ns/token, presence words +2.3, the index instead +6.7 ns/token over presence words; scaled to the box about 30 to 40 ms, more than the 39 ms of BOOL work it would replace. Not built |
+| Row terms written straight into superblock rows (no move at the block end) | not built: the block-end pass it saves measured about 7 core-cycles per slot, the row move 3 to 4, and it adds an address select to each of 27.6M BOOL tokens in a loop that is uop-bound (+1.5 cycles each); net 0 to −2 ms, under the build-to-build spread |
+| Superblocks of 512 documents (two AVX2 vectors per term) | test server 87.5 / 87.8 ms against 87.0; with ALWAYS 0.125, 89.5 / 89.8 |
+| ALWAYS 0.18 / 0.32 with the 1 MB sample | 82.6–83.3 / 85.1–85.4 ms against 82.0–82.5 (0.25 kept) |
+| Phrase-anchor neighbour pre-check: compare the term next to the anchor before the whole phrase; with or without a branch-free anchor capture in `look_up` | exact; 12 threads −0.4% (pre-check only), +1.2% (both), +6% (capture only); one thread −1.8% / −3.7% / −0.3% cycles; +16 S. Not pushed |
+| A thread pool for every parallel phase; threads spawned in a tree | no setup gain on the test server: the threads then started together but waited on page faults instead |
+| glibc's mmap threshold fixed at 128 KB (`mallopt`) instead of `malloc_trim` | M 37.3 MB, but setup +2 ms of munmap |
+| `MADV_POPULATE_READ` on each slice before its scan | +22 ms |
+| No grouping of keys per split (each hash-build thread filters every split's keys by group) | +2 ms: the group test is a random branch |
+| Ids and spans written by the hash-build threads straight into the final vectors (no serial concat) | setup −0.6 ms for +15 lines, a wash |
+| `Vocab::finish` in parallel | slower: the spawn costs more than the 0.4 ms loop |
+| Results written with `pwrite` from every formatting thread, and states, logs and scan tables released in parallel before exit | within noise |
+| Entries aligned to 32 bytes (no entry across two cache lines) | step 34's build 84.7 ms against 82.4 without |
 
 ## Correctness checks run before every push
 
@@ -179,4 +234,7 @@ failure paths are tested by forcing them: four builds that fail seed 0 outright,
 offer seed 0's buckets a single pilot (no free pilot); each must give the reference output on the
 full, sample, holdout, tiny and adversarial inputs at 1 and 8 CPUs, and each did. Seed 0 succeeds on the full and sample inputs; the tiny
 inputs re-seed, usually up to seed 3 (README, design 2), so every gate run also exercises the
-re-seed and doubling path.
+re-seed and doubling path. From step 33 on, every gate also runs fresh seeds the earlier checks had
+not seen (tiny seeds 701 to 706 and sample seeds 41 to 43, against the reference at 1, 3 and 8 CPUs),
+an adversarial set of 1-term phrases, absent terms and `x NOT x` queries whose answers are mostly
+empty, holdout seed 99 byte for byte, and the seed-1 hash at 1, 3, 7 and 8 CPUs.
