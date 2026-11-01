@@ -9,7 +9,7 @@ RUN python3 c_join.py --seed 7 --scale sample --out /tmp/train > /dev/null \
  && RUSTFLAGS="-C target-cpu=native -C target-feature=+crt-static -C profile-generate=/tmp/pgo -C llvm-args=-instrprof-atomic-counter-update-all" cargo build --release --offline \
  && mkdir /tmp/out && target/release/solution /tmp/train /tmp/out \
  && llvm-profdata merge -o /tmp/pgo.profdata /tmp/pgo \
- && RUSTFLAGS="-C target-cpu=native -C target-feature=+crt-static -C profile-use=/tmp/pgo.profdata" cargo build --release --offline
+ && RUSTFLAGS="-C target-cpu=native -C target-feature=+crt-static -C profile-use=/tmp/pgo.profdata -C llvm-args=-align-loops=64" cargo build --release --offline
 
 FROM debian:13-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
 COPY --from=build /src/target/release/solution /app/solution
