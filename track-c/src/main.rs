@@ -105,8 +105,8 @@ struct Record {
     next: usize,
 }
 
-// libc, declared by hand so that the crate has no dependencies. The constants passed
-// to them are written as numbers, named in a comment, from the Linux and glibc headers.
+// libc, declared by hand so that the crate has no dependencies. Their constants, from
+// the Linux and glibc headers, are named where they are passed.
 // SAFETY: glibc's signatures on x86-64 Linux; prctl is declared variadic, as in C.
 unsafe extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, at: i64) -> *mut u8;
@@ -120,15 +120,33 @@ unsafe extern "C" {
 fn map(path: &str) -> &'static [u8] {
     let file = std::fs::File::open(path).unwrap_or_else(|e| panic!("open {path}: {e}"));
     let len = file.metadata().expect(path).len() as usize; // the panic names the file
-    // SAFETY: a fresh read-only (PROT_READ, 1) private (MAP_PRIVATE, 2) mapping of `len`
-    // bytes where the kernel chooses; the dataset is mounted read-only, so the bytes
-    // cannot change under us.
+    // SAFETY: a fresh read-only private mapping of `len` bytes where the kernel
+    // chooses; the dataset is mounted read-only, so the bytes cannot change under us.
+    // 1 is PROT_READ, 2 is MAP_PRIVATE.
     let ptr = unsafe { mmap(null_mut(), len, 1, 2, file.as_raw_fd(), 0) };
     assert_ne!(ptr as isize, -1, "mmap {path}");
     // SAFETY: the mapping succeeded (above), is valid for `len` bytes, and is never
     // written or unmapped (closing the file does not unmap it), so the slice can
     // live until exit.
     unsafe { std::slice::from_raw_parts(ptr, len) }
+}
+
+/// Drops the whole pages inside `bytes` from the page tables. Exit would otherwise
+/// unmap the input's 50,000 pages one by one, on one core (6 ms on the box); this
+/// does it in each parsing thread, in parallel. Best effort: if the call fails, the
+/// pages just stay.
+///
+/// # Safety
+/// `bytes` must lie in a private file mapping that is never written, as `map`'s
+/// are: a dropped page then faults back in from the page cache with the same bytes.
+/// (Anonymous or written memory would read back as zeros.)
+unsafe fn drop_pages(bytes: &[u8]) {
+    // madvise needs page-aligned bounds; x86-64 pages are 4096 bytes.
+    let start = (bytes.as_ptr() as usize).next_multiple_of(4096);
+    let end = (bytes.as_ptr() as usize + bytes.len()) / 4096 * 4096;
+    // SAFETY: MADV_DONTNEED on the whole pages inside `bytes` (none if it holds no
+    // whole page), which read back the same by the caller's contract.
+    unsafe { madvise(start as *mut u8, end.saturating_sub(start), 4) }; // 4 is MADV_DONTNEED
 }
 
 /// Spins for a while, then yields the core between checks, until `count` reaches
@@ -143,30 +161,32 @@ fn wait(count: &AtomicUsize, n: usize) {
     }
 }
 
-/// Builds the join table from regions.csv, then parses and aggregates every run,
-/// and writes the output. One set of threads does all of it, this one included;
-/// the thread that writes the output exits the process.
-///
 /// Errors (a missing file, input outside spec 2.2) are panics: the build aborts on
 /// panic, so the message is printed and the exit status is nonzero. (For the same
 /// reason no lock is ever poisoned: `lock().unwrap()` cannot fail.)
 fn main() {
-    // M_TOP_PAD (-2), 32 MB: a worker thread's first allocations get their own heap,
-    // which otherwise grows a few pages per mprotect, and each mprotect stalls every
-    // other thread's page faults (800 of them per run: -2.8 ms). Reserved but
-    // untouched pages cost no memory.
+    // M_TOP_PAD, 32 MB: a worker thread's first allocations get their own heap, which
+    // otherwise grows a few pages per mprotect, and each mprotect stalls every other
+    // thread's page faults (800 of them per run: -2.8 ms). Reserved but untouched
+    // pages cost no memory.
     // SAFETY: a libc call that touches no memory of ours; a failure keeps the default.
-    unsafe { mallopt(-2, 32 << 20) };
-    // PR_SET_THP_DISABLE (41): with transparent huge pages, touching one byte of a
-    // sparse table can fault in a whole 2 MB page, so the memory peak would depend on
-    // how fragmented the host is (13 to 24 MB between runs).
+    unsafe { mallopt(-2, 32 << 20) }; // -2 is M_TOP_PAD
+    // PR_SET_THP_DISABLE: with transparent huge pages, touching one byte of a sparse
+    // table can fault in a whole 2 MB page, so the memory peak would depend on how
+    // fragmented the host is (13 to 24 MB between runs).
     // SAFETY: a system call that touches no memory of ours; a failure keeps the default.
-    unsafe { prctl(41, 1u64, 0u64, 0u64, 0u64) };
-    // The data directory (1) and the output directory (2).
+    unsafe { prctl(41, 1u64, 0u64, 0u64, 0u64) }; // 41 is PR_SET_THP_DISABLE
     let dir = |k: usize, or: &str| std::env::args().nth(k).unwrap_or(or.into());
-    let lines = map(&(dir(1, "/data") + "/regions.csv")).strip_prefix(b"region_id,country\n");
+    run(&dir(1, "/data"), &dir(2, "/out"))
+}
+
+/// Builds the join table from regions.csv, then parses and aggregates every run,
+/// and writes the output. One set of threads does all of it, this one included;
+/// the thread that writes the output exits the process.
+fn run(data_dir: &str, out_dir: &str) -> ! {
+    let lines = map(&format!("{data_dir}/regions.csv")).strip_prefix(b"region_id,country\n");
     let lines = lines.expect("regions.csv: the header is not region_id,country");
-    let text = map(&(dir(1, "/data") + "/records.csv"));
+    let text = map(&format!("{data_dir}/records.csv"));
     // The header is the first line (spec 2.2: a BOM, the header, CRLF).
     let header_end = text.iter().position(|&b| b == b'\n');
     let body_start = 1 + header_end.expect("records.csv: no header line");
@@ -283,32 +303,20 @@ fn main() {
         // it, which ends before that thread counts itself done below.
         flushed.fetch_add(1, Release);
         wait(&flushed, threads);
-        // No thread reads the input any more: each drops one slice of its pages from
-        // the page tables, in one call (MADV_DONTNEED, 4; x86-64 pages are 4096 bytes).
-        // Exit would otherwise unmap the input's 50,000 pages one by one, on one core
-        // (6 ms on the box). (Each 8 runs' pages as they were parsed: 96 calls, each a
-        // round of TLB-shootdown interrupts to every other thread.) Best effort: if the
-        // call fails, the pages just stay.
-        let page = |k| (text.as_ptr() as usize + text.len() * k / threads) & !4095;
-        // SAFETY: whole pages of `text`, which is `map`'s: a private file mapping that
-        // is never written, so a dropped page faults back in from the page cache with
-        // the same bytes. (Anonymous or written memory would read back as zeros.)
-        unsafe { madvise(page(w) as *mut u8, page(w + 1) - page(w), 4) };
+        // No thread reads the input any more: each drops one slice of its pages, in
+        // one call. (Each 8 runs' pages as they were parsed: 96 calls, each a round
+        // of TLB-shootdown interrupts to every other thread.)
+        let slice = |k| body_start + (text.len() - body_start) * k / threads;
+        // SAFETY: `text` is `map`'s: a private mapping that is never written.
+        unsafe { drop_pages(&text[slice(w)..slice(w + 1)]) };
         (0..threads).for_each(|t| take((w + t) % threads, &mut totals));
         // The last thread to finish writes the output and exits, without waiting
         // for the others to exit and without dropping anything.
         let (done, sums) = &mut *finished.lock().unwrap();
-        // Every column adds up, except the min and the max.
-        for (sum, t) in sums.iter_mut().zip(&totals) {
-            for k in [COUNT, ID_SUM, AMOUNT_SUM, NAMES_DISTINCT, BYTES] {
-                sum[k] += t[k];
-            }
-            sum[AMOUNT_MIN] = sum[AMOUNT_MIN].min(t[AMOUNT_MIN]);
-            sum[AMOUNT_MAX] = sum[AMOUNT_MAX].max(t[AMOUNT_MAX]);
-        }
+        merge(sums, &totals);
         *done += 1;
         if *done == threads {
-            write_output(&dir(2, "/out"), sums, &countries.lock().unwrap());
+            write_output(out_dir, sums, &countries.lock().unwrap());
             std::process::exit(0);
         }
     };
@@ -348,6 +356,18 @@ fn fill(lines: &[u8], group_of: &[AtomicU8], codes: &[AtomicU8], countries: &Mut
         }
         group_of[id].store(group.load(Relaxed), Relaxed);
         at += 5; // past ",CCC" and the LF
+    }
+}
+
+/// Adds a thread's totals to the sums: every column adds up, except the min and
+/// the max.
+fn merge(sums: &mut [Totals; GROUPS], totals: &[Totals; GROUPS]) {
+    for (sum, t) in sums.iter_mut().zip(totals) {
+        for k in [COUNT, ID_SUM, AMOUNT_SUM, NAMES_DISTINCT, BYTES] {
+            sum[k] += t[k];
+        }
+        sum[AMOUNT_MIN] = sum[AMOUNT_MIN].min(t[AMOUNT_MIN]);
+        sum[AMOUNT_MAX] = sum[AMOUNT_MAX].max(t[AMOUNT_MAX]);
     }
 }
 
@@ -522,10 +542,11 @@ fn parse_run(
         unsafe { _mm_prefetch::<_MM_HINT_NTA>(text.as_ptr().wrapping_add(i + 1024).cast()) };
         // SAFETY: fast_end is at most text.len() - FAST_MARGIN, or 0, and i >= 8
         // (above).
-        let r = unsafe { fast_record(text, i, fast_end) }.unwrap_or_else(|| *walk_record(text, i));
+        let mut r = unsafe { fast_record(text, i, fast_end) }.unwrap_or_else(|| *walk_record(text, i));
         // The region's group is read after the next record's parse: its fetch starts
-        // now.
-        let entry = &group_of[(r.region_id as usize).min(REGION_IDS - 1)];
+        // now. Ids above the table read its last entry, which is 0 (see REGION_IDS).
+        r.region_id = r.region_id.min(REGION_IDS as u64 - 1);
+        let entry = &group_of[r.region_id as usize];
         // SAFETY: a prefetch never faults.
         unsafe { _mm_prefetch::<_MM_HINT_T0>((entry as *const AtomicU8).cast()) };
         r
@@ -534,8 +555,8 @@ fn parse_run(
         // Copied out first: read through `r` after the stores into `t` below, the
         // hash was loaded again from memory.
         let (id, region_id, cents, bytes, hash) = (r.id, r.region_id, r.cents, r.bytes, r.hash);
-        // Ids above the table read its last entry, which is 0 (see REGION_IDS).
-        let group = group_of[(region_id as usize).min(REGION_IDS - 1)].load(Relaxed);
+        // SAFETY: `record` clamped region_id into the table.
+        let group = unsafe { group_of.get_unchecked(region_id as usize) }.load(Relaxed);
         let t = &mut totals[group as usize];
         (t[COUNT], t[ID_SUM], t[AMOUNT_SUM]) =
             (t[COUNT] + 1, t[ID_SUM] + id as i64, t[AMOUNT_SUM] + cents);
@@ -560,7 +581,7 @@ fn parse_run(
     let mut last = None;
     while i < mid.min(fast_end) && j < fast_end {
         let a = record(i);
-        for b in last.take() {
+        if let Some(b) = last.take() {
             count(&b);
         }
         let b = record(j);
@@ -568,7 +589,7 @@ fn parse_run(
         (i, j) = (a.next, b.next);
         last = Some(b);
     }
-    for b in last {
+    if let Some(b) = last {
         count(&b);
     }
     // The rest of the longer half, one record at a time; each half must end exactly
@@ -666,7 +687,9 @@ unsafe fn fast_record(text: &[u8], i: usize, fast_end: usize) -> Option<Record> 
         cents: if negative { -(c as i64) } else { c as i64 },
         bytes: (name_bytes << 32 | note_bytes) as u64,
         hash,
-        next: i + amount_end + 1 + (at(amount_end) == b'\r') as usize, // CRLF or LF
+        // The record's LF, the last byte of a CRLF or LF (spec 2.2: no other CR), from
+        // the tail's bitmap: the next record's start is then not behind the amount's.
+        next: i + note_end + 2 + bytes_eq(tail, b'\n').trailing_zeros() as usize,
     })
 }
 
@@ -679,40 +702,45 @@ unsafe fn fast_record(text: &[u8], i: usize, fast_end: usize) -> Option<Record> 
 #[inline(never)]
 fn walk_record(text: &[u8], i: usize) -> Box<Record> {
     let mut at = i + (text[i] == 0xEF) as usize * 3; // a BOM is not data
-    // Each field, quoted or not, and the byte after it (a comma or the terminator's
-    // first byte), which `at` moves past: its raw bytes (inside the quotes, if
-    // quoted), its unescaped length, and the value of its decimal digits, skipping
-    // any other byte (an amount's digits, without its sign and dot, are its cents).
-    let [id, name, note, region, amount] = [(); 5].map(|_| {
-        let quoted = text[at] == b'"';
-        let (start, mut escapes) = (at + quoted as usize, 0);
-        at = start;
-        loop {
-            // A quoted value ends at the next `"` that is not one of a `""` pair.
-            match (quoted, &text[at..]) {
-                (true, [b'"', b'"', ..]) => (at, escapes) = (at + 2, escapes + 1),
-                (true, [b'"', ..]) | (false, [b',' | b'\r' | b'\n', ..]) => break,
-                _ => at += 1,
-            }
-        }
-        let raw = &text[start..at];
-        at += 1 + quoted as usize;
-        let digits = raw.iter().filter(|b| b.is_ascii_digit());
-        let value = digits.fold(0, |value, d| value * 10 + (d - b'0') as u64);
-        (raw, (raw.len() - escapes) as u64, value)
-    });
-    // The values in the order they are computed (`next` from `at`, past the record).
+    let [id, name, note, region, amount] = [(); 5].map(|_| field(text, &mut at));
     Box::new(Record {
         // The name is hashed from a padded copy, so that the hash's loads stay in
         // bounds whatever the input. (This path is rare.)
         // SAFETY: the copy has 32 bytes after the name.
         hash: unsafe { hash_words(&[name.0, &[0; 32]].concat(), 0, name.0.len()) },
         bytes: name.1 << 32 | note.1,
-        id: id.2,
-        region_id: region.2,
-        cents: amount.2 as i64 * if amount.0[0] == b'-' { -1 } else { 1 },
+        id: number(id.0),
+        region_id: number(region.0),
+        cents: number(amount.0) as i64 * if amount.0[0] == b'-' { -1 } else { 1 },
         next: at + (text[at - 1] == b'\r') as usize, // CRLF or LF
     })
+}
+
+/// The field at `*at`, quoted or not, and the byte after it (a comma or the
+/// terminator's first byte), which it moves past: its raw bytes (inside the quotes,
+/// if quoted) and its unescaped length.
+fn field<'a>(text: &'a [u8], at: &mut usize) -> (&'a [u8], u64) {
+    let quoted = text[*at] == b'"';
+    let (start, mut escapes) = (*at + quoted as usize, 0);
+    *at = start;
+    loop {
+        // A quoted value ends at the next `"` that is not one of a `""` pair.
+        match (quoted, &text[*at..]) {
+            (true, [b'"', b'"', ..]) => (*at, escapes) = (*at + 2, escapes + 1),
+            (true, [b'"', ..]) | (false, [b',' | b'\r' | b'\n', ..]) => break,
+            _ => *at += 1,
+        }
+    }
+    let raw = &text[start..*at];
+    *at += 1 + quoted as usize;
+    (raw, (raw.len() - escapes) as u64)
+}
+
+/// The value of the decimal digits in `bytes`, skipping any other byte: an amount's
+/// digits, without its sign and dot, are its cents.
+fn number(bytes: &[u8]) -> u64 {
+    let digits = bytes.iter().filter(|b| b.is_ascii_digit());
+    digits.fold(0, |value, d| value * 10 + (d - b'0') as u64)
 }
 
 /// Bitmaps of a 64-byte block: bit k is set if byte k is `"`, if it is `,`, and if
