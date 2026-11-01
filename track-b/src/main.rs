@@ -136,10 +136,6 @@ fn main() {
             let scan = unsafe { Scan::new(&vocab, Some(&plan), &[]).run(docs, start, end, first) };
             (scan.answers, scan.doc)
         };
-        // Drop the slice's pages now, in parallel, instead of the kernel
-        // unmapping all 62,000 at exit on one core.
-        // SAFETY: docs[start..end] is part of the mapping made by mmap::map.
-        unsafe { mmap::release(&docs[start..end]) };
         // The ids go on in the next slice, and stay below MAX_DOCS.
         let next = slices.get(i + 1).map_or(doc + 1, |s| s.2);
         // A slice's ids, and the queries, also fit the first-id log (see MIN_SLICES).
@@ -173,10 +169,28 @@ fn main() {
     });
 
     // Formatted in parallel, one range of lines per thread, then written in order.
-    let mut file = std::fs::File::create(format!("{out_dir}/results.txt")).expect("results.txt");
-    for chunk in par(parts, &|p| format_part(&plan, &results, p, parts)) {
-        std::io::Write::write_all(&mut file, &chunk).expect("write results.txt");
-    }
+    let file = std::fs::File::create(format!("{out_dir}/results.txt")).expect("results.txt");
+    let chunks = par(parts, &|p| format_part(&plan, &results, p, parts));
+    // This thread writes them while the workers drop the corpus's pages and give
+    // the big tables back to the kernel, none of which is read any more: the exit,
+    // on one core, then has fewer pages to unmap and free.
+    par(parts, &|p| {
+        if p == 0 {
+            for chunk in &chunks {
+                std::io::Write::write_all(&mut &file, chunk).expect("write results.txt");
+            }
+            return;
+        }
+        let share = |len| part(len, p - 1, parts - 1);
+        // SAFETY: none of these is read again before the process exits.
+        unsafe { mmap::release(&text[share(text.len())]) };
+        // SAFETY: as above.
+        unsafe { mmap::release(&results[p].state) };
+        // SAFETY: as above.
+        unsafe { mmap::release(&results[p].ends) };
+        // SAFETY: as above.
+        unsafe { mmap::release(&vocab.table[share(vocab.table.len())]) };
+    });
     // Done: exit without freeing the tables and logs, one free at a time.
     std::process::exit(0)
 }
@@ -933,9 +947,8 @@ impl Plan {
             _ => {
                 // By length and operators, so that `end_super` predicts its branches.
                 always.lock().unwrap().sort_unstable_by_key(|e| {
-                    e.terms
-                        .iter()
-                        .fold(e.len, |key, &word| key << 2 | word >> 30)
+                    let ops = e.terms.iter().fold(e.len, |key, &w| key << 2 | w >> 30);
+                    (ops, e.terms[0] & TERM)
                 });
                 _ = anchors.set(csr(|| by_anchor.iter().flatten().copied(), order.len()));
             }

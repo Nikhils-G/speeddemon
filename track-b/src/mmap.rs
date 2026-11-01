@@ -66,22 +66,18 @@ pub fn map(path: &str) -> &'static [u8] {
     unsafe { std::slice::from_raw_parts(base, len + PAD) }
 }
 
-/// Drops this process's page-table entries for the pages that `slice` touches, a
-/// part of a read-only file mapping that is done with. At exit the kernel would
-/// otherwise unmap the 62,000 pages of the input one by one, on one core; this
-/// does the same work in each scanning thread, in parallel. Reading the bytes
-/// again is still correct: the page faults back in from the page cache.
+/// Gives the whole pages inside `slice` back to the kernel (MADV_DONTNEED), so
+/// that the exit, on one core, has fewer to unmap and free. A file mapping's pages
+/// would fault back in from the page cache if read again; anonymous memory would
+/// read as zero.
 ///
 /// # Safety
 ///
-/// Only for slices of a mapping made by `map`: on heap memory it would zero live data.
-pub unsafe fn release(slice: &[u8]) {
-    // madvise takes a page-aligned start; the end is rounded up to whole pages.
-    // The pages at the ends may also hold the neighbouring slices' bytes.
-    let start = slice.as_ptr() as usize / PAGE * PAGE;
-    let len = slice.as_ptr() as usize + slice.len() - start;
-    // SAFETY: whole pages of a private, read-only mapping that is never written
-    // (the file, then zero pages: the caller's contract); dropping them loses
-    // nothing.
-    unsafe { madvise(start as *mut u8, len, MADV_DONTNEED) };
+/// Nothing reads or writes `slice` again: the process is about to exit.
+pub unsafe fn release<T>(slice: &[T]) {
+    let start = (slice.as_ptr() as usize).next_multiple_of(PAGE);
+    let end = (slice.as_ptr() as usize + size_of_val(slice)) / PAGE * PAGE;
+    // SAFETY: whole pages inside the slice (none if end <= start), never used
+    // again (the caller's contract).
+    unsafe { madvise(start as *mut u8, end.saturating_sub(start), MADV_DONTNEED) };
 }
