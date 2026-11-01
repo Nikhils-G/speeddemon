@@ -51,8 +51,8 @@ const OR: u32 = 3;
 const SAMPLE_BYTES: usize = 1 << 20;
 /// A query whose cover terms are expected in more blocks than this (as a share,
 /// summed over the terms) is evaluated in every superblock: one evaluation then
-/// covers four blocks. (0.125 and 0.5 were measured slower.)
-const ALWAYS: f64 = 0.25;
+/// covers four blocks. (On the box 0.25 beat 0.125; this probe tries 0.35.)
+const ALWAYS: f64 = 0.35;
 /// Documents per superblock: four blocks of 64.
 const SUPER: u32 = 256;
 /// A thread's sum of matching ids is packed under its count in one u64.
