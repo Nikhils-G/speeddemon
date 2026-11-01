@@ -141,7 +141,8 @@ fn map(path: &str) -> &'static [u8] {
     // SAFETY: a fresh read-only private mapping of `len` bytes where the kernel
     // chooses; the dataset is mounted read-only, so the bytes cannot change under us.
     let ptr = unsafe { mmap(null_mut(), len, PROT_READ, MAP_PRIVATE, file.as_raw_fd(), 0) };
-    assert_ne!(ptr as isize, -1, "mmap {path}");
+    let err = std::io::Error::last_os_error(); // errno, before another call sets it
+    assert_ne!(ptr as isize, -1, "mmap {path}: {err}");
     // SAFETY: the mapping succeeded (above), is valid for `len` bytes, and is never
     // written or unmapped (closing the file does not unmap it), so the slice can
     // live until exit.
@@ -294,22 +295,7 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
             chunks_done.fetch_add(1, Release);
         }
         wait(&chunks_done, REGION_CHUNKS);
-        // Two threads can start on one CPU while another one idles, and the scheduler
-        // then leaves them there for most of the run (+20%; on the replica, in 3% of
-        // runs). The second one to get here moves to a CPU it may use that no thread
-        // has claimed, if any. A failed call leaves it where it is: sched_getcpu's -1
-        // reads as CPU 63, outside `allowed` unless the machine has 64 CPUs.
-        // SAFETY: a libc call that touches no memory of ours.
-        let cpu = unsafe { sched_getcpu() } as u32 % 64;
-        let seen = on.fetch_or(1 << cpu, AcqRel) & allowed;
-        // The lowest CPU it may use that no thread has claimed (0 if none is left).
-        let free = !seen & allowed;
-        let bit = free & free.wrapping_neg();
-        if seen >> cpu & 1 == 1 && bit != 0 && on.fetch_or(bit, AcqRel) & bit == 0 {
-            // SAFETY: a system call that reads the 8 bytes of `bit`; a failure keeps the
-            // thread where it is.
-            unsafe { sched_setaffinity(0, 8, &bit) };
-        }
+        move_off_shared_cpu(&on, allowed);
         // Runs are claimed one at a time, so a thread slowed down parses fewer of
         // them, and no thread waits for another one until the end.
         while let Some(nth) = claim(&next_run, runs) {
@@ -397,6 +383,27 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
     unreachable!("worker 0 exits the process")
 }
 
+/// Two threads can start on one CPU while another one idles, and the scheduler then
+/// leaves them there for most of the run (+20%; on the replica, in 3% of runs). The
+/// second one to get here moves to the lowest CPU of `allowed` that no thread has
+/// claimed in `on`, and stays there for the rest of the run: only movers are pinned
+/// (pinning every thread was worse: 18 slow runs in 300 against 4), and a move happens
+/// in about 3% of runs. A failed call leaves it where it is: sched_getcpu's -1 reads as
+/// CPU 63, outside `allowed` unless the machine has 64 CPUs.
+fn move_off_shared_cpu(on: &AtomicU64, allowed: u64) {
+    // SAFETY: a libc call that touches no memory of ours.
+    let cpu = unsafe { sched_getcpu() } as u32 % 64;
+    let seen = on.fetch_or(1 << cpu, AcqRel) & allowed;
+    // The lowest CPU it may use that no thread has claimed (0 if none is left).
+    let free = !seen & allowed;
+    let bit = free & free.wrapping_neg();
+    if seen >> cpu & 1 == 1 && bit != 0 && on.fetch_or(bit, AcqRel) & bit == 0 {
+        // SAFETY: a system call that reads the 8 bytes of `bit`; a failure keeps the
+        // thread where it is.
+        unsafe { sched_setaffinity(0, 8, &bit) };
+    }
+}
+
 /// Enters the `region_id,CCC` LF lines of regions.csv in `lines` (spec 2.3) into
 /// the join table `group_of`: each region id gets its country's group. A
 /// country code seen for the first time gets the next group, by `codes` (indexed
@@ -411,7 +418,7 @@ fn fill(lines: &[u8], group_of: &[AtomicU8], codes: &[AtomicU8], countries: &Mut
             (id, at) = (id * 10 + (digit - b'0') as usize, at + 1);
         }
         let [a, b, c] = [1, 2, 3].map(|i| (lines[at + i] - b'A') as usize);
-        let group = &codes[a * 676 + b * 26 + c];
+        let group = &codes[(a * 26 + b) * 26 + c];
         // Checked again under the lock: two threads can meet a new code at once.
         if group.load(Relaxed) == 0 {
             let mut countries = countries.lock().unwrap();
@@ -587,11 +594,8 @@ fn run_start(text: &[u8], from: usize, k: usize, parts: usize) -> usize {
 /// region id is known, and which then has a record's parse to arrive; the count's
 /// load also needs no value still being computed. Counted right after the parse,
 /// the instruction after that load took 19% of this function's cycles on the box's
-/// CPU (i5-13500). On the replica of the box, paired runs: -0.88 ms (-4.7%, 201
-/// pairs) against counting each pair at once (c-11), -0.28 ms (-1.5%, 201 pairs)
-/// against counting each pair after the next pair (c-12); without the prefetch
-/// +2.0% (101 pairs), with three cursors +2.1% (51 pairs). (Cursors in arrays:
-/// +3 ms, the arrays stay in memory.)
+/// CPU (i5-13500). (PERF.md has the measured alternatives: counting each record or
+/// each pair at once, no prefetch, three cursors, cursors in arrays.)
 ///
 /// The second half starts at a cut found like the runs' cuts, so the first half
 /// must end exactly there. Every total, the min and max, and the set of pairs do
