@@ -47,11 +47,13 @@ a record start.
 **Parsing.** Each record is taken from the 64 bytes at its start, as simdjson does for JSON: AVX2
 compares give a bitmap of `"` and one of `,`; a carry-less multiply of the quote bits by all ones
 gives, for every byte, whether it is inside quotes (`masks()` returns all three bitmaps), and what
-is left of the comma bitmap are exactly the field separators. Counting quote bits between
-separators gives each text field's unescaped length (`""` is one byte) without looking at its
-bytes. One 32-byte load of the tail (`region_id,amount`) gives, by three compares, the region's
+is left of the comma bitmap are exactly the field separators. A quoted field's inside bits are
+its opening quote, its bytes and one quote of each `""` pair, so counting the inside bits up to a
+field's end gives its unescaped length without looking at its bytes; the quote bitmap is needed
+only for the carry-less multiply. One 32-byte load of the tail (`region_id,amount`) gives, by three compares, the region's
 comma, the amount's dot and its minus sign (a bit of the `-` bitmap, so no byte load waits on the
-comma), and one AVX2 pass converts the three numbers. About 10% of records need a second 64-byte
+comma), and one AVX2 pass converts the three numbers, each masked to its digits by one load
+from a small table. About 10% of records need a second 64-byte
 window for the note, still on the fast path. A record whose name or note runs past both windows,
 and the last records of the file, go through a short walker: one `field()` scan reads each of the
 five fields, and a digit fold gives the numbers, an amount's digits without its sign and dot being
@@ -75,7 +77,9 @@ of 4 partitions per thread, chosen from the hash's top 32 bits by a multiply-shi
 table holds 32-bit keys in buckets of 8 slots, at most 5/8 full. At 12 threads a table has 4096
 slots: a key's low 12 bits hold the name's row + 1 (never 0, which marks an empty slot), and its
 high 20 bits are hash bits. A lookup starts at the bucket picked by hash bits 8 and up and compares
-all 8 keys of the bucket at once. A key that matches still has to pass a check: 15 more hash bits
+all 8 keys of the bucket at once. Free slots are looked at only when no key of the bucket matches:
+slots fill in order and are never emptied, so a name is in the first bucket of its probe that has
+a free slot, or in one before it. A key that matches still has to pass a check: 15 more hash bits
 are stored in the name's row of group bits, in word 3's bits 48..62. Those are the bits of groups
 240..254, which never exist, since the spec has at most 240 countries (more aborts the program).
 The row is the one the lookup is about to set a bit in, so the check reads data it needs anyway.
@@ -144,58 +148,58 @@ removed (PERF.md, step 25).
 One line per technique: what, where in `src/main.rs`, and why the output stays exact. All totals
 are exact; the distinct-name count rests on a hash (technique 6 below).
 
-1. Both files memory-mapped (`map`): pre-warmed pages are charged to the host.
-2. Transparent huge pages off (`prctl`): a stable memory peak.
-3. `mallopt(M_TOP_PAD, 32 MB)`: worker heaps do not grow by `mprotect`, which stalled other threads' page faults.
+1. Both files memory-mapped (`map`): pre-warmed pages are charged to the host. Exact: the dataset is read-only.
+2. Transparent huge pages off (`prctl`): a stable memory peak. Exact: no effect on the bytes.
+3. `mallopt(M_TOP_PAD, 32 MB)`: worker heaps do not grow by `mprotect`, which stalled other threads' page faults. Exact: allocation policy only.
 4. Cuts after the first LF followed by a digit or a BOM byte (`run_start`). Exact: by spec 2.2 such an LF ends a record.
-5. Each thread finds its own cuts: no serial pass.
-6. Tripwires: every half-run must end exactly at its cut (`assert_eq!` in `parse_run`).
+5. Each thread finds its own cuts: no serial pass. Exact: the cut search is monotonic, so the runs cover the file once.
+6. Tripwires: every half-run must end exactly at its cut (`assert_eq!` in `parse_run`). Exact: input that moves a cut almost always stops here instead of being answered.
 7. Dense region table, one byte per id, allocated zeroed (`group_of`). Exact: ids ascend in regions.csv, so the last line sizes it.
-8. regions.csv filled in parallel from 64 claimed chunks (`fill`).
+8. regions.csv filled in parallel from 64 claimed chunks (`fill`). Exact: chunks are cut at record starts, and each region id is stored once.
 9. Country codes indexed by 26^3, numbered under a lock on first sight (`codes`, double-checked load). Exact: one number per code.
 10. Groups numbered as first seen, sorted by code at output (`write_output`). Exact: byte order, `_UNMATCHED` last.
-11. Byte-sized group indices into 256-entry tables: no bounds checks.
-12. Region id clamped to the table, and 0 - 1 wraps to `_UNMATCHED` (`count`): no branch. Exact: the last entry is 0 for every id above the table.
-13. simdjson-style `"` and `,` bitmaps per 64-byte window (`masks`).
+11. Byte-sized group indices into 256-entry tables: no bounds checks. Exact: a `u8` cannot index past 256 entries.
+12. Region id clamped to the table, and 0 - 1 wraps to `_UNMATCHED` (`parse_run`): no branch. Exact: the last entry is 0 for every id above the table.
+13. simdjson-style `"` and `,` bitmaps per 64-byte window (`masks`). Exact: one bit per byte, by compare.
 14. Inside-quotes mask by a carry-less multiply with all ones (`pclmulqdq`). Exact: a `""` pair flips the state twice.
-15. Separators by `tzcnt` and clear-lowest-bit on commas outside quotes (`fast_record`).
-16. Unescaped text length from the quote popcount, without reading the bytes. Exact: every inner quote is half of a `""` pair (spec 2.2).
-17. A second 64-byte window with the quote state carried over, for long notes.
-18. One 32-byte tail load giving the region comma, the dot and the minus sign by three compares.
-19. BOM detected from a word load (`load(3) >> 40`).
-20. Three numbers converted in one AVX2 pass: `pshufb` drops the dot, then `maddubs`/`madd`/`packus`/`madd` (`numbers`). Exact: at most 8 digits each.
-21. Branch-free CRLF or LF for the next record start.
-22. `vpmovmskb` as inline asm (`bytes_eq`).
+15. Separators by `tzcnt` and clear-lowest-bit on commas outside quotes (`fast_record`). Exact: a comma inside quotes is masked out (14).
+16. Unescaped text length from the popcount of the inside-quotes bits, without reading the bytes (`fast_record`). Exact: inside a quoted field the set bits are its opening quote, its bytes and one quote of each `""` pair (spec 2.2: every inner quote is half of a pair), so the count less one is the unescaped length; an empty field has none.
+17. A second 64-byte window with the quote state carried over, for long notes. Exact: the carried state is the parity at the window's end.
+18. One 32-byte tail load giving the region comma, the dot and the minus sign by three compares. Exact: the numbers are never quoted and a record's only `.` is its amount's (spec 2.2).
+19. BOM detected from the record's first byte (`at(0) == 0xEF`). Exact: a record starts with a BOM or an id digit (spec 2.2), and no digit is 0xEF.
+20. Three numbers converted in one AVX2 pass: `pshufb` drops the dot, each number's digits kept by a mask from the `DIGITS` table, then `maddubs`/`madd`/`packus`/`madd` (`numbers`). Exact: at most 8 digits each; `DIGITS[n]` keeps a word's last n bytes, and the index `n & 127` stays inside the table for any input.
+21. Branch-free CRLF or LF for the next record start. Exact: CR appears only in a CRLF terminator (spec 2.2).
+22. `vpmovmskb` as inline asm (`bytes_eq`). Exact: the same instruction, without LLVM's bit-by-bit rebuild.
 23. Rare records (long fields, the last 256 bytes) to an out-of-line `#[cold]` walker (`walk_record`, `field`). Exact: it reads the same five fields byte by byte.
-24. Fast-path end bound checked once per record against a precomputed `fast_end`.
+24. Fast-path end bound checked once per record against a precomputed `fast_end`. Exact: records within 256 bytes of the end take the walker, so no load leaves the file.
 25. Two halves of a run parsed in one loop: two region-table loads in flight (`parse_run`). Exact: totals do not depend on record order.
-26. Non-temporal prefetch of the record stream 1 KB ahead: more of the region table stays in L2.
-27. Branchy min and max: a new min or max is rare, so the branch predicts.
+26. Non-temporal prefetch of the record stream 1 KB ahead: more of the region table stays in L2. Exact: a prefetch reads nothing the program uses.
+27. Branchy min and max: a new min or max is rare, so the branch predicts. Exact: min and max.
 28. Name and note bytes packed in one column (`<< 32`). Exact: each is below 2^31 (spec 3).
 29. Name identity from its raw bytes inside the quotes. Exact: `""` maps one to one to `"`; the empty name is empty quoted or not.
-30. Branch-free AES hash: 32-byte blocks masked by a sliding `KEEP` window, three AES rounds, the length in the state (`hash_words`).
+30. Branch-free AES hash: 32-byte blocks masked by a sliding `KEEP` window, three AES rounds, the length in the state (`hash_words`). Exact: equal names hash equal; the odds that different names are taken as one are in technique 6.
 31. The walker hashes a padded copy, so both paths give a name the same hash and every load is in bounds.
-32. Partition by multiply-shift of the hash's top 32 bits: any partition count.
-33. Four name partitions per thread, each written only by its owner: no atomics on the hot path.
-34. Pair buffers handed to the owner's inbox, moved and not copied.
-35. One shared pool of empty buffers; a buffer that grew is dropped once emptied.
-36. Buffers sized at a run's mean share plus 2 standard deviations plus 4.
-37. An inbox past 16 x threads buffers is taken over by its filer: memory stays bounded.
-38. Runs claimed one at a time, 64 per thread: no barriers; a slow thread parses fewer.
-39. Claims round the file's stripes: concurrent runs rarely share a page-table page.
-40. Spin, then yield, in the two waits (`wait`).
-41. 32-bit keys in 8-slot buckets, compared by one AVX2 compare (`add`).
-42. The name's row + 1 inside its key: no second load after a hit.
-43. 15 check bits of the hash in the row's unused group bits (groups 240..254).
-44. A bit per group in each name's row: distinct names counted when a bit flips.
-45. Tables sized from the generator's 100,000-name pool with 8 standard deviations of room, at most 5/8 full; more names stop the program.
+32. Partition by multiply-shift of the hash's top 32 bits: any partition count. Exact: equal hashes go to the same partition.
+33. Four name partitions per thread, each written only by its owner: no atomics on the hot path. Exact: one writer per table.
+34. Pair buffers handed to the owner's inbox, moved and not copied. Exact: every pair reaches its owner's table once (technique 7).
+35. One shared pool of empty buffers; a buffer that grew is dropped once emptied. Exact: memory policy only.
+36. Buffers sized at a run's mean share plus 2 standard deviations plus 4. Exact: a full buffer grows, so the size never drops a pair.
+37. An inbox past 16 x threads buffers is taken over by its filer: memory stays bounded. Exact: the takeover is under the inbox's lock, so a table still has one writer at a time.
+38. Runs claimed one at a time, 64 per thread: no barriers; a slow thread parses fewer. Exact: each run is claimed once from a counter.
+39. Claims round the file's stripes: concurrent runs rarely share a page-table page. Exact: the order of claims only.
+40. Spin, then yield, in the two waits (`wait`). Exact: the wait ends only when the counter is reached.
+41. 32-bit keys in 8-slot buckets, compared by one AVX2 compare; free slots tested only after no key matched (`add`). Exact: slots fill in order and are never emptied, so a name is in the first bucket of its probe with a free slot or before it, and a matching slot whose row bits are 0 is empty and ends the bucket's names.
+42. The name's row + 1 inside its key: no second load after a hit. Exact: row + 1 is never 0, the empty-slot mark.
+43. 15 check bits of the hash in the row's unused group bits (groups 240..254). Exact: those groups never exist (more than 240 countries aborts).
+44. A bit per group in each name's row: distinct names counted when a bit flips. Exact: a (name, country) pair flips its bit once.
+45. Tables sized from the generator's 100,000-name pool with 8 standard deviations of room, at most 5/8 full; more names stop the program. Exact: it stops; it never drops a name.
 46. Input pages dropped per block of 8 runs (about 2 MB) by the last thread to parse one: one TLB-shootdown round per call. Exact: `MADV_DONTNEED`, so a read past a block faults back in.
-47. Totals summed under one lock as each thread finishes; the last one writes and exits without frees.
-48. The main thread is worker 0.
-49. `#[inline(never)]` on `parse_run` and `add`: edits around them cannot change their register allocation.
-50. Profile-guided build trained on generator seed 7, with atomic profile counters (Dockerfile).
+47. Totals summed under one lock as each thread finishes; the last one writes and exits without frees. Exact: sums are added, min and max taken; the output is complete before the exit.
+48. The main thread is worker 0. Exact: thread placement only.
+49. `#[inline(never)]` on `parse_run` and `add`: edits around them cannot change their register allocation. Exact: code placement only.
+50. Profile-guided build trained on generator seed 7, with atomic profile counters (Dockerfile). Items 50 and 51 change speed only: every check runs the Dockerfile's binary.
 51. Hot loops aligned to 64 bytes; fat LTO, one codegen unit, `panic = "abort"`, `crt-static`, `target-cpu=native`; `compile_error!` without AVX2, PCLMULQDQ or AES.
-52. Exit-code timing probes on the box (PERF.md, "Box probes").
+52. Exit-code timing probes on the box (PERF.md, "Box probes"). Measurement only, never a scored version.
 53. No dependencies: libc calls declared by hand.
 
 Each technique below names the bottleneck, what the design does about it, and why the output
@@ -223,9 +227,11 @@ exact. The distinct-name count rests on a hash; its odds are stated in technique
   `vpmovmskb` is inline asm: written as the intrinsic, LLVM rebuilt the 64-bit masks one bit at a
   time on CPUs without AVX-512, a quarter of the run time (PERF.md, step 7).
 - **Why exact.** A `""` pair flips the quote state twice, so it leaves the mask unchanged, and an
-  escaped quote is never taken as a field end. A text field's unescaped length is its raw length
-  minus the two quotes minus half its inner quote bits, since inside a field every inner quote is
-  half of a `""` pair (spec 2.2). Records the windows cannot hold go to the walker, which reads the
+  escaped quote is never taken as a field end. Inside a quoted field the inside bits are its
+  opening quote, its bytes and the second quote of each `""` pair (the first flips the state off,
+  the second back on); every inner quote is half of such a pair (spec 2.2), so the field's
+  unescaped length is its count of inside bits less one. An empty field has no inside bits, and the
+  id and the commas are outside. Records the windows cannot hold go to the walker, which reads the
   same five fields byte by byte.
 
 ### 3. The numbers in one AVX2 pass
@@ -234,7 +240,8 @@ exact. The distinct-name count rests on a hash; its odds are stated in technique
   on the comma's position.
 - **Design.** One 32-byte load of the tail gives, by three compares, the region comma, the dot and
   the minus sign. The 8 bytes ending at each number go into one vector; a shuffle drops the
-  amount's dot, masks keep each field's digits, and `maddubs`/`madd`/`packus`/`madd` convert all
+  amount's dot, masks from the `DIGITS` table (one load per number instead of a shift count)
+  keep each field's digits, and `maddubs`/`madd`/`packus`/`madd` convert all
   three at once.
 - **Why exact.** Ids are below 4 × 10^7 (spec section 3, "Magnitudes"), region ids are at most
   9,999,999 and amounts lie between -999.99 and 99,999.99 (spec 2.2), so each number has at most
@@ -314,6 +321,34 @@ exact. The distinct-name count rests on a hash; its odds are stated in technique
   `panic = "abort"`, a static binary, `target-cpu=native`. `#[inline(never)]` on `parse_run` and
   `add`, so that edits to the worker cannot change how their loops are compiled.
 - **Why exact.** The build changes speed only; each check runs the Dockerfile's binary.
+
+## Robust on unseen seeds
+
+The scored data comes from the organisers' generator, and spec 2.2 states what it writes for every
+seed and scale; the parser relies on that and nothing else. Nothing is fitted to seed 1's data.
+
+| What could change with the seed | What the program does |
+|---|---|
+| Region ids and their count | The table is sized from regions.csv's last line; an id above it is `_UNMATCHED` |
+| Countries | Numbered as first seen, sorted at output; more than 240 stops the program |
+| Names | Tables sized from the generator's 100,000-name pool plus 8 standard deviations; more stops the program. The odds of two names taken as one are per dataset, for any seed: about 5.9e-6 at 12 threads (technique 6) |
+| Long names and notes, the file's end | The walker, which reads the same five fields byte by byte |
+| Where the cuts fall | Each half-run must end exactly at its cut (`assert_eq!`) |
+
+Evidence, on the binary the Dockerfile builds:
+
+- **Holdout seed 99**, full scale, byte-equal to the reference for the submitted code at 1, 5 and
+  12 CPUs (two test-server builds), and at every gate since step 25.
+- **Sample seeds 2-4** byte-equal at 1 and 12 CPUs; tiny seeds 11-14 and sample seeds 21-23 at
+  four CPU sets.
+- **Fresh seeds**, generated for that gate and checked with `reference/c_join.py`: tiny 61-63 and
+  sample 64-66 (step 33), and 57, 58 and 71-73 at earlier checkpoints, at 1, 3, 12 and 16 threads.
+  Fresh seeds were last generated for step 33's gate. The hot functions stayed the same
+  instructions through step 36 (PERF.md, steps 34 and 36); step 37 changed `fast_record`,
+  `numbers` and `add` and passed the gate above on two server builds.
+- **Hostile input**: 32 mutants (truncations, stray quotes, no terminator, bad regions, more than
+  240 countries) exit 0 or abort with a message, never a segfault (step 33's gate).
+- **Timing on other seeds** was not measured for Track C: every time in these docs is seed 1.
 
 ## Dependencies
 

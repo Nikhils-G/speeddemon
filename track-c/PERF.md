@@ -51,21 +51,34 @@ their own, or their run is not in the log; their numbers are left out rather tha
 | 33 | 5d6d235 | 32-bit name-table keys in buckets of 8 slots; 15 check bits of the hash in the name's row (word 3, bits 48..62, the bits of groups that never exist); more than 240 countries aborts. Both runs were in dispatches our log marks as a slower box | run-852c8d9d0f10, run-fde147f55fbc | 0.022314, 0.022147 | 10.56, 10.78 | 436 | 81.15, 81.14 |
 | 34 | 3e7d9a4 | Fewer lines in cold code (merged `use` lines and two `let` pairs; empty groups skipped in the output loop header); the hot functions compile to the same instructions as step 33's. The first run was in a SLOW BOX dispatch (unchanged Track A at 0.0233 s against its best 0.0189 s); the second, run-085364b6513f, in a normal one (nine board runs of this code in all: see below) | run-37ca5d6651ae, run-085364b6513f | 0.024684, 0.022277 | 10.99, 10.39 | 430 | 79.93, 81.28 |
 | 35 | 2c8ba1c | Output lines written into one string (`write!` into a String, `money()` gone) | run-a9ee2ce7006d, run-b0a4d0918d2a, run-6a13aed936f1 | 0.021639, 0.022423, 0.021718 | 10.63, 10.44, 10.65 | 429 | 81.51, 81.20, 81.46 |
-| 36 | | Code-quality pass: comments, names and SAFETY arguments; named `Record`, `Field` and column consts; `fill`, `merge` and `drop_pages` as functions; the hot functions compile to the same instructions as step 35's in a build without the profile. No board run yet | | | | 469 | |
+| 36 | 82cf0cf (board runs from 82cf0cf, 5a0612d, 045a6b5, 9ce324f) | Code-quality pass: comments, names and SAFETY arguments; named `Record`, `Field` and column consts; `fill`, `merge` and `drop_pages` as functions; the hot functions compile to the same instructions as step 35's in a build without the profile. The last run came in a dispatch where Track A ran its fastest time (0.018636 s), so C's slow runs are not only a slow box | run-5063c99104c2, run-3b36d6c3b4df, run-84ffefa565f7, run-f93690fc8898 | 0.02165, 0.02189, 0.021882, 0.023947 | 10.57, —, 10.77, 11.03 | 469 | 81.23, —, 81.04, 79.95 |
+| 37 | 4503e60 (board runs from later B sweep pushes) | The submitted code. Fewer instructions per record in the same design: unescaped lengths from the inside-quotes bits (one popcount per field instead of a quote popcount and its arithmetic), digit masks from a 128-entry table, the BOM from one byte compare, and the name lookup testing free slots only after no key matched. Test server: 855.3M → 777.8M instructions on one thread (−9.1%, 257.6 → 234.3 per record), 20.17 / 20.32 → 19.62 / 19.43 ms (−0.72 ms, 31 interleaved runs, two PGO builds each). The second run is the fastest C time on the board; A ran normally in its dispatch (run-68aba678e9cb, 0.018909 s) | run-69c7ee1ea546, run-77c8650252ea | 0.022621, 0.021133 | 10.34, 10.95 | 486 | 80.74, 81.23 |
 
 Two more runs of step 32's code were in a DISTURBED and a SLOW BOX dispatch: run-87e294d71310
 (0.022429 s) and run-dc9ee4598ca3 (0.021796 s, 11.28 MB).
 
-This file ships with step 36's code, which has no board run yet; its hot code is step 35's. The
-code on the board is step 35: step 34 with the output lines written into one String. Its runs are
-run-a9ee2ce7006d (0.021639 s, 10.63 MB, 81.51 points), run-b0a4d0918d2a (0.022423 s, 81.20),
-run-6a13aed936f1 (0.021718 s, 81.46), run-718519297500 (0.021659 s, 81.59) and run-5514f073467f
-(0.021643 s, 10.8 MB, 81.43), plus one at 0.024088 s in a slow dispatch whose run ID is not in our
-log. Step 34's code had nine board runs: run-b52eb817e73d 0.022131, run-085364b6513f 0.022277,
-run-c22dfd35468d 0.022346, run-ea147e35f6ca 0.022517, run-bd2e07eba1e1 0.022515,
-run-92c59d19bd2f 0.022606, run-005966bd2a44 0.022879, run-37ca5d6651ae 0.024684 (SLOW BOX) and
-run-4e8d1ce215a3 0.025734 s; median 0.022517 s. The best C run is still step 32's
-run-1ef2cedeac0a (81.60 points); the 32-bit keys of step 33 stay for now.
+**Code-quality pass (82cf0cf, step 36), on the box:** run-5063c99104c2 0.02165 s, 10.57 MB, 81.23
+points (runs.log 09:23Z); run-3b36d6c3b4df 0.02189 s (runs.log 09:28Z, a normal C run in a slow
+dispatch for A and B); run-84ffefa565f7 0.021882 s, 10.77 MB, 81.04, and run-f93690fc8898
+0.023947 s, 11.03 MB, 79.95 (`board.py`). Its hot code is step 35's, and three of the four runs
+fall in step 35's range (0.021639 to 0.022423 s), so the pass cost no speed; it cost points
+through S (429 → 469).
+
+**The submitted code is step 37 (4503e60).** Its board runs are run-69c7ee1ea546 (0.022621 s,
+10.34 MB, 80.74 points) and run-77c8650252ea (0.021133 s, 10.95 MB, 81.23 points), the fastest C
+time we have. The board's best C points, run-1ef2cedeac0a's 81.60 (step 32, 0.02147 s), predate
+the 56 lines of the quality pass and step 37 (S 430 → 486): at the S exponent fitted to our logged runs
+(K ∝ S^-0.15) those lines cost about 0.40 points, the faster T gives back about 0.17, and the higher M (10.95 against
+10.59 MB) the rest. T is faster now; the points are lower because of S.
+
+Step 35's runs are run-a9ee2ce7006d (0.021639 s, 10.63 MB, 81.51
+points), run-b0a4d0918d2a (0.022423 s, 81.20), run-6a13aed936f1 (0.021718 s, 81.46),
+run-718519297500 (0.021659 s, 81.59) and run-5514f073467f (0.021643 s, 10.8 MB, 81.43), plus one at
+0.024088 s in a slow dispatch whose run ID is not in our log. Step 34's code had nine board runs:
+run-b52eb817e73d 0.022131, run-085364b6513f 0.022277, run-c22dfd35468d 0.022346, run-ea147e35f6ca
+0.022517, run-bd2e07eba1e1 0.022515, run-92c59d19bd2f 0.022606, run-005966bd2a44 0.022879,
+run-37ca5d6651ae 0.024684 (SLOW BOX) and run-4e8d1ce215a3 0.025734 s; median 0.022517 s. The best-scoring
+C run is still step 32's run-1ef2cedeac0a (0.02147 s, S 430, 81.60 points).
 
 ## What each step taught
 
@@ -318,26 +331,69 @@ The phase probes ran in four dispatches whose box state differed (Track B's unch
 - **Name every collision odd.** Each change to the name keys came with the recomputed odds (steps
   29 and 33), not a claim of exactness.
 
-## How correctness was verified
+## What we learned about the box
 
-Since step 25 (trusting spec 2.2), on the exact docker-built binary. For the shipped code (step
-36), built by the Dockerfile on the 16-vCPU test server:
-- **Seed hashes.** Full seed 1, d8088b1cd42b…, at 1, 2, 3, 5, 7, 12 and 16 CPUs (`taskset`), and
-  three repeated runs at 12 CPUs; sample seed 1, 9035fed36823….
-- **Samples and holdout.** Sample seeds 2–4 byte-identical to the reference output at 1, 3 and 12
-  CPUs; the holdout-like seed 99 at 1, 5 and 12.
-- **Earlier gate seeds.** Tiny 11–14 and sample 21–23 at 1, 3, 12 and 16 CPUs, all identical.
-- **Spec fixtures.** The WORKED fixtures give the expected output at 1 and 12 CPUs. The RULES
-  fixtures (and their 300-times repeats) abort with exit 134, as step 35's code does, never a
-  segfault; a records.csv with no records gives the same output as step 35's.
-- **Code check.** `objdump | grep -c vpinsrb` = 0. Built without the profile, `parse_run`, its
-  closure and `walk_record` are instruction for instruction step 35's, and `add` differs in one
-  immediate (the length of its panic message). The profile-guided builds are not reproducible
-  (the training threads' order varies): two builds of step 35 differ from each other by 6 lines of
-  `parse_run`, and the two builds of step 36 from them by 4–10, all of one kind (two min/max
-  store blocks placed differently).
+The box is the board's scoring machine; the test server is a 16-vCPU AMD VM. On Track C:
 
-For step 33 (cmem2-1) the set was:
+- **Cuts of uops and branches on the per-record path pay.** The opaque `vpmovmskb` (step 7: 0.0979
+  → 0.0553 s with step 6), the per-record fast path (step 15: 506 → 282 instructions per record,
+  0.04093 → 0.02677 s), trusting spec 2.2 (step 25: 1042M → 854M instructions, 0.025101 →
+  0.022853 s) and the stall cuts of steps 28-30 (server −5%, box −5.1%) all moved the box as they
+  moved the server. Step 37 (9.1% fewer instructions, server −3.6%) gave the fastest C run,
+  0.021133 s, on its second run; its first, 0.022621 s, was within the box's spread.
+- **Cache-footprint cuts pay little.** On the test server, masking the region id to a 16 KB table
+  saved 2.3 ms. On the box, the in-process A/B against a table cut to its first 512 KB found only
+  0.5 and 0.6 ms (run-d915ef465a1b, run-cb37e117cec4), so a compact table, which adds a dependent
+  load, was dropped. The non-temporal prefetch (step 19, 0.025757 → 0.025293 s) is within the
+  box's spread; it stays because it costs no lines.
+- **Shared random state costs.** One lock-free name table shared by all threads, on top of the SIMD
+  parser, ran 0.0539 s against 0.0461 (run-edc1e75d5cee, reverted); dense name ids from a shared
+  table took the server from 45 to 67 ms. Per-thread partitions with buffers handed over (steps 18
+  and 22) are what stayed.
+- **Changes tuned on the test server can be wrong on the box.** Step 26 timed the same on the
+  server and 10% slower on the box (0.025257 and 0.02524 s against 0.022853); tables populated
+  before the threads start were 20% faster on the server and slower on the box (run-b4f2d95150d7,
+  0.106 s); pread was 6 ms faster on the server and no faster on the box (run-4381f7c8201d).
+- **One slow CPU doubles a barrier design.** Four runs of unchanged code took about 2x (steps 21-24);
+  without barriers the same load costs about 15% on the server (22.4 → 25.8 ms).
+
+## How the final number was verified
+
+**The gate.** Since step 25, before every push, on the binary the Dockerfile builds (`docker
+build`, then `docker create` and `docker cp`). For the submitted code (step 37), on two PGO
+builds made by the Dockerfile on the test server:
+
+- full seed 1, sha256 d8088b1cd42b…, at 1, 3, 7, 12 and 16 CPUs; sample seed 1, 9035fed36823…;
+- sample seeds 2-4 byte-equal to the reference output at 1 and 12 CPUs, holdout seed 99 at 1, 5
+  and 12;
+- tiny seeds 11-14 and sample seeds 21-23 at four CPU sets; the WORKED fixtures, as written and
+  repeated 300 times, give the expected output; the RULES fixtures abort with exit 134, as step
+  36's code does;
+- `objdump | grep -c vpinsrb` = 0;
+- the name keys, check bits and identity bits are step 36's, so the collision odds are unchanged
+  (5.9e-6 per dataset at 12 threads, 7.1e-5 on one).
+
+Step 36's gate also ran full seed 1 at 1, 3, 7 and 8 CPUs on the laptop, samples and holdout 99 at
+1, 3 and 8 CPUs there, and an input with no records (same output as step 35's).
+
+Before its board runs, step 37 also passed an in-process A/B on the test server (the probe method
+below, mode 0 step 36's `fast_record`, `numbers` and `add`, mode 1 step 37's): exits 106 and 107
+in five runs on full seed 1, so step 37's parse pass was 0.6 to 0.7 ms faster there.
+
+**The box number.** Board runs of one binary spread about 3%, with outliers up to 2x. So:
+
+- **In-process A/B probes** (see "Box probes"): one build runs the parse once as a warm-up, then 8
+  times, ABBA ABBA between the shipped code and the variant, and exits with the difference in
+  0.1 ms units. Both modes see the same box state, so a 0.4 ms effect can be read, which no pair
+  of separate dispatches could show (in the four dispatches of the phase probes, Track B's
+  unchanged code alone varied from 0.1211 to 0.1312 s).
+- **Alternating dispatches** for whole versions: candidates pushed in turn against the code they
+  replace, and kept only if the result repeats (step 26 failed twice, step 27 passed twice).
+- **Points** are the board's; M counts on this track, so no point value is computed here.
+
+### Earlier gates
+
+For step 33 (cmem2-1) the set was (the last gate with fresh seeds):
 - **Seed hashes.** Full seed 1, d8088b1cd42b…, at 1, 3, 7, 12 and 16 CPUs (`taskset`), and three
   repeated runs at 3 and 12 CPUs; sample seed 1, 9035fed36823….
 - **Samples.** Sample seeds 2–4 byte-identical to the reference output at 1 and 12 threads.
