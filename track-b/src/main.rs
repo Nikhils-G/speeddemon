@@ -69,7 +69,7 @@ const MAX_DOCS: u32 = 1 << 20;
 /// SLOTS_AHEAD on, and the words and state that the range RANGES_AHEAD on reads
 /// first (PERF.md, steps 20 and 28).
 const SLOTS_AHEAD: usize = 16;
-const RANGES_AHEAD: usize = 8;
+const RANGES_AHEAD: usize = 4;
 /// Hash groups: a key's group is the low 6 bits of its hash (hash & 63). A pilot
 /// is 1 mod GROUPS, so each group owns a region of the table, and the threads
 /// place their groups in parallel.
