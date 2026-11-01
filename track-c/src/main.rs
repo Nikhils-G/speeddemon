@@ -66,13 +66,6 @@ const WORDS: usize = GROUPS / 64;
 /// regions.csv is entered in this many parts, which threads claim as they start,
 /// so the ones that start first do more of it.
 const REGION_CHUNKS: usize = 64;
-/// PROBE (box A/B in one process). On input > 100 MB the whole parse (runs, pair
-/// filing, dedupe, totals) runs once per entry: a warm-up pass, then ABBA ABBA
-/// between mode 0 and mode 1. The exit code is 100 + (mean mode-0 pass - mean
-/// mode-1 pass) in 0.1 ms units; the output is the last pass's (mode 0, exact).
-const MODES: [usize; 9] = [0, 0, 1, 1, 0, 0, 1, 1, 0];
-/// Pairs a name table takes at a time in mode 1 (batched dedupe): their rows are prefetched together.
-const BATCH: usize = 32;
 
 /// A group's columns: count, id_sum, amount_sum, amount_min, amount_max,
 /// names_distinct, and name_bytes << 32 | note_bytes (amounts in cents; every
@@ -220,10 +213,6 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
     // The threads' totals, summed as each one finishes (kept one per thread, with
     // the Vec's regrowth: 0.2 MB more), and how many have.
     let finished = Mutex::new((0, [EMPTY; GROUPS]));
-    // PROBE: passes, threads arrived at a pass's start, and (pass start, summed pass time per mode).
-    let passes = if text.len() > 100 << 20 { MODES.len() } else { 1 };
-    let arrived = AtomicUsize::new(0);
-    let clock = Mutex::new((std::time::Instant::now(), [std::time::Duration::ZERO; 2]));
     let worker = &|w: usize| {
         let mut totals = [EMPTY; GROUPS];
         // This thread's tables and pair buffers: made here, so they are in its cache.
@@ -233,11 +222,10 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
         // Thread t's tables take the pairs in its inbox, and give the buffers back
         // empty.
         let (mut taken, mut spare) = (Vec::new(), Vec::new());
-        let mut take = |mine: &mut Vec<Table>, t: usize, totals: &mut _, mode: usize| {
+        let mut take = |mine: &mut Vec<Table>, t: usize, totals: &mut _| {
             std::mem::swap(&mut taken, &mut inboxes[t].lock().unwrap());
             for (k, pairs) in taken.iter_mut().enumerate() {
-                let table = &mut mine[k % PARTITIONS_PER_THREAD];
-                if mode == 1 { add_batched(table, pairs, totals) } else { add(table, pairs, totals) }
+                add(&mut mine[k % PARTITIONS_PER_THREAD], pairs, totals);
                 pairs.clear();
             }
             // A buffer that grew (the empty name's partition overflows) is dropped,
@@ -247,21 +235,6 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
         };
         std::iter::from_fn(|| claim(&next_chunk, REGION_CHUNKS)).for_each(&fill);
         wait(&chunks_done, REGION_CHUNKS);
-        for pass in 0..passes {
-        let mode = MODES[pass];
-        // PROBE: from the second pass on, this thread's tables start empty again (no
-        // other thread can take them now: every inbox is empty until the pass starts).
-        if pass > 0 {
-            for (keys, seen) in tables[w].lock().unwrap().iter_mut() {
-                keys.fill(0);
-                seen.clear();
-            }
-            totals = [EMPTY; GROUPS];
-        }
-        if arrived.fetch_add(1, AcqRel) + 1 == (pass + 1) * threads {
-            clock.lock().unwrap().0 = std::time::Instant::now();
-        }
-        wait(&arrived, (pass + 1) * threads);
         // Runs are claimed one at a time, so a thread slowed down parses fewer of
         // them, and no thread waits for another one until the end.
         while let Some(claim) = claim(&next_run, runs) {
@@ -272,7 +245,7 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
             // Each thread finds its own cuts, so their pages fault in in parallel.
             let cut = |run| run_start(text, body_start, run, runs);
             let span = (cut(run), cut(run + 1));
-            parse_run(text, span, &group_of, usize::MAX, &mut totals, &mut pairs);
+            parse_run(text, span, &group_of, &mut totals, &mut pairs);
             // Empty buffers for the next run's pairs, all at once.
             let mut pool = empties.lock().unwrap();
             let n = pool.len().saturating_sub(parts);
@@ -295,7 +268,7 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
                     && let Ok(mut theirs) = tables[t].try_lock()
                     && !theirs.is_empty()
                 {
-                    take(&mut theirs, t, &mut totals, mode);
+                    take(&mut theirs, t, &mut totals);
                 }
             }
             // The last of a block's runs to be parsed drops the block's pages.
@@ -316,15 +289,15 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
             }
             // This thread's tables, unless another thread holds them.
             if let Ok(mut mine) = tables[w].try_lock() {
-                take(&mut mine, w, &mut totals, mode);
+                take(&mut mine, w, &mut totals);
             }
         }
         // Once no thread files pairs any more, every thread's tables take their
         // inbox, this thread's first.
         flushed.fetch_add(1, Release);
-        wait(&flushed, (pass + 1) * threads);
+        wait(&flushed, threads);
         for t in std::iter::once(w).chain(0..threads) {
-            take(&mut tables[t].lock().unwrap(), t, &mut totals, mode);
+            take(&mut tables[t].lock().unwrap(), t, &mut totals);
         }
         // The last thread to finish writes the output and exits, without waiting
         // for the others to exit and without dropping anything.
@@ -338,25 +311,8 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
         }
         *done += 1;
         if *done == threads {
-            let mut clock = clock.lock().unwrap();
-            let elapsed = clock.0.elapsed();
-            if pass > 0 {
-                clock.1[mode] += elapsed;
-            }
-            if pass + 1 == passes {
-                write_output(out_dir, sums, &keys.lock().unwrap());
-                if passes > 1 {
-                    // Means over the 4 passes of each mode, in 0.1 ms units.
-                    let [a, b] = clock.1.map(|d| d.as_secs_f64() * 1e4 / 4.0);
-                    std::process::exit((100.0 + a - b).round().clamp(1.0, 255.0) as i32);
-                }
-                std::process::exit(0);
-            }
-            // The next pass starts from nothing: every thread is past its runs.
-            next_run.store(0, Relaxed);
-            parsed.iter().for_each(|p| p.store(0, Relaxed));
-            (*done, *sums) = (0, [EMPTY; GROUPS]);
-        }
+            write_output(out_dir, sums, &keys.lock().unwrap());
+            std::process::exit(0);
         }
     };
     thread::scope(|s| {
@@ -452,108 +408,6 @@ fn add(table: &mut Table, pairs: &[u64], totals: &mut [Totals; GROUPS]) {
     }
 }
 
-/// PROBE: cspeed-1's batched dedupe, mode 1.
-/// Marks each (name hash, group) pair, and counts in `totals` the pairs seen for
-/// the first time. Out of line, like `parse_run`, so that edits to the worker
-/// around it cannot change how its loop is compiled.
-#[inline(never)]
-fn add_batched(table: &mut Table, pairs: &[u64], totals: &mut [Totals; GROUPS]) {
-    // Fields as locals: no store through them can change the others.
-    let (keys, seen) = table;
-    let (buckets, full) = (keys.len() / 8, keys.len() / 8 * 5 * WORDS);
-    // A key holds the name's row + 1 in its low bits (rows < slots, so it fits) and,
-    // above them, the pair's bits up to 56: 20 hash bits, 36..56, at 12 threads (4096
-    // slots per table), 16 on one (65,536 slots). The row's check bits hold hash bits
-    // 21..36. With the bucket's bits (9 at 12 threads, 13 on one) and the
-    // partition's (log2 of 48 or of 4, from the top bits), that tells names apart by
-    // 49.6 bits at 12 threads, 46 on one: with the generator's 100,000 names, two
-    // share them all with odds of about C(100000, 2) / 2^49.6 = 5.9e-6 per dataset
-    // at 12 threads, C(100000, 2) / 2^46 = 7.1e-5 on one.
-    let rows_mask = keys.len() as u32 - 1;
-    // The name's row: the first slot of its buckets that holds the name, or an empty
-    // one, which it takes.
-    let find = |keys: &mut Vec<u32>, seen: &mut Vec<u64>, pair: u64| {
-        let (key, check) = ((pair >> 24) as u32 & !rows_mask, pair >> 21 & 0x7FFF);
-        // The top hash bits picked the partition; the bits above the group pick a
-        // bucket of 8 slots, compared at once. Slots fill in order and are never
-        // emptied, so the first slot that holds the name or is empty is the name's.
-        let mut bucket = (pair >> 8) as usize & (buckets - 1);
-        // SAFETY: buckets are masked to the table (a multiple of 8 slots), and a
-        // key's row has its WORDS words in `seen`. AVX2 is enabled.
-        unsafe {
-            let wanted = _mm256_set1_epi32(key as i32);
-            let mask = _mm256_set1_epi32(!rows_mask as i32);
-            'found: loop {
-                let v = _mm256_loadu_si256(keys.as_ptr().add(bucket * 8).cast());
-                let free = _mm256_cmpeq_epi32(v, _mm256_setzero_si256());
-                let hit = _mm256_cmpeq_epi32(_mm256_and_si256(v, mask), wanted);
-                let hit = _mm256_or_si256(hit, free);
-                // Slots whose hash bits match, or empty, in order: a match whose
-                // check bits differ is another name.
-                let mut hits = _mm256_movemask_ps(_mm256_castsi256_ps(hit));
-                while hits != 0 {
-                    let slot = keys.get_unchecked_mut(bucket * 8 + hits.trailing_zeros() as usize);
-                    if *slot == 0 {
-                        assert!(seen.len() < full, "more names than the tables hold");
-                        *slot = key | (seen.len() / WORDS + 1) as u32;
-                        seen.extend_from_slice(&[0, 0, 0, check << 48]);
-                        break 'found seen.len() / WORDS - 1;
-                    }
-                    let row = (*slot & rows_mask) as usize - 1;
-                    // Word 3's bits 48..62, without bit 63 (`_UNMATCHED`).
-                    if seen.get_unchecked(row * WORDS + 3) << 1 >> 49 == check {
-                        break 'found row;
-                    }
-                    hits &= hits - 1;
-                }
-                bucket = (bucket + 1) & (buckets - 1);
-            }
-        }
-    };
-    // In batches, so that the rows' cache misses overlap: first each pair's likely
-    // row, the first slot of its first bucket with its key bits, is looked up and
-    // prefetched; then each pair checks that row and sets its bit. Any other case
-    // (a new name, a full bucket, check bits that differ) takes `find`, which gives
-    // the same row: the first slot with the key bits is filled, so it comes before
-    // any empty slot. A row found in the first pass is never stale (slots are never
-    // emptied); a name added in the second pass is missed by the first and found.
-    for batch in pairs.chunks(BATCH) {
-        let mut likely = [0u32; BATCH]; // row + 1, or 0 for none
-        for (likely, &pair) in likely.iter_mut().zip(batch) {
-            let bucket = (pair >> 8) as usize & (buckets - 1);
-            // SAFETY: the bucket is masked to the table, a slot index below 8 (0 if
-            // no slot matches, then unused), and a prefetch never faults. AVX2 is enabled.
-            unsafe {
-                let v = _mm256_loadu_si256(keys.as_ptr().add(bucket * 8).cast());
-                let key = _mm256_set1_epi32(((pair >> 24) as u32 & !rows_mask) as i32);
-                let hit = _mm256_cmpeq_epi32(_mm256_and_si256(v, _mm256_set1_epi32(!rows_mask as i32)), key);
-                let hits = _mm256_movemask_ps(_mm256_castsi256_ps(hit)) as u32;
-                let slot = *keys.get_unchecked(bucket * 8 + (hits.trailing_zeros() & 7) as usize);
-                *likely = if hits != 0 { slot & rows_mask } else { 0 };
-                let row = seen.as_ptr().wrapping_add((*likely as usize).wrapping_sub(1) * WORDS + 3);
-                _mm_prefetch::<_MM_HINT_T0>(row.cast());
-            }
-        }
-        for (&likely, &pair) in likely.iter().zip(batch) {
-            let (group, check) = ((pair & 0xFF) as usize, pair >> 21 & 0x7FFF);
-            let row = likely as usize;
-            // SAFETY: a nonzero `likely` is a filled slot's row + 1, which has its
-            // WORDS words in `seen`, and `seen` covers every group.
-            unsafe {
-                let row = if row != 0 && seen.get_unchecked(row * WORDS - 1) << 1 >> 49 == check {
-                    row - 1
-                } else {
-                    find(keys, seen, pair)
-                };
-                let word = seen.get_unchecked_mut(row * WORDS + group / 64);
-                let bit = 1 << (group % 64);
-                totals[group][5] += (*word & bit == 0) as i64; // names_distinct
-                *word |= bit;
-            }
-        }
-    }
-}
-
 /// Where run `k` of the `parts` runs of `text[from..]` starts (`parts`: the end):
 /// at `from`, or at a guessed record start (see the top of the file), the first
 /// one at or after the nominal cut. Monotonic in k: a search that passes the next
@@ -585,7 +439,6 @@ fn parse_run(
     text: &[u8],
     (start, end): (usize, usize),
     group_of: &[AtomicU8],
-    mask: usize,
     totals: &mut [Totals; GROUPS],
     pairs: &mut [Vec<u64>],
 ) {
@@ -603,7 +456,7 @@ fn parse_run(
     let mut count = |r: &Record| {
         let &(id, region_id, cents, bytes, hash, _) = r;
         // The stored group + 1, so 0 (not in the table) wraps to `_UNMATCHED`.
-        let k = (region_id as usize).min(group_of.len() - 1) & mask; // PROBE: the mask
+        let k = (region_id as usize).min(group_of.len() - 1);
         // SAFETY: k is below the length (which is at least 2).
         let stored = unsafe { group_of.get_unchecked(k) }.load(Relaxed);
         let group = stored.wrapping_sub(1);
