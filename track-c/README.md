@@ -14,25 +14,27 @@ country, in byte order of the code, with `_UNMATCHED` last. Each line has:
 - the number of distinct names;
 - the unescaped bytes of the names and of the notes.
 
-The CSV is hostile: names and notes are quoted, with `""` escapes, LFs and BOMs inside quotes,
-and CRLF and LF terminators mixed. Distinct names must be counted per country over all records.
+The CSV is hostile: names and notes are quoted or empty, with `""` escapes and commas inside the
+quotes, LFs inside notes, BOMs at some record starts, and CRLF and LF terminators mixed. Distinct
+names must be counted per country over all records.
 
 ## Where the time goes on the box
 
-The reference runs 14.44 s at 367 MB and S 108. The submitted code (PERF.md step 58, b8b733a,
-S 487) runs 0.0171 to 0.0174 s on the board in its normal runs (run-aa635b7c5107, 0.017108 s,
-10.68 MB, 83.62 points; run-00bcea1e0afe, 0.017356 s, 9.66 MB, 83.90 points, its best points), and
-step 57,
-the same hot code, 0.0170 to 0.0173 s in its normal runs (run-c56b067ab64d, 0.016978 s, 10.74 MB, 83.71
-points; run-9ac7e3c0222d, 0.017339 s) (details: PERF.md, steps 49-58).
+The reference runs 14.44 s at 367 MB and S 108. The submitted code (PERF.md step 59, 1eb28f0,
+S 536) is step 58 with its worker in named functions, the hot loops' code unchanged; its first
+board run took 0.017307 s (run-635fea87b55d, 10.69 MB, 83.18 points). Step 58 ran 0.0171 to 0.0174
+s in 15 of its 19 board runs: fastest run-0be3ea3875d4 (0.017071 s, 10.58 MB, 83.69 points), best
+points run-00bcea1e0afe (0.017356 s, 9.66 MB, 83.90). Step 57, the
+same hot code, ran the fastest Track C time, 0.016978 s (run-c56b067ab64d). Details: PERF.md,
+steps 49-59.
 
 Per record, step 46 executed about 193 instructions in all, parse and deduplication together
 (640.9M instructions for 3.32M records at 12 threads). The single largest stall is the join
 itself: one random byte load into a 1 MB region table, which misses L2 on the box's CPU. With the
 region index masked to 256 KB (wrong output, timing only), the replica ran 6.7% faster. The
 submitted code hides most of that load instead: it prefetches the entry as soon as a record's
-region id is known, and counts the record only after the next record is parsed (5.6% faster on
-the replica than counting at once).
+region id is known, and counts the record only after the next record is parsed (4.7% faster on
+the replica than counting at once: step 48's hot path against step 46's, 198 of 201 pairs).
 
 ## The design
 
@@ -44,7 +46,7 @@ the replica than counting at once).
 | Region table: one byte per region id | The join itself |
 | Distinct names in one table per thread, buffers handed over | Atomics and cache-line traffic of one shared name table |
 | Runs claimed one at a time, no barriers | One slow CPU holding up every thread |
-| Input released once per thread, small pooled buffers, tables dropped in parallel, exit without frees | Memory peak and the exit's serial unmap |
+| Input released in two calls per thread, small pooled buffers, tables dropped in parallel, exit without frees | Memory peak and the exit's serial unmap |
 
 **What the parser relies on.** Spec section 2.2 lists what the generator writes, for every seed
 and scale, the holdout included, and says that a solution may rely on it. This one does:
@@ -195,6 +197,12 @@ Two names are confused only if they share every compared bit:
   their own table's pages and a share each of the join table, of regions.csv and of the input's
   last third, which the exit would otherwise free one by one on one core.
 
+**The code's layout.** `run` maps the files, derives the sizes and spawns the threads. Each thread
+runs `worker` (its table and pair buffers, its share of regions.csv, `move_off_shared_cpu`, the run
+loop with the hand-off and the takeover), which ends in `finish` (the flush barrier, the input
+drop, the takes through `take`, the merge, then the write or the teardown). What the threads share
+is one `Shared` struct, each field with its comment.
+
 **Memory.** At 12 threads the program's own data is:
 - the region table (1 MB);
 - the name tables' keys (0.79 MB: 12 tables of 16,384 4-byte slots);
@@ -203,9 +211,9 @@ Two names are confused only if they share every compared bit:
 The pair buffers wait for about one run, so their size follows the run size. About 3.3 MB is
 outside the program's control (measured before step 46): about 1 MB already charged when the
 program starts, about 0.7 MB of kernel page tables and stacks, and 1-2 MB of the kernel's per-CPU
-charge batching. On the replica (mem.sh): step 58, 20 runs, max 10.50 MB; step 57, 20 runs, 9.30
-to 10.43 MB; step 56, the same
-logic, 200 runs, median 10.11 MB, max 10.99 MB. At the parse-end peak (smaps, step 58, three runs)
+charge batching. On the replica (mem.sh): step 58, two sets of 20 runs, max 10.50 and 10.69 MB;
+step 57, 20 runs, 9.30 to 10.43 MB; step 56, the same logic, 200 runs, median 10.11 MB, max
+10.99 MB. At the parse-end peak (smaps, step 58, three runs)
 anonymous memory is 7.3 to 8.1 MB: the join table's 0.98 MB, 12 malloc arenas of 0.38 to 0.78 MB
 each (one run had a 1.4 MB arena, the pair-buffer pool at its peak) and 12 thread stacks of 20 KB;
 on top come 0.5 MB of page tables and 1.5 to 2.4 MB of the kernel's per-CPU charge stock.
@@ -223,7 +231,7 @@ are exact; the distinct-name count rests on a hash (technique 6 below).
 4. Cuts after the first LF followed by a digit or a BOM byte (`run_start`). Exact: by spec 2.2 such an LF ends a record.
 5. Each thread finds its own cuts: no serial pass. Exact: the cut search is monotonic, so the runs cover the file once.
 6. Tripwires: every half-run must end exactly at its cut (`assert_eq!` in `parse_run`). Exact on 2.2 input; input that moves a record boundary almost always stops here, and other breaks of 2.2 are answered as parsed ("Error handling").
-7. Dense join table of 2^20 bytes, allocated zeroed (`group_of`, `REGION_IDS`). Exact: listed ids are below 1,000,000 (spec 2.3; a larger one panics in `fill`), and ids above the table read its last entry, which no listed id sets.
+7. Dense join table of 2^20 bytes, allocated zeroed (`group_of`, `REGION_IDS`). Exact: listed ids are below 1,000,000 (spec 2.3; a listed id of 2^20 − 1 or more panics in `fill`), and ids past the table are clamped to its last entry, which no listed id sets.
 8. regions.csv filled in parallel from 64 claimed chunks (`fill`). Exact: chunks are cut at line starts, and each region id is stored once.
 9. Country codes indexed by 26^3, numbered under a lock on first sight (`codes`, double-checked load). Exact: one number per code.
 10. Groups numbered as first seen, sorted by code at output (`write_output`). Exact: byte order, `_UNMATCHED` last.
@@ -340,9 +348,9 @@ exact. The distinct-name count rests on a hash; its odds are stated in technique
   - *Deferred counts.* As soon as a record's region id is known, it is clamped to the table and its
     entry is prefetched; the count then reads the entry without a check. The record is counted
     after the next record is parsed: the first half's after the second half's parse, the second
-    half's after the next pass's first record. On the replica this was 5.6% faster than counting at
-    once. The prefetch alone gave 0.26%, and the deferral without the prefetch was 1.22% slower
-    (PERF.md, steps 47-48).
+    half's after the next pass's first record. On the replica this was 4.7% faster than counting at
+    once (198 of 201 pairs against step 46's hot path). The prefetch alone gave 0.26%, and the
+    deferral without the prefetch was 1.22% slower (PERF.md, steps 47-48).
   - *The next record's start* comes from the LF bit of the tail's 32 bytes, not from the amount's
     end and a CR byte load: −0.57% on the replica (PERF.md, step 49).
   - *Stream prefetch.* The record stream is prefetched non-temporally 1 KB ahead, so it takes less
@@ -360,9 +368,9 @@ exact. The distinct-name count rests on a hash; its odds are stated in technique
   for an id that is not listed. It is filled in parallel from 64 claimed chunks of regions.csv.
   The record's region id is clamped to the table's last entry.
 - **Why exact.** Listed ids are below 1,000,000 (spec 2.3), so they fit the table's 2^20 entries;
-  a larger one panics in `fill`. The last entry is never set, so every id above the table reads 0,
-  `_UNMATCHED`. Each country's group number is handed out once under a lock, and the output sorts
-  the groups by code.
+  a listed id of 2^20 − 1 or more panics in `fill`. The last entry is never set, so every id
+  above the table reads 0, `_UNMATCHED`. Each country's group number is handed out once under a
+  lock, and the output sorts the groups by code.
 
 ### 6. Distinct names without atomics
 
@@ -439,8 +447,11 @@ exact. The distinct-name count rests on a hash; its odds are stated in technique
 
 ## Why the output is exact
 
-The output is exact for every input the generator writes (spec 2.2), at any thread count. The
-arguments, gathered from the techniques above:
+Every total (count, id and amount sums, min, max, name and note bytes) is exact for every input
+the generator writes (spec 2.2), at any thread count. `names_distinct` is exact unless two of the
+dataset's names agree on all 47.6 compared hash bits at 12 threads (42 on one thread), with odds
+of about 2.4e-5 per dataset (1.1e-3 on one thread); a check rules that out on all six datasets we
+have. The arguments, gathered from the techniques above:
 
 - **Cuts.** Under 2.2 an LF inside quotes is followed by a letter or a quote, and a record
   terminator by the next record's id digit or BOM, so every cut is a record start and the runs
@@ -469,6 +480,25 @@ arguments, gathered from the techniques above:
 - **Evidence.** The seed-1 hash at 1, 3, 7 and 12 CPUs, sample seeds 2-4 and holdout seed 99 at
   every gate, the 32 mutants, and the robustness runs on 30 fresh full-scale seeds and in 1,505
   more runs ("Robust on unseen seeds").
+
+**The spec's edge cases (section 2.5), one by one.**
+
+| Edge case | Where it is handled |
+|---|---|
+| 1-3. A BOM at the file's start, after a CRLF or an LF mid-file, and the record after one | The first is part of the header line, which is skipped. A cut may land after the LF before a BOM byte; the fast path's number words see a BOM byte, never a digit, before the id; the walker skips the 3 bytes |
+| 4. CRLF and LF mixed | The next record starts after the first LF of the tail's 32 bytes, either way |
+| 5. A comma inside quotes | The inside-quotes mask takes it out of the separators |
+| 6. `""` escapes | A pair flips the quote state twice, and counts one byte |
+| 7-9. One to three LFs in a note, with a comma and an escape | An LF inside quotes is followed by a letter or a quote, so no cut lands there; a second 64-byte window carries the quote state, and longer notes go to the walker |
+| 10-11. Empty fields, unquoted or `""` | Length 0, and for a name the hash of the empty string, either way |
+| 12. Trailing spaces in a name | Part of its raw bytes: of its hash and its length |
+| 13. The last record, ending in CRLF | The last 256 bytes go to the walker, which reads CRLF or LF |
+| 14-15. Negative amounts, -0.99 to -0.01, and 0.00 | The sign is the byte after the region's comma; the digits without the dot are the cents ("0.05" is 5) |
+| 16. A region id in a hole, or above the range | Its entry is 0, `_UNMATCHED`; ids past the table are clamped to its last entry, also 0 |
+| 17. `Betts` and `Betts ` in one country | Different raw bytes: two names, which the hash keeps apart but for the odds of technique 6 |
+| 18. An unquoted and a quoted empty name in one country | The same empty bytes: one name |
+| 19. A country with no records | Its count is 0, and the output skips it |
+| 20. A country whose amounts all lie in -0.99..-0.01 | The min and max start at the far ends (`EMPTY`), so a negative max is kept, and the money format prints "-0.05" |
 
 ## Robust on unseen seeds
 

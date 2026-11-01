@@ -1,13 +1,15 @@
 # Track A: performance log
 
-**Result.** The reference runs 32.05 s at 228 MB and S 56. The submitted code (step 66, a09d036,
-S 455) is step 63 with the worker defined once, named structs for the parts, run starts and runs,
+**Result.** The reference runs 32.05 s at 228 MB and S 56. The submitted code (step 67, 12e48b1,
+S 455) is step 66 with review comments, the same code token for token; its board run is pending.
+Step 66 is step 63 with the worker defined once, named structs for the parts, run starts and runs,
 and a lines pass in `main`, each measured at the same speed on the replica; its board runs took
-0.016158 s (run-ee262fe95b70, 18.21 MB, 86.59 points) and 0.016216 s, and 0.020944 and 0.02058 s in
-A's slow windows. Step 64, the same engine, has the best Track A run, run-1bda764d4b1e (0.016043 s, 18.67
+0.016041 s (run-870c44970b40, 18.54 MB, 86.59 points), 0.016152, 0.016158 (run-ee262fe95b70, 86.59
+points), 0.016216 and 0.016473 s, and 0.020944 and 0.02058 s in A's slow windows.
+Step 64, the same engine, has the best Track A run, run-1bda764d4b1e (0.016043 s, 18.67
 MB, S 442, 86.65 points), and step 63 the fastest Track A time, run-219d1a5f89d0 (0.016017 s,
-86.64 points). Six of the twelve board runs of steps 61 to 65 took 0.018 s or more, two of them in
-DISTURBED dispatches, against four of the fifteen of steps 59 and 60. Three
+86.64 points). Eight of the nineteen board runs of steps 61 to 66 took 0.018 s or more, two of them
+in DISTURBED dispatches, against four of the fifteen of steps 59 and 60. Three
 ideas carry it: a parse that finds each line's fields from one AVX2 mask
 and looks its endpoint up where it lies, with two slices side by side per thread (steps 43 and
 51); 4-byte records grouped into hours as runs of lines, so no timestamp is parsed per line and no
@@ -44,7 +46,9 @@ Before pushing, steps were timed in three ways ("How we measured", near the end)
   board's own timer.
 
 The commit column is the Track A code that was measured. Some board runs come from a later push
-that carried the same Track A code. A dash means the value was not written in our run log. Rows
+that carried the same Track A code. A dash means the value was not written in our run log; a
+value read only from `board.py`'s output is credited as such in its row; * marks a value computed
+with the board's formula from the logged T, M and S. Rows
 without a run ID either had no board run of their own or their run is not in the log; their
 numbers are left out rather than guessed.
 
@@ -52,7 +56,7 @@ numbers are left out rather than guessed.
 |---|---|---|---|---|---|---|---|
 | 0 | | The reference, unchanged (the board's calibration figures, not a run of ours) | | 32.05 | 228 | 56 | 0 |
 | 1 | cf9c345 | mmap, a thread per hardware thread, packed u64 records, counting sort by (hour, endpoint), sort per group | run-9042fdf66fed | 0.0796 | 57.03 | 402 | 64.72 |
-| 2 | 060fea1 | AVX2 line parse: vector compares for the endpoint's end, a 32-byte key from the register, SWAR digits | run-4e23aae357cc | 0.0749 | 59.36 | 505 | 64.45 |
+| 2 | 060fea1 | AVX2 line parse: vector compares for the endpoint's end, a 32-byte key from the register, SWAR digits | run-4e23aae357cc | 0.0749 | 59.36 | 505 | 64.45* |
 | 3 | 144561a | Parallel glue: prefix sums, scatter and output in parallel (pwrite into a pre-sized file) | run-92e5d2af56e2 | 0.0510 | 62.2 | 575 | 68.0 |
 | 4 | 64499b4 | Scatter arrays populated in one call (board run not in our log) |  |  |  |  |  |
 | 5 | 42acaa7 | Profile-guided build (training on a generated sample, seed 7) | run-8d33686a4c41 | 0.0498 | 51.6 | 597 | 68.96 |
@@ -79,7 +83,7 @@ numbers are left out rather than guessed.
 | 25 | d8e2636 (reverted in 1c8d136) | The endpoint key built inline; the latency shuffle control from one table load | run-b68029ac7816 | 0.019916 | — | 514 | — |
 | 26 | f8ccd39 | A third fewer lines, one file, same engine and hot loops | run-b5ca2d290934 | 0.019723 | 21.01 | 335 | 84.80 |
 | 27 | a70edf7 | Each parse thread finds its own cuts; tighter imports and digit table | run-ad02131f83b0 | 0.020038 | — | 327 | 84.68 |
-| 28 | fb34663 | Dockerfile only: PGO training with atomic profile counters, one profile for every build | run-ca06822d40f0, run-64be7f99b895 | 0.019331, 0.019387 | — | 327 | 85.08, 85.09 |
+| 28 | fb34663 | Dockerfile only: PGO training with atomic profile counters, so the training run's threads no longer lose counter updates | run-ca06822d40f0, run-64be7f99b895 | 0.019331, 0.019387 | — | 327 | 85.08, 85.09 |
 | 29 | 2148d5f | Malformed input aborts instead of reading past the pad (fuzzing: 68 of 300 segfaults → 0) | run-14334649ab5d | 0.019612 | — | 327 | — |
 | 30 | 56c42bf | One set of threads for both passes, no join or respawn between them | run-666179516fda | 0.020152 | — | 338 | — |
 | 31 | bbdb79e | Memory peak cut in pass 2: log unmapped, keys released, smaller pending statistics, largest hours first | run-d1362361f9e4 | 0.019837 | 18.24 | 355 | 85.16 |
@@ -117,9 +121,14 @@ numbers are left out rather than guessed.
 | 63 | 8a293ff (later runs from 1e8c3f0, 83a938d, 15388b9 and 2b59127) | The main thread is the 12th worker and the last one done with pass 1 merges, so no 13th thread shares the 12 CPUs (the change alone, 300 interleaved runs: runs over +8% 21-43 → 6-10, median −0.9%); every latency of 7 or more digits escapes; one loop runs both slices (replica −1.07% against step 62, 144 of 201 pairs) | run-df6e626d67b9, run-5f20ef221ffb, run-424d169e8d52, run-285034434470, run-219d1a5f89d0 | 0.019571, 0.01964, 0.022344, 0.016107, 0.016017 | 19.18, 18.68, 18.79, 18.55, 18.68 | 445 | 84.35, 84.43, 83.00, 86.61, 86.64 |
 | 64 | 695cd44 (second run from fc30062) | The worker defined once in `main`: threads − 1 are spawned and this thread runs the last one, with the worker's machine code unchanged (first run DISTURBED). Its second run has the best Track A points | run-a1a3f0c0e9f5, run-1bda764d4b1e | 0.019162, 0.016043 | 18.34, 18.67 | 442 | 84.80, 86.65 |
 | 65 | 5719822 (second run from 883c315) | Named structs for the tuple data model (`Part`, `Start`, `Run`): `Part` is `repr(C)`, runs are copied at the loop head and parts built by a small closure, each choice kept for a measured code-generation reason; and 14 review comment fixes (the same code lines as the structs alone; replica equal) | run-1531e5c2ac59, run-aeb5c0425a96 | 0.016109, 0.016208 | 18.49, 18.15 | 462 | 86.50, 86.52 |
-| 66 | a09d036 (later runs from 79fb02b, 14aa7c9 and f37f273) | A lines pass in `main`: the six shared counters as one array, the room per thread inline, the hour key in one line, `counts` zeroed as each group is taken instead of a 16 KB fill per hour, the scope returning the total (replica −0.04, +0.29, −0.01 and +0.03% over four pairings: equal). **The submitted code** | run-b46ef564c46b, run-ce29fb96c3ac, run-64335e22618d, run-ee262fe95b70 | 0.016216, 0.020944, 0.02058, 0.016158 | 18.35, 18.65, —, 18.21 | 455 | 86.51, 83.67, —, 86.59 |
+| 66 | a09d036 (later runs from 79fb02b, 14aa7c9, f37f273, 9b2ee21, 41e6cfe and 1eb28f0) | A lines pass in `main`: the six shared counters as one array, the room per thread inline, the hour key in one line, `counts` zeroed as each group is taken instead of a 16 KB fill per hour, the scope returning the total (replica −0.04, +0.29, −0.01 and +0.03% over four pairings: equal) | run-b46ef564c46b, run-ce29fb96c3ac, run-64335e22618d, run-ee262fe95b70, run-dd77010a62f8, run-d5416e8b5c12, run-870c44970b40 | 0.016216, 0.020944, 0.02058, 0.016158, 0.016152, 0.016473, 0.016041 | 18.35, 18.65, —, 18.21, 18.48, —, 18.54 | 455 | 86.51, 83.67, —, 86.59, 86.53, 86.31, 86.59 |
+| 67 | 12e48b1 | Review comments only: the safety arguments, the phases, and the Dockerfile's note on reproducible builds; the token stream is step 66's. **The submitted code**; its board run is pending | | | | 455 | |
 
-**The submitted code is step 66 (a-20, a09d036), S 455**: step 63 with three changes that keep its
+**The submitted code is step 67 (12e48b1), S 455**: step 66 with the round-5 review comments (the
+safety arguments, the phases, the Dockerfile's note on reproducible builds), the same code token for
+token. Its board run is pending.
+
+**Step 66 (a-20, a09d036), S 455**: step 63 with three changes that keep its
 speed (replica, PGO, 201 pairs, two builds a side).
 - *The worker defined once (step 64, a-18).* `main` defines the worker closure before the spawn
   loop, spawns threads − 1 workers and runs the last one on its own thread; the worker's machine
@@ -138,8 +147,11 @@ speed (replica, PGO, 201 pairs, two builds a side).
   peaks over 40 rounds, 18.49 and 18.37 MB (two builds) against 18.38. S 462 → 455.
 - *Board.* Step 64 ran 0.016043 s (run-1bda764d4b1e, 18.67 MB, 86.65 points), the best Track A
   points, and 0.019162 s in a DISTURBED dispatch (C's unchanged code ran 0.028048 s); step 65
-  0.016109 and 0.016208 s (run-aeb5c0425a96, 18.15 MB, 86.52 points). Step 66 ran 0.016158 s (run-ee262fe95b70, 18.21 MB, 86.59 points) and 0.016216 s, and 0.020944 s
-  with B and C normal and 0.02058 s.
+  0.016109 and 0.016208 s (run-aeb5c0425a96, 18.15 MB, 86.52 points). Step 66 ran
+  0.016041 s (run-870c44970b40, 18.54 MB, 86.59 points), 0.016152 s (run-dd77010a62f8, 18.48 MB,
+  86.53 points), 0.016158 s (run-ee262fe95b70, 18.21 MB, 86.59 points), 0.016216 and 0.016473 s
+  (run-d5416e8b5c12, 86.31 points, its M not logged), and 0.020944 and 0.02058 s, both with B and C
+  normal.
 
 **Step 63 (a-17, 8a293ff), S 445**: step 60 with three changes, each
 measured on the replica (ab.sh, 201 pairs unless noted).
@@ -191,8 +203,9 @@ timed exec to exit by the board's timer:
 
 The slow runs are slow parses, the part whose floor is memory-bound (step 47); pass 2 stays within
 0.3 ms of normal. That fits the contention hypothesis above, though it does not prove it: on the
-board, A ran slow with B and C normal twice (step 63's 0.019571 s and step 66's 0.020944 s), and its
-other slow runs came while B was slow too.
+board, A ran slow with B and C normal three times (step 63's 0.019571 s, and step 66's 0.020944 and
+0.02058 s, when B ran 0.078623 and 0.080472 s and C 0.017356 and 0.017421 s), and in each of its
+other slow runs of steps 61 to 64, B or C was slow too.
 
 **Step 60 (a-15, 3aa95c6), S 449**: step 59 with the source rustfmt-clean
 and named patterns for the hour key and the part, the same at run time (replica: +0.52%, −0.18%,
@@ -338,7 +351,10 @@ dispatches where B's unchanged code ran 0.1209-0.1312 s.
   builds of the unchanged step-23 source spread 0.5 ms on the server.
 - **Step 28** fixed that build-to-build spread at its cause. The instrumented training run has 12
   threads, and plain profile counters lose updates when threads increment them at once. Atomic
-  counters give the same profile on every build. A first attempt, training on one CPU with
+  counters stop the lost updates. Builds still differ a little: counts that depend on timing (the
+  endpoint table's insert race, the merge's sort, the flush) vary from run to run, so two builds of
+  one source can lay out blocks differently (17 to 120 worker instructions in step 65's builds),
+  which is why every replica A/B uses two builds a side. A first attempt, training on one CPU with
   `taskset -c 0` (368aa64), broke every track's board build: CPU 0 is not in the build
   container's CPU set. It was reverted in 387ebb3. The two board runs after step 28 were the best
   A times at that point (0.019331 and 0.019387 s).
@@ -640,8 +656,8 @@ The box is the board's scoring machine; the test server is a 16-vCPU VM. What he
   run cannot tell a 3% change from that, so decisions used alternating dispatches, and from step 49
   on the replica.
 
-- **The parse is core-bound, though its floor is memory-bound.** A build of the submitted code
-  that prints its phase ends, run on the replica 15 times each way, interleaved: with one thread
+- **The parse is core-bound, though its floor is memory-bound.** A build of step 60's code
+  (the submitted code when this was measured) that prints its phase ends, run on the replica 15 times each way, interleaved: with one thread
   per core (6 threads, on CPUs 0, 2, 4, 6, 8 and 10) the parse ended at 12.62 ms against 9.63 ms
   with 12 threads (medians; minima 12.40 and 9.47), 31% later, and the rest of the run took 6.97
   against 5.86 ms, 19% longer. The touch-only probe of step 47 lost only 5% with half the
@@ -931,9 +947,12 @@ On top of that:
   tripwire, none crashes).
 - **Step 60** passed the gate on the replica, with `rustfmt --check` clean;
   it changes names and formatting only.
-- **Steps 64 to 66** passed the gate on the exact Dockerfile build; step 65 has the same code lines
-  as its structs, which passed the replica gates, and step 66's machine code differs from step
-  65's only outside the hot loops (above).
+- **Steps 64 and 65** passed the replica gates on the exact Dockerfile builds of their code (step
+  65 adds only comments to the gated code): the seed-1 hash 495ca09682b9… at 1, 3, 7 and 12 CPUs;
+  sample seeds 1-4; holdout seed 99; the empty input; 250 malformed logs, none of which crashes;
+  and the 13 in-spec edge inputs, 52 of 52. Their robustness runs are in the table below.
+  **Step 66** passed the gate script on its exact Dockerfile build, and its machine code differs
+  from step 65's only outside the hot loops (above).
 - **Step 59** passed the gate on the replica (the seed-1 hash at 1, 3, 7 and
   12 CPUs, sample seeds 2-4, holdout seed 99) and on the laptop. A build of it (sha256
   aa7ed65b991b…) has no `vpinsrb` and 542 `vpmovmskb`, as step 56's.
@@ -950,6 +969,7 @@ byte-exact, with no crash, no nonzero exit and nothing on stderr:
 
 | Version | Fresh full seeds 101-130 | Repeats, and CPU contention | Tiny and sample, uid 65534, up to 20 CPUs | Page-aligned files |
 |---|---|---|---|---|
+| Steps 64 and 65 (a-18, and as-1b with a-19's code lines) | 101-110 at 12 threads, 101-102 at 1 and 3 CPUs: 14/14 | 200/200 (20 repeats of 10 seeds) | 208/208 (seeds 201-205; full 111-112) | — |
 | Step 63 (a-17) | 101-110 at 12 threads, 101-102 at 1 and 3 CPUs: 14/14 | 200/200 (20 repeats of 10 seeds) | 208/208 (seeds 201-205; full 111-112) | — |
 | Step 59 (a-14) | 40/40 runs | 640/640 | 840/840 | 5/5 |
 | Step 58 (a-13) | 34/34 runs | 640/640 | 840/840 | 5/5 |
@@ -971,7 +991,8 @@ The gate is a shell script kept outside the repo (scc would count it as code): f
   three runs, 0.01795 s and 0.021609 s, step 60 0.016292 to 0.019578 s in ten runs, step 63 0.016017
   s (run-219d1a5f89d0, 86.64 points) and 0.016107 s, and 0.019571 to 0.022344 s in three slower
   runs, step 64 0.016043 s (run-1bda764d4b1e, 86.65 points, the best Track A points) and 0.019162
-  s, step 65 0.016109 and 0.016208 s, and the submitted step 66 0.016158 and 0.016216 s, and 0.020944 and 0.02058 s.
+  s, step 65 0.016109 and 0.016208 s, step 66 0.016041 (run-870c44970b40), 0.016152, 0.016158, 0.016216 and 0.016473 s, and 0.020944 and
+  0.02058 s, and the submitted step 67's run is pending.
 - **Alternating dispatches**, before the replica: a candidate and the code it would replace were
   pushed in turn, a few minutes apart, so both met the same box state, and a result counted only
   if it repeated. Example (runs.log 08:10Z): step 37, step 39, step 37, step 39, step 37 gave

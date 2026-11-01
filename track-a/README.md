@@ -20,13 +20,15 @@ percentiles need every latency of a group, not a running summary.
 
 ## Where the time goes on the box
 
-The reference runs 32.05 s at 228 MB and S 56. The submitted code (PERF.md step 66, a09d036, S
-455) is step 63's engine with the worker defined once, named structs and a lines pass in `main`, at
-the same speed on the replica; its board runs took 0.016158 s (run-ee262fe95b70, 18.21 MB,
-86.59 points) and 0.016216 s, and 0.020944 and 0.02058 s in A's slow windows. Step 64, the same engine, has the best
+The reference runs 32.05 s at 228 MB and S 56. The submitted code (PERF.md step 67, 12e48b1, S
+455) is step 66 with review comments, the same code token for token; its board run is pending.
+Step 66 is step 63's engine with the worker defined once, named structs and a lines pass in `main`,
+at the same speed on the replica; its board runs took 0.016041 s (run-870c44970b40, 18.54 MB, 86.59
+points), 0.016152, 0.016158, 0.016216 and 0.016473 s, and 0.020944 and 0.02058 s in A's slow
+windows, both with B and C normal. Step 64, the same engine, has the best
 Track A run (run-1bda764d4b1e, 0.016043 s, 18.67 MB, 86.65 points), and step 63 the fastest Track
 A time (run-219d1a5f89d0, 0.016017 s, 86.64 points). Step 60 ran 0.0163 to 0.0172 s in its normal runs (run-252c6a84434b, 0.016292 s, 19.61 MB,
-86.22 points; run-4f8350fdbe1a, 0.016341 s, 86.32 points) (details: PERF.md, steps 51-66). On the replica of
+86.22 points; run-4f8350fdbe1a, 0.016341 s, 86.32 points) (details: PERF.md, steps 51-67). On the replica of
 the scoring box (the same CPU, timed by the board's own timer; PERF.md, "How we measured"), step
 53 ran at a median of 16.856 ms over 201 pairs and steps 54 to 56, 59 and 60 within 0.3% of it;
 step 61 measured −0.69% against step 60, step 62 the same as step 61, step 63 −1.07% against
@@ -60,8 +62,8 @@ Memory is the other axis. About 4.7 MB is the container's floor (an empty input)
 counts, because `/out` is a tmpfs. The mapped input does not: the harness has it in the page cache
 already, charged to the host. The peak comes 2 to 3 ms into pass 2, while records of 32 of the 48
 parts are still alive. Since step 61 the output waits there until the records given back make
-room for it (*Gate*, below): the expected highest of five peaks is 18.45 MB on the replica,
-against 19.49 MB for step 60. Each
+room for it (*Gate*, below): the expected highest of five peaks is 18.37 to 18.49 MB on the replica
+for the submitted code (two builds, 40 rounds), against 19.49 MB for step 60. Each
 run's peak also includes 0 to 3 MB of the kernel's per-CPU charge batches (PERF.md, "What we
 learned about the box").
 
@@ -178,26 +180,26 @@ One line per technique: what it is, where it is in `src/main.rs`, and why the ou
 25. Escape list for every latency of 7 or more digits, pushed by `parse_digits`, which returns the marker 2^20 − 1. Exact: up to 6 digits stay below the marker; escapes are read back in order, run by run, from each run's first escape index.
 26. Worst-case pre-sized records, one array per thread for all its slices (`free`), written through raw pointers: no capacity checks, and untouched pages cost nothing. Exact: a line moves the parse on at least 35 bytes (`MIN_LINE`), so a slice of n bytes holds at most n / 35 + 1 records, and an assert checks the room.
 27. 5xx from the status's first digit. Exact: a status is 5xx exactly when it starts with 5.
-28. Input pages dropped by each parse thread after each pair (`release`, `MADV_DONTNEED`): the exit does not unmap 58,000 pages on one core.
+28. Input pages dropped by each parse thread after each pair (`release`, `MADV_DONTNEED`): no single unmap (the exit's, or now the merge's `munmap`) drops 58,000 pages on one core. Exact: the log is a read-only file mapping, so a dropped page that is read again (by a later `cut`, for one) faults back in unchanged.
 29. Log unmapped by the merging thread right after the hand-off, while the others start pass 2: its page tables are freed off their path. Exact: nothing reads the log after the parse; the names were copied (20).
 30. Endpoint keys released after the sort. Exact: no key is read after it.
 31. Endpoint sort by the first 32 key bytes as two big-endian `u128`, then the name. Exact: byte order; the space after an endpoint is below every endpoint byte, so a proper prefix sorts first.
 32. All runs sorted by (hour, slice) and cut into hours with `chunk_by` (`merge`, `same_hour`). Exact: every run of an hour, from any slice, lands in that hour, whatever the disorder.
 33. Hours queued in blocks of one per thread, largest first: small hours do not pile up behind a big one. Exact: it orders the work; each hour's place in the file comes from the published lengths (42).
-34. Per-hour counting sort with count and 5xx count packed in one `u64`: one add per record.
-35. Scatter without bounds checks (SAFETY: the counts are this hour's).
+34. Per-hour counting sort with count and 5xx count packed in one `u64`: one add per record. Exact: each group's count is zeroed as it is taken (`std::mem::take`), and every id a record can hold is in the endpoint list, so each hour starts from zeros.
+35. Scatter without bounds checks (SAFETY: the counts are this hour's). Exact: each id's cursor starts at its group's start and ends at the next id's start, at most the hour's record count.
 36. Record pages released per slice once no hour reads them (`readers`): one `madvise` per slice, because each call is a round of TLB shootdowns. Exact: released only after the last reader has placed its values.
 37. Percentiles of groups of up to 64 values by counting ranks (`small_ranks`): masked loads into 1, 4 or 8 vectors, one compare per value and vector, and the value at rank r taken as the largest value with at most r values below it. Exact: that is the definition of the value at rank r; the zeros past the end are never counted.
 38. Larger groups: p50, p95 and p99 by nested `select_nth_unstable`, each read right after its own selection (`stats`). Exact: ranks `ceil(p * n / 100)`; the next selection reorders the slice.
 39. Scratch sized once for the largest hour and allocated zeroed. Exact: every hour fits in it.
 40. Pending statistics as six `u32` per endpoint (24 bytes), the rate computed once in pass 2 (`stats`). Exact: the rate is the integer `errors * 1000000 / count`.
-41. Each hour's exact output length computed first (`line_len`: the hour label and its space, 21 bytes, `LABEL`; the name; each number after a space; LF), and the writer asserts it.
-42. Out-of-order compute, in-order placement: an hour's start is the sum of the published lengths before it.
-43. Output mapped shared at a bound, truncated to the total at the end: no write calls on the tmpfs inode lock.
+41. Each hour's exact output length computed first (`line_len`: the hour label and its space, 21 bytes, `LABEL`; the name; each number after a space; LF), and the writer asserts it. Exact: the length comes from the same six numbers the writer prints, and a mismatch stops the program (`assert_eq!`).
+42. Out-of-order compute, in-order placement: an hour's start is the sum of the published lengths before it. Exact: each hour's length is published once, so every hour's byte range is fixed and disjoint from the others, in whatever order the hours finish.
+43. Output mapped shared at a bound, truncated to the total at the end: no write calls on the tmpfs inode lock. Exact: no output exceeds the bound (hours × endpoints × 213 bytes, the longest possible line), and the file is cut to the sum of the lengths.
 44. Lines written backwards, straight into the mapping (`write`, `PAIRS`): digit pairs while the value is 100 or more, then the last one or two digits as one pair, with a lone digit's leading 0 overwritten by the space before the number. No stack buffer and no copy, so no store-forwarding stall. Exact: the writer asserts that each hour's lines end exactly at the hour's start.
-45. Exit without teardown (`process::exit`). Before it, the threads drop the output mapping's page-table entries in parallel after a barrier (`written`, `share`); the pages stay in the file.
+45. Exit without teardown (`process::exit`). Before it, the threads drop the output mapping's page-table entries in parallel after a barrier (`written`, `share`); the pages stay in the file. Exact: the output is complete in the page cache before the exit, and `MADV_DONTNEED` on a shared file mapping drops only page-table entries.
 46. Profile-guided build trained on generator seed 7, not the scored seed (Dockerfile). Items 46 to 51 change speed only: every correctness check runs the binary this Dockerfile builds.
-47. Atomic profile counters: every build gets the same profile.
+47. Atomic profile counters: the training run's threads no longer lose counter updates. Builds still differ a little in block order, because some counts depend on timing, so every A/B uses two builds a side.
 48. Hot loops aligned to 64 bytes (`-align-loops=64`). Kept because A is not slower with it and C's best run uses it (PERF.md, steps 34 and 36).
 49. Fat LTO, one codegen unit, `panic = "abort"` (Cargo.toml).
 50. Static binary (`crt-static`).
@@ -417,7 +419,8 @@ stays exact for every seed of the generator.
   pending statistics, all at once.
 - **Design.**
   - *Input pages.* Each parse thread drops its slices' pages (`madvise(MADV_DONTNEED)`), in
-    parallel, instead of leaving 58,000 pages to the exit on one core.
+    parallel, instead of leaving 58,000 pages to one unmap on one core (the exit's, or now the
+    merge's `munmap`).
   - *Page tables.* The merging thread unmaps the log right after the hand-off to free its page
     tables (about 0.5 MB).
   - *Records.* A slice's records go when the last hour that reads them has placed them.
@@ -445,13 +448,21 @@ stays exact for every seed of the generator.
 
 ### 13. Build
 
+- **Bottleneck.** Branch weights and code layout: without a profile the compiler guesses which side
+  of each branch is hot, and two builds of one source should give the board close to the same
+  binary. The
+  first profile-guided build took 0.0510 → 0.0498 s on the board (PERF.md, step 5; step 4 has no
+  run in our log).
 - **Design.**
   - *PGO.* The Dockerfile generates training data with a byte-identical copy of the organisers'
     generator (seed 7, sample scale), runs an instrumented build on it, and builds the final binary
     with the profile.
   - *Atomic counters.* The training run uses `-instrprof-atomic-counter-update-all`. With plain
     counters its threads lost updates, so every build got a different profile and a different
-    binary.
+    binary. Atomic counters stop that, but counts that depend on timing (the endpoint table's
+    insert race, the merge's sort, the flush) still vary from run to run, so two builds of one
+    source can lay out blocks differently (17 to 120 worker instructions in step 65's builds). Every
+    replica A/B therefore uses two builds a side.
   - *Loop alignment* (`-align-loops=64`) is on for A. The one board build without it (PERF.md, step
     36) ran 0.027124 s, in A's slow mode, so it proves nothing either way; the flag stays because A
     is not slower with it and C's best run uses it.
@@ -474,7 +485,9 @@ from the techniques above:
 - **The id bound.** A thread keeps an id that lost its slot for its next insert, so at most one id
   per thread is unpublished: the spec's 1,842 endpoints need at most 1,854 of the 2,047 ids at 12
   threads, and any thread count up to 205 fits. More endpoints than that stop the program
-  (technique 5, index 17).
+  (technique 5, index 17). The merge lists every id handed out, an unpublished one too, under a
+  copy of a name that a published id holds; no record holds it, so its group is empty in every
+  hour and prints no line.
 - **Latencies.** One of up to 6 digits is converted by exact place values, a longer one digit by
   digit in a `u64`. Every value of 7 or more digits goes to the escape list (a record's 20 bits
   hold every value of up to 6), read back in order, so every `u32` latency is kept (technique 6).
@@ -487,6 +500,9 @@ from the techniques above:
 - **Percentiles.** The ranks are the spec's nearest ranks, `ceil(p * n / 100)`. Groups of up to 64
   values count ranks exactly, ties included; larger groups take three nested
   `select_nth_unstable` calls, each rank read right after its own selection (technique 9).
+- **Counts.** Each hour's per-endpoint counts start at zero: the array starts zeroed, and each hour
+  zeroes every count as it takes the group (`std::mem::take`); every id a record can hold is in the
+  endpoint list, so no count carries over to the next hour (technique 9).
 - **The output.** Each hour's byte length comes from the same numbers the writer prints, and the
   writer asserts that the hour's lines end exactly at its start. The rate is the integer
   `errors * 1000000 / count`, and the file is cut to the sum of the lengths (technique 10).
@@ -564,6 +580,11 @@ Evidence, all on the binary built by this directory's Dockerfile:
   1 and 3 CPUs, 14 of 14; 20 repeats of each of 10 seeds, 200 of 200; tiny and sample seeds
   201-205 at 1, 3, 7, 12 and 20 CPUs, as root and as uid 65534, plus full seeds 111-112, 208 of
   208; the 13 in-spec edge inputs at 1 and 12 CPUs as both users, 52 of 52.
+- **Steps 64 and 65**, the exact Dockerfile builds of their code (step 65 adds only comments to the
+  code that was gated): the same runs as step 63 (14 of 14, 200 of 200, 208 of 208), the 13 in-spec
+  edge inputs (52 of 52) and 250 malformed logs, none of which crashes. Step 66, the submitted code,
+  passed the gate script on its exact Dockerfile build, and its machine code differs from step 65's
+  only outside the hot loops (PERF.md, step 66).
 - **The id bound, measured.** Every seed has 1,842 endpoints, against 2,047 ids. With step 54's
   code up to 13 ids were lost in 20 runs of a seed; with steps 57 to 59, at most 1 id in 150 runs,
   and the bound is one per thread: at most 1,854 ids at 12 threads.
@@ -575,10 +596,15 @@ Evidence, all on the binary built by this directory's Dockerfile:
 ## Error handling
 
 Errors are panics with a message, and the build aborts on panic, so the exit status is nonzero:
-- a missing file, or a failed `mmap`;
+- a missing log, a summary that cannot be created or sized, or a failed `mmap`;
 - an endpoint over 125 bytes, or more than 2,047 endpoint ids;
 - records past their room;
 - an hour whose written length differs from its computed one.
+
+Ignored on purpose, as each only costs memory or time and never changes a byte: a failed `prctl`
+(THP stays on), `madvise` (the pages are kept) or `munmap` (the log stays mapped). The output is
+written through a shared mapping, so a full `/out` would show as a SIGBUS on a store, not as an
+error message; the output is 10 MB.
 
 The spec's empty input gives an empty summary.
 
@@ -595,8 +621,8 @@ hand. All the code is one file, `src/main.rs`.
   nor did sorting groups of up to 128 or 256 values, a bracketed sample selection, an AVX2
   quickselect or a radix select (PERF.md, experiments). A cheaper exact selection for groups of 65 to a few thousand
   values is still the next thing to try.
-- **The memory peak.** The board read 18.79 to 19.8 MB in six runs of step 56's engine and 18.38
-  to 19.18 MB in the four runs of steps 61 to 63, and the final scoring takes the largest of five
+- **The memory peak.** The board read 18.79 to 19.8 MB in six runs of step 56's engine and 18.15
+  to 19.18 MB in the sixteen runs of steps 61 to 66 that report it, and the final scoring takes the largest of five
   peaks. Step 61's gate moved the output off the peak (about −1 MB). Deferring every write, alone
   or with long runs given back right after their scatter, took 0.2 to 0.5 MB more off but cost
   1.9 to 2.8% (PERF.md, experiments). Up to 3 MB of each peak is the kernel's per-CPU charge
