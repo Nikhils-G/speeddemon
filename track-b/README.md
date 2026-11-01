@@ -23,11 +23,33 @@ the sum of the matching ids and the ten smallest ids.
   BOOL evaluation costs about 39 ms on the box, twice its 19 ms on the test server. A probe of step 32's
   code put the end of setup at 16.5 ms, the same as the test server's 16.4 to 16.8 ms; step 33 cut it
   to 11.6 ms there.
+
+  No probe has run on the submitted code (step 44 of PERF.md); the phases as last measured, each
+  with the code it measured:
+
+  | Phase | Box (probe run) | Test server | Code measured |
+  |---|---|---|---|
+  | Setup (queries, hash, sample, plan) | 16.5 ms (run-dbda057bda65) | 16.4 to 16.8 ms; 11.6 ms after step 33 | step 32; step 33 |
+  | Scan, to its end | 118 ms from the start (run-dec0ff56b77b) | | step 31 |
+  | of which BOOL evaluation | 39 ms (run-9ce29e8f1465 ends the scan at 79 ms without it) | 19 ms | step 31 |
+  | Tail: merge, format, write, exit | about 4 ms (the rest of about 170 ms after run-cafcc5244948's scan end at 166 ms) | | step 10 |
+
+  Steps 39 to 44 changed the token path and the tail since; their effect shows only in board totals.
 - **Then stalls, not instructions.** Once the token path was lean, what the box paid for was waiting
   on loads whose address is random: the term table's slots, and at each block's end the entry
   ranges, entries, presence words and answer state of the queries a block triggers. Steps 20 and 28
   of PERF.md, which fetch those ahead, gained on the box; cuts of instructions alone (steps 18 to 19)
   or of L2 misses alone (steps 23 to 24) did not.
+- **Other seeds cost the same.** The plan is made per input from a 1 MB sample, so nothing is tuned
+  to seed 1's data except the ALWAYS threshold. Test server, the submitted build, 12 threads
+  (`taskset -c 0-11`), output on tmpfs, medians of 21 runs per build (two PGO builds); query and
+  evaluation counts from a counting build at 12 threads:
+
+  | Input | Median (two builds) | Superblock queries | Block-entry evaluations |
+  |---|---|---|---|
+  | Full seed 1 | 80.43 / 80.74 ms | 6,023 | 4.52M |
+  | Holdout seed 99 | 80.33 / 80.76 ms | 6,044 | 4.55M |
+  | Full seed 2 | 80.20 / 80.42 ms | 6,105 | 4.45M |
 
 ## The design
 
@@ -51,11 +73,14 @@ measures 40.1 to 42.2 MB, under the 44 MB credit.
    - *Plan*, a range of query lines per thread: whether each line is an `always` query (design 4), with
      each term's kind set by an atomic OR; the term order (BOOL terms first, so that they index dense
      per-thread arrays) by a counting sort through `csr`; each part renumbers its own terms; `csr`
-     groups the entries and anchors straight from the parts' vectors, without merging them first.
+     groups the entries and anchors straight from the parts' vectors, without merging them first,
+     the anchors on a second thread while the main one groups the entries.
    - *Memory back.* glibc keeps freed blocks resident once it has seen large ones freed, which left
      about 4 MB of setup memory in the peak; `malloc_trim(0)` before the scan returns it (0.2 ms).
-2. **Finding and looking up tokens.** Each 64-byte chunk is classified with AVX2 into a token-byte
-   mask and an LF mask; token starts and lengths come from bit operations on them. A token's key is
+2. **Finding and looking up tokens.** Each 64-byte window is classified with AVX2 into a token-byte
+   mask and an LF mask. A window starts at a byte that is not inside a token and is scanned up to its
+   last non-token byte, so every token it scans ends inside it: token starts and last bytes are bit
+   operations on the mask, and a token's length is the distance between the two. A token's key is
    its first 12 bytes, lowercased and zero-padded in one 16-byte register. The query terms of up to
    12 bytes (75,735 distinct keys on seed 1) are in a **perfect hash**, so a token is compared with one
    16-byte slot, never more:
@@ -63,25 +88,27 @@ measures 40.1 to 42.2 MB, under the 44 MB credit.
      the low 64 bits kept. After two rounds every output bit depends on every key byte, and a
      different seed gives an unrelated hash; it costs three instructions per token.
    - *Pilots* (PTHash style). A hash h falls in bucket `h & bmask` (16,384 buckets on seed 1, about
-     4.6 terms each), and the bucket's 16-bit pilot m places it in slot
-     `(h * m).rotate_right(6) >> shift`. The builder takes the largest buckets first and gives each
+     4.6 terms each), and the bucket's 16-bit pilot places it in slot
+     `(h * pilot).rotate_right(6) >> shift`. The builder takes the largest buckets first and gives each
      the first pilot whose slots are all free, so every term gets a slot of its own.
-   - *Parallel build.* Every pilot is 1 mod 64, so the low 6 bits of `h * m` are those of h (its
+   - *Parallel build.* Every pilot is 1 mod 64, so the low 6 bits of `h * pilot` are those of h (its
      *group*), and the rotation makes them the slot's top bits: each of the 64 groups owns one
      region of the table, whatever its pilots. Each of the 12 threads sorts, deduplicates and places
      a range of groups in its own regions, with no locks; a barrier, then each thread reads back the
      ids of its share of the query lines.
    - *Slot.* 16 bytes: the term's 12 key bytes under its 4-byte info word (id and ANCHOR flag). The
      table is 2^17 slots (2 MB, a load of 0.58) plus one slot per long term and a final MISS slot;
-     empty slots are left zero. The slot is computed and prefetched as soon as the token is found,
+     empty slots are left zero. The slot's byte offset is computed and prefetched as soon as the token is found,
      and a document's tokens are all found before any is looked up, so the misses of one document
      overlap.
    - *Probe.* One aligned 16-byte load, an XOR with the token's key, a `vptest` of the 12 key bytes
-     and a `cmov` that selects the info word or MISS. There is no branch: whether a token is a query
+     and a `cmov` that selects the info word (a 4-byte load of the same slot) or MISS. There is no branch: whether a token is a query
      term is too random for the branch predictor.
    - *Re-seed.* If two different keys of a group have the same 64-bit hash, or a bucket finds no free
      pilot among its 1,024 candidates, the build fails and runs again with the next seed; every third
-     seed also doubles the table. Seed 0 succeeds on full seed 1, the holdout seed 99 and sample
+     seed also doubles the table. This ends with probability 1: each seed gives unrelated hashes (two
+     keys clash with probability about 2^-64), and every third seed halves the load, so the pilot
+     search finds free slots. Seed 0 succeeds on full seed 1, the holdout seed 99 and sample
      seeds 1 to 4. The 1,000-query `tiny` inputs have about 10 keys per bucket instead of 4.6 (the
      bucket count follows the term occurrences, the table the distinct terms) and usually succeed at
      seed 3, the first doubling; the output is the same whichever seed succeeds.
@@ -99,7 +126,7 @@ measures 40.1 to 42.2 MB, under the 44 MB credit.
    and each kept range's first entry. The second pass evaluates the ranges and, 4 ranges ahead,
    prefetches the presence words and the answer state that the next range's first entry reads. The
    evaluation itself has no branch: the operator is folded into two masks per step.
-4. **Common queries, per superblock of 256 documents.** The 5,882 queries whose cover terms are
+4. **Common queries, per superblock of 256 documents.** The 6,023 queries (seed 1, 12 threads) whose cover terms are
    expected in more than a quarter of the blocks (summed over the terms) would be evaluated in almost
    every block anyway. They are evaluated once per 256 documents instead, with AVX2 on four words per
    term, and only over their real terms: they are sorted by term count and operators, so the operator
@@ -115,11 +142,14 @@ measures 40.1 to 42.2 MB, under the 44 MB credit.
    the same in AVX2. First ids come from trailing-zero counts, and only while a query has fewer than ten.
 7. **Phrases.** Each phrase is anchored on its rarest term. When a document ends, the anchors seen in
    it are checked against the document's term ids, which are still in L1.
-8. **Merging.** Each thread maps its first-id log back from answer numbers to line numbers and sorts
-   it. The slices are in document order, so the logs merge in slice order into the ten smallest ids.
+8. **Merging.** Each thread puts its first-id log in line order without a sort: an answer logged its
+   first min(count, 10) ids in id order, so a prefix sum of those counts over the lines gives every
+   entry its place, and one scatter maps it there with its line number. The slices are in document
+   order, so the logs merge in slice order into the ten smallest ids.
    Output lines are formatted in parallel; each formatter adds up the threads' counts and sums by
    reading their states through `answer_of`, without first copying them into line order (that copy
-   cost about 4.5 MB and put the run over the 44 MB memory credit, step 26). The process exits right
+   cost about 4.5 MB and put the run over the 44 MB memory credit, step 26), and fetches the 12 states
+   of the line 8 ahead, since they are random reads (PERF.md, step 45). The process exits right
    after writing instead of freeing its tables.
 
 ## Techniques
@@ -134,7 +164,7 @@ output stays the same.
 | No index; queries first | An index of the query terms holds 21M (term, document) pairs: 85 to 200 MB, past the 44 MB credit (steps 1 to 5) | All 50,000 queries are read first and answered during one parallel scan; nothing grows with the corpus | Every query is evaluated on every document that can match it (covers, below), with the spec's set operations |
 | Perfect hash, AES-hashed | One random probe per token; the old 4-way buckets compared four keys and spilled into the next bucket | PTHash-style pilots give every term of up to 12 bytes its own 16-byte slot; the hash is two `aesenc` rounds; the probe is one load, an XOR, a `vptest` and a `cmov` | The probe compares the token's whole key with the slot's; the hash only says where to look. A failed build re-seeds; it never yields a table that answers wrongly |
 | Lock-free parallel hash build | Sorting, deduplicating and placing 155,000 term keys takes about 10 ms on one thread of the test server | Pilots are 1 mod 64, so each of 64 hash groups owns a region of the table and 12 threads place their groups without locks | Groups, bucket order and ids do not depend on thread timing; each thread writes only its regions before the barrier |
-| SIMD tokenizer, prefetched lookups | 36.3M tokens to find and look up | AVX2 classifies 64 bytes into token and LF bitmaps; starts and lengths are bit operations; each slot is prefetched when its token is found, and a document's tokens are all found before any is probed | A token is exactly a maximal run of `[A-Za-z0-9]`; the key is its bytes OR 0x20 and masked to its length |
+| SIMD tokenizer, prefetched lookups | 36.3M tokens to find and look up | AVX2 classifies 64 bytes into token and LF bitmaps; windows end at a non-token byte, so starts and lengths are bit operations; each slot is prefetched when its token is found, and a document's tokens are all found before any is probed | A token is exactly a maximal run of `[A-Za-z0-9]`; the key is its bytes OR 0x20 and masked to its length |
 | Bitset evaluation per 64 documents | 31,000 BOOL queries evaluated document by document | Each term present in a block gets a 64-bit word; AND, OR and NOT are word operations in the query's order, branch-free | Bit i is "document base + i contains the term", so a word operation is the spec's set operation on 64 documents at once |
 | Cover triggers from a sample | 121M evaluations if every query ran in every block | From a 1 MB sample, each query gets a cover, a set of terms every match contains; it is evaluated only in blocks with a cover term (4.27M evaluations); queries with common covers run per 256 documents with AVX2 | A block without a cover term holds no match. The sample only decides where a query is evaluated, never its result |
 | Two-pass block end | Each evaluation's entry, words and state are random L3 loads | The first pass collects and prefetches the touched terms' entry ranges; the second fetches words and state four ranges ahead | Prefetches read nothing the program uses; the second pass evaluates exactly the ranges the first kept, in order |
@@ -143,7 +173,7 @@ output stays the same.
 | Phrases on their rarest term | Checking 19,000 phrases per document | Each phrase is anchored on its rarest sampled term and checked against the document's token ids while they are in L1 | A phrase match contains its anchor, so every match is checked; a document is counted once |
 | Setup without page faults | Once setup ran in parallel, its threads mostly waited on page faults of fresh, growing vectors: on the test server the setup still spends more CPU time in the kernel than in the program (34.6 of 58 ms) | Compact pre-sized records, grouping by counting sort, a stable counting sort for the term order, `malloc_trim` before the scan | Records reload each key from the same file bytes; counting sorts are permutations, which change the order terms are numbered in, never what a term is |
 | Exit-code probes | Where the box spends its time cannot be profiled | Temporary builds exit with an elapsed time as their status (setup end, scan end, scan end without BOOL evaluation) | Measurement only; never pushed as a scored version |
-| Build | Build-to-build speed spread of 2.5 to 6% (steps 27, 32) | PGO with atomic counters, fat LTO, `crt-static`, `target-cpu=native`; `cmov` and `vpmovmskb` as inline asm where LLVM would branch or rebuild masks bit by bit. Loop alignment (`-align-loops=64`) is under a board A/B test (PERF.md, step 38) | Flags and instruction choice only |
+| Build | Build-to-build speed spread of 2.5 to 6% (steps 27, 32) | PGO with atomic counters, fat LTO, `crt-static`, `target-cpu=native`; `cmov` and `vpmovmskb` as inline asm where LLVM would branch or rebuild masks bit by bit. Loop alignment (`-align-loops=64`) was dropped for B after the board A/B of step 38 | Flags and instruction choice only |
 
 ### Index
 
@@ -160,27 +190,27 @@ above groups them by bottleneck.
 8. PTHash-style perfect hash with per-bucket pilots (`Vocab`, `place`): one slot per term.
 9. Two AES rounds as the hash, the seed in the first round key (`hash`): three instructions per token.
 10. Pilots of 1 mod 64, so each of 64 groups owns a table region: a lock-free build on every thread (`Vocab::new`). Exact: no thread writes another's region; the barrier orders the read-back.
-11. Largest buckets placed first, first free pilot taken (`Vocab::new`).
-12. Sort key rotated so the bucket bits lead (`rotate_right(bmask.count_ones())`): sort by bucket, then hash, in one key.
-13. Equal-hash check on the key bytes; a clash or a full bucket re-seeds, every third seed doubles the table. Exact: a failed build never answers.
+11. Largest buckets placed first, first free pilot taken (`find_pilot`).
+12. Sort key rotated so the bucket bits lead (`dedup_keys`, `rotate_right(bmask.count_ones())`): sort by bucket, then hash, in one key.
+13. Equal-hash check on the key bytes (`dedup_keys`); a clash or a full bucket re-seeds, every third seed doubles the table. Exact: a failed build never answers.
 14. Terms of 13 to 32 bytes in a cold `HashMap`, with their slots after the hash's (`get_long`). Exact: compared byte for byte; tokens over 32 bytes find nothing.
 15. 16-byte slot: 12 key bytes under a 4-byte info word.
-16. Branch-free probe: one aligned load, XOR, `vptest`, inline-asm `cmov` (`probe`). Exact: the full key is compared; the hash only says where.
+16. Branch-free probe: one aligned load, XOR, `vptest`, inline-asm `cmov` of the info word, loaded on its own (`probe`). Exact: the full key is compared; the hash only says where.
 17. Token key from one 16-byte load, OR 0x20 and a sliding `KEEP` mask (`key_at`). Exact: lowercases A to Z, keeps digits, zero padding separates lengths.
 18. AVX2 token and LF bitmaps per 64 bytes, signed compares, letters tested on `v | 0x20` (`masks`).
 19. `vpmovmskb` as inline asm (`movemask`).
 20. Slice end clipped with `bzhi` (`masks`). Exact: bytes past the slice are not tokens here.
-21. Token starts from `mask & !(mask << 1 | carry)`, with a carry across chunks (`Scan::run`).
-22. Token length by `tzcnt` of the inverted, shifted mask, in two shifts so `b = 0` is defined.
-23. Slot computed and prefetched when the token is found; a document's tokens all found before any is probed (`pending`, `look_up`): the misses overlap.
+21. Windows that end at their last non-token byte, so no token crosses one: token starts `mask & !(mask << 1)` clipped there with `bzhi`, no carry (`Scan::run`); tokens of 63 bytes or more on a cold path (`long_run`).
+22. Token length from the start and last-byte masks, one `tzcnt` each.
+23. Slot's byte offset computed and prefetched when the token is found; a document's tokens all found before any is probed (`pending`, `look_up`): the misses overlap.
 24. Writes into reserved capacity through raw pointers, no capacity checks (`pending`, `toks`, `work`).
-25. 64-bit presence word per BOOL term per block of 64 documents (`w`).
+25. 64-bit presence word per BOOL term per block of 64 documents (`presence`).
 26. Branch-free touched list: the slot is always written, kept only when its word was zero (`look_up`).
-27. Non-BOOL tokens all land on one sink slot `nb` (`min(nb)`): no branch on the kind.
+27. Non-BOOL tokens all land on one sink slot `sink` (`min(sink)`): no branch on the kind.
 28. Cover sets: a set of terms every match contains, cheapest by sampled frequency (`cover`). Exact: a block without a cover term holds no match.
 29. Cost model `1 - (1 - df / n)^64`: the share of blocks that contain a term (`Plan::new`).
 30. A 1 MB sample spread over the slices for document frequencies (`SAMPLE_BYTES`). Exact: it only decides where a query is evaluated.
-31. `earlier` bits: a block with several cover terms is evaluated by one entry only. Exact: the others add an empty result.
+31. `earlier_or_len` bits: a block with several cover terms is evaluated by one entry only. Exact: the others add an empty result.
 32. Left-to-right word evaluation with the operator folded into two masks, no branch (`end_block`). Exact: AND, AND NOT and OR as the spec defines them.
 33. Queries padded to six steps with AND of an all-ones word. Exact: AND with all ones changes nothing.
 34. Two-pass block end: ranges gathered and prefetched 16 slots ahead, then words and state 4 ranges ahead (`end_block`). Exact: the second pass evaluates exactly the ranges the first kept.
@@ -188,8 +218,8 @@ above groups them by bottleneck.
 36. Common queries per 256-document superblock, four words at once in AVX2 (`end_super`, `ALWAYS`).
 37. Superblock queries sorted by length and operators so the operator branch predicts.
 38. 32-byte aligned rows for aligned AVX2 loads (`Row`).
-39. Terms renumbered by kind and sampled frequency: hot words share cache lines (`Plan::new`). Exact: a bijection.
-40. Answers numbered in the order the scan updates them (`answer_of`, `line_of`). Exact: a bijection.
+39. Terms renumbered by kind and sampled frequency: hot words share cache lines (`term_order`). Exact: a bijection.
+40. Answers numbered in the order the scan updates them (`Plan::number_answers`, `answer_of`, `line_of`). Exact: a bijection.
 41. Count by popcount; id sum as `base * popcount + sum_k 2^k * popcount(w & M_k)` (`Answers::add`). Exact: integer identity.
 42. The six masks `M_k` computed as constants by one expression (`digit`).
 43. AVX2 nibble tables (`pshufb`) for count and position sums of 256 documents, reduced by `maddubs`/`madd` (`count_positions`). Exact: sums stay below 2^15 per lane.
@@ -200,12 +230,12 @@ above groups them by bottleneck.
 48. Answer state written at allocation (`written_zeros`, `black_box`): a lazily zeroed page read first would fault twice.
 49. `malloc_trim(0)` before the scan: setup memory back to the system.
 50. Each slice's pages dropped by its own thread (`mmap::release`).
-51. First-id logs mapped back to lines and sorted per thread, merged in slice order. Exact: slices are in document order.
-52. Output formatted in parallel, states read in place through `answer_of` (no 4.5 MB copy).
+51. First-id logs put in line order per thread by a prefix sum of the logged counts and one scatter, no sort (`main`); merged in slice order. Exact: each answer logs its ids in order, and slices are in document order.
+52. Output formatted in parallel, states read in place through `answer_of` (`format_part`; no 4.5 MB copy), the states of the line 8 ahead prefetched.
 53. Exit right after writing, no frees.
 54. Slice edges need no special case. Exact: a document outside a thread's slice has zero bits there.
 55. Profile-guided build trained on generator seed 7, with atomic profile counters (Dockerfile).
-56. Loop alignment (`-align-loops=64`) under a board A/B test (PERF.md, step 38: the current Dockerfile builds without it); fat LTO, one codegen unit, `panic = "abort"`, `crt-static`, `target-cpu=native`, `compile_error!` without AVX2, BMI2 or AES.
+56. Loop alignment dropped for B after the board A/B (PERF.md, step 38); fat LTO, one codegen unit, `panic = "abort"`, `crt-static`, `target-cpu=native`, `compile_error!` without AVX2, BMI2 or AES.
 57. Exit-code timing probes on the box (PERF.md, "Timing probes").
 58. No dependencies: libc calls declared by hand.
 
@@ -259,9 +289,15 @@ above groups them by bottleneck.
 ## Error handling
 
 Errors are panics with a message, and the build aborts on panic, so the exit status is nonzero: a
-missing file or a failed mmap, a docs.txt line without a TAB, an id that is empty, not all digits
-or over 9 digits, document ids that are not 0, 1, 2, ... below 2^20 each before a TAB, and a slice
-whose last id does not meet the next slice's first.
+missing file or a failed mmap, a docs.txt line without a TAB, an id that is not all digits or over
+9 digits, document ids that are not 0, 1, 2, ... below 2^20 each before a TAB, and a slice whose
+last id does not meet the next slice's first. A line that starts with a separator byte (an empty id,
+for example) has no id token: its text joins the previous document. That is caught when it breaks
+the id sequence (the next line's id check), but not when it is an extra line or the last line,
+where the answer is silently wrong.
+
+queries.txt is trusted to follow the spec's grammar (2.3): a malformed line either panics on a
+slice bound or is answered as parsed (an unknown operator reads as AND).
 
 ## Dependencies
 
@@ -290,8 +326,6 @@ Measured or modelled on seed 1; none of this was built.
   where it goes.
 - **More stall hiding at the block end.** The two passes fetch only the first entry of each range;
   ranges with many entries still wait on their later entries' words and state.
-- **Sort the first-id logs by answer in place** (about 122,000 entries per thread) instead of with a
-  comparison sort, if a timing shows the sort above 1.5 ms of the tail.
 - **A denser perfect hash.** The table runs at a load of 0.58 (2 MB). Placing buckets at a load near
   0.9, as PTHash does with more pilot candidates, would fit it in 1.25 MB of slots and cut the misses
   of the scan's one random load per token; the build would take longer, on twelve threads. Untested.
