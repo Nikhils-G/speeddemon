@@ -43,6 +43,7 @@ const MAX_ENDPOINTS: usize = 1 << (32 - ENDPOINT_SHIFT);
 const PAD: usize = 256;
 
 fn main() {
+    let t0 = std::time::Instant::now();
     // Transparent huge pages off: with THP set to "always", touching one byte of a
     // sparse, lazily zeroed table can fault in a whole 2 MB page, so the memory
     // peak would depend on how fragmented the host is that run.
@@ -82,17 +83,14 @@ fn main() {
     // the merge below (done on this thread once every part is in) and goes on with
     // pass 2, so no thread is joined or started between the passes.
     let parts: Vec<OnceLock<Part>> = (0..threads).map(|_| OnceLock::new()).collect();
-    let (merged, order): (OnceLock<Merged>, OnceLock<Vec<(usize, &[u8])>>) = Default::default();
-    // How many hours still read each part's records: the hour that brings its
-    // part's count to zero gives the rest of them back.
-    let readers: Vec<AtomicUsize> = parts.iter().map(|_| AtomicUsize::new(0)).collect();
+    let merged: OnceLock<Merged> = OnceLock::new();
     let next = AtomicUsize::new(0);
     thread::scope(|s| {
         for p in 0..threads {
-            let (parts, merged, order, readers, next) = (&parts, &merged, &order, &readers, &next);
+            let (parts, merged, next) = (&parts, &merged, &next);
             s.spawn(move || {
-                let _ = parts[p].set(parse(&log[cut(p)..cut(p + 1)], table));
-                let ((runs, file, lens), endpoints) = (merged.wait(), order.get().unwrap());
+                parts[p].set(parse(&log[cut(p)..cut(p + 1)], table)).unwrap();
+                let (endpoints, runs, readers, file, lens) = merged.wait();
                 let parts: Vec<&Part> = parts.iter().map(|part| part.get().unwrap()).collect();
                 let hours = hours_of(runs);
                 // Where an hour's output starts, once the lengths of all earlier hours are known.
@@ -198,6 +196,8 @@ fn main() {
         // 16 bytes as one number, so few comparisons need the bytes themselves, then
         // by the full bytes on ties.
         let parts: Vec<&Part> = parts.iter().map(OnceLock::wait).collect();
+        // PROBE: exit with the parse's wall time (main start to all parts in) in 0.1 ms units.
+        std::process::exit((t0.elapsed().as_micros() / 100).min(255) as i32);
         // SAFETY: the parse is over, so nothing writes the table any more.
         let count = table.count.load(Relaxed);
         let names = table.names[..count].iter().map(|n| unsafe { &**n.get() });
@@ -211,6 +211,9 @@ fn main() {
         }
         runs.sort_unstable_by_key(|run| (run.0.0, run.1));
         let hours = hours_of(&runs).len();
+        // How many hours still read each part's records: the hour that brings its
+        // part's count to zero gives the rest of them back.
+        let readers: Vec<AtomicUsize> = parts.iter().map(|_| AtomicUsize::new(0)).collect();
         for runs in runs.chunk_by(|a, b| (a.0.0, a.1) == (b.0.0, b.1)) {
             readers[runs[0].1].fetch_add(1, Relaxed);
         }
@@ -226,11 +229,9 @@ fn main() {
         // which each write only their own hours' bytes.
         let file = map(null_mut(), bound, 3, 1, output.as_raw_fd()) as usize; // READ | WRITE; SHARED
         let lens = (0..hours).map(|_| OnceLock::new()).collect();
-        order.set(endpoints).ok();
-        merged.set((runs, file, lens)).ok();
+        merged.set((endpoints, runs, readers, file, lens)).ok();
     });
-    let lens = &merged.get().unwrap().2;
-    let total: usize = lens.iter().map(|len| len.get().unwrap()).sum();
+    let total = merged.get().unwrap().4.iter().map(|len| len.get().unwrap()).sum::<usize>();
     output.set_len(total as u64).expect("size the summary");
     // The output is complete in the page cache. Exit now: dropping the tables
     // above, one free at a time, took a few milliseconds on the scoring box.
@@ -306,10 +307,10 @@ fn hours_of(runs: &[Run]) -> Vec<&[Run]> {
     runs.chunk_by(|a, b| a.0.0 == b.0.0).collect()
 }
 
-/// What the merge between the passes hands to pass 2 besides the endpoint order:
-/// all runs in order of hour then part, the output mapping's address and each
-/// hour's output length once known.
-type Merged = (Vec<Run>, usize, Vec<OnceLock<usize>>);
+/// What the merge between the passes hands to pass 2: the endpoints in name order,
+/// all runs in order of hour then part, each part's reader count, the output
+/// mapping's address and each hour's output length once known.
+type Merged = (Vec<(usize, &'static [u8])>, Vec<Run>, Vec<AtomicUsize>, usize, Vec<OnceLock<usize>>);
 
 /// Parses the lines of `chunk`, a slice of the mapped log, which goes on with PAD
 /// zero bytes, then gives the chunk's pages back. Every line is
