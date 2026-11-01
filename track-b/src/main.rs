@@ -238,7 +238,8 @@ fn probe(slot: *const u128, key: __m128i) -> u32 {
     // reads registers only. AVX2 is enabled for the whole build.
     unsafe {
         let x = _mm_xor_si128(_mm_load_si128(slot.cast()), key);
-        let mut info = (*slot >> 96) as u32;
+        // The info word on its own: a load, where vpextrd would be two uops.
+        let mut info = *slot.cast::<u32>().add(3);
         asm!("vptest {x}, {m}", "cmovnz {i:e}, {miss:e}", x = in(xmm_reg) x, m = in(xmm_reg) _mm_set_epi32(0, -1, -1, -1),
              i = inout(reg) info, miss = in(reg) MISS, options(pure, nomem, nostack));
         info
@@ -306,8 +307,7 @@ struct Vocab {
 /// The hash function of the table: the seed, the pilots (per bucket, a
 /// power of two of them) and the shift. Copy, so that the scan keeps it in
 /// registers. The pilots are leaked (they live until the process exits), and
-/// atomic so that the threads of the build can write them; a relaxed load is a
-/// plain load.
+/// atomic so that the threads of the build can write them.
 #[derive(Clone, Copy)]
 struct Phf(u64, &'static [AtomicU16], u32);
 
@@ -316,9 +316,16 @@ impl Phf {
     #[inline(always)]
     fn slot(self, key: __m128i) -> usize {
         let h = hash(key, self.0);
-        // SAFETY: h & (len - 1) < len.
-        let m = unsafe { self.1.get_unchecked(h as usize & (self.1.len() - 1)) };
-        place(h, m.load(Relaxed) as u64, self.2)
+        // SAFETY: BMI2 is enabled for the whole build. The bucket, the low bits
+        // of h, is below len (a power of two). The pilot is read as a plain u16
+        // (an atomic load would cost a second zero extension): AtomicU16 has the
+        // layout of u16, and pilots are only read once the build is over, which
+        // the build's barrier and the end of its threads order before the reads.
+        let m = unsafe {
+            let bucket = _bzhi_u64(h, self.1.len().trailing_zeros()) as usize;
+            self.1.get_unchecked(bucket).as_ptr().read()
+        };
+        place(h, m as u64, self.2)
     }
 }
 
@@ -441,8 +448,8 @@ impl Vocab {
         }
     }
 
-    /// A long token's key and slot: the zero key, and the slot of its term or
-    /// the last one, which the zero key matches.
+    /// A long token's key and the byte offset of its slot: the zero key, and
+    /// the slot of its term or the last one, which the zero key matches.
     #[cold]
     #[inline(never)]
     fn get_long(&self, token: &[u8]) -> (__m128i, u64) {
@@ -453,7 +460,7 @@ impl Vocab {
         let id = self.long.get(&*lower).map_or(self.count, |&id| id);
         let slot = self.table.len() + id as usize - 1 - self.count as usize;
         // SAFETY: SSE2 is enabled for the whole build.
-        (unsafe { _mm_setzero_si128() }, slot as u64)
+        (unsafe { _mm_setzero_si128() }, (slot * size_of::<u128>()) as u64)
     }
 }
 
@@ -665,7 +672,8 @@ struct Scan<'a> {
     /// Row r < plan.rows: the words of BOOL term r in the 4 blocks of this
     /// superblock. Row `rows` takes the other terms; row `rows + 1` is all ones.
     wide: Vec<Row>,
-    /// This document's tokens to look up: their keys and slots.
+    /// This document's tokens to look up: their keys and the byte offsets of
+    /// their slots.
     pending: Vec<(__m128i, u64)>,
     /// This document's term ids, and the positions of anchors among them.
     toks: Vec<u32>,
@@ -709,58 +717,68 @@ impl<'a> Scan<'a> {
     /// Scans the whole lines in `docs[start..end]`, whose first id is `first`.
     fn run(mut self, docs: &'static [u8], start: usize, end: usize, first: u32) -> Self {
         self.doc = first.wrapping_sub(1);
-        // `line`: bit 0 is set when the next chunk starts a line, as the slice does.
-        let (mut bit, mut carry, mut line) = (0u64, 0u64, 1u64);
-        let (mut mask, mut lf) = masks(docs, start, end);
-        for at in (start..end).step_by(64) {
-            let (next, next_lf) = masks(docs, at + 64, end);
-            let mut starts = mask & !(mask << 1 | carry);
-            carry = mask >> 63;
-            // The id tokens: those that start a line.
-            let mut ids = starts & (lf << 1 | line);
-            line = lf >> 63;
-            // A token is at most 32 bytes (longer ones match no term), so it
-            // ends within this chunk and the next. `shifted(b)` is the window
-            // from bit b on: `next << (64 - b)` in two steps, valid for b = 0.
-            let (next1, mask0) = (next << 1, mask);
-            let shifted = |b: u32| mask0 >> b | next1 << (63 - b);
-            // A chunk has at most 32 tokens: two tokens are at least one byte
+        let mut bit = 0u64;
+        // The scan goes by windows of 64 bytes from `at`, where byte `at` is
+        // never inside a token: it starts the slice (and so a line), or it is
+        // the byte that ended the window before. A window is scanned up to its
+        // last byte that is not a token byte (`cut`), so every token it scans
+        // ends inside it, and a token's length is the distance to its last byte.
+        let mut at = start;
+        let (mut mask, mut lf) = masks(docs, at, end);
+        while at < end {
+            let cut = 63u32.wrapping_sub((!mask).leading_zeros());
+            if cut.wrapping_sub(1) >= 63 {
+                // No such byte after bit 0: a token of 63 bytes or more starts
+                // at bit 0 (the slice's first id) or at bit 1.
+                let (p, id) = (at + (mask & 1 == 0) as usize, mask & 1 != 0 || lf & 1 != 0);
+                at = self.long_run(docs, p, end, id);
+                (mask, lf) = masks(docs, at, end);
+                continue;
+            }
+            // The next window, fetched before this one is scanned.
+            let (next, next_lf) = masks(docs, at + cut as usize, end);
+            // Bit 0 starts a token only at the slice start, which starts a line.
+            // SAFETY: BMI2 is enabled for the whole build.
+            let mut starts = unsafe { _bzhi_u64(mask & !(mask << 1), cut) };
+            let mut ids = starts & (lf << 1 | 1);
+            // The last byte of each token (those after the cut are never used).
+            let mut ends = mask & !(mask >> 1);
+            // A window has at most 32 tokens: two tokens are at least one byte
             // apart, so at most 32 of its 64 bytes start one.
             self.pending.reserve(32);
             loop {
                 // The tokens before the next id token, if any.
                 let mut text = starts & (ids & ids.wrapping_neg()).wrapping_sub(1);
                 starts ^= text;
-                let (buf, mut n) = (self.pending.as_mut_ptr(), self.pending.len());
+                let buf = self.pending.as_mut_ptr();
+                let mut out = buf.wrapping_add(self.pending.len());
                 let (vocab, phf, table) = (self.vocab, self.vocab.phf, self.vocab.table.as_ptr());
                 while text != 0 {
-                    let b = text.trailing_zeros();
-                    text &= text - 1;
-                    // Only 64 bits: a token that runs past them is too long to be
-                    // a term anyway.
-                    let len = (!shifted(b)).trailing_zeros() as usize;
-                    let p = at + b as usize;
-                    // SAFETY: `reserve(32)` above made room for this chunk's tokens.
-                    if len <= KEY {
-                        let key = key_at(docs, p, len);
-                        let s = phf.slot(key);
-                        prefetch(table, s);
-                        unsafe { buf.add(n).write((key, s as u64)) };
+                    let (b, e) = (text.trailing_zeros() as usize, ends.trailing_zeros() as usize);
+                    (text, ends) = (text & (text - 1), ends & (ends - 1));
+                    let p = at + b;
+                    // 1 - len, so that the key's KEEP window is a fixed offset from it.
+                    let back = b as isize - e as isize;
+                    // SAFETY: `reserve(32)` above made room for this window's tokens.
+                    if back > -(KEY as isize) {
+                        let key = key_at(docs, p, (1 - back) as usize);
+                        let off = phf.slot(key) * size_of::<u128>();
+                        prefetch(table.cast::<u8>(), off);
+                        unsafe { out.write((key, off as u64)) };
                     } else {
-                        unsafe { buf.add(n).write(vocab.get_long(&docs[p..p + len])) };
+                        unsafe { out.write(vocab.get_long(&docs[p..=p + e - b])) };
                     }
-                    n += 1;
+                    out = out.wrapping_add(1);
                 }
-                // SAFETY: the first n entries were written.
-                unsafe { self.pending.set_len(n) };
+                // SAFETY: the entries up to `out` are written.
+                unsafe { self.pending.set_len(out.offset_from(buf) as usize) };
                 if ids == 0 {
                     break;
                 }
                 ids &= ids - 1;
-                let b = starts.trailing_zeros();
-                starts &= starts - 1;
-                let len = (!shifted(b)).trailing_zeros() as usize;
-                let p = at + b as usize;
+                let (b, e) = (starts.trailing_zeros(), ends.trailing_zeros());
+                (starts, ends) = (starts & (starts - 1), ends & (ends - 1));
+                let (len, p) = ((e + 1 - b) as usize, at + b as usize);
                 let id = parse_id(&docs[p..p + len]);
                 let ok = docs[p + len] == b'\t' && id == self.doc.wrapping_add(1);
                 assert!(ok, "docs.txt: ids must be 0, 1, 2, ..., each before a TAB");
@@ -778,6 +796,7 @@ impl<'a> Scan<'a> {
                 self.doc = id;
                 bit = 1 << (id % 64);
             }
+            at += cut as usize;
             (mask, lf) = (next, next_lf);
         }
         self.look_up(bit);
@@ -785,6 +804,19 @@ impl<'a> Scan<'a> {
         self.end_block(self.doc & !63);
         self.end_super(self.doc / SUPER * SUPER);
         self
+    }
+
+    /// A token from `p` that is too long for a window (63 bytes or more), so too
+    /// long to be a term: it goes to `pending` as a long token. An id token that
+    /// long is rejected by `parse_id`. Returns the end of the token.
+    #[cold]
+    fn long_run(&mut self, docs: &[u8], p: usize, end: usize, id: bool) -> usize {
+        let len = docs[p..end].iter().take_while(|b| b.is_ascii_alphanumeric()).count();
+        if id {
+            parse_id(&docs[p..p + len]);
+        }
+        self.pending.push(self.vocab.get_long(&docs[p..p + len.min(64)]));
+        p + len
     }
 
     /// Looks up the tokens of this document, whose bit is `bit`, and sets their
@@ -796,9 +828,9 @@ impl<'a> Scan<'a> {
         let (nb, table) = (self.w.len() - 2, self.vocab.table.as_ptr());
         self.toks.reserve(self.pending.len());
         let (toks, mut len) = (self.toks.as_mut_ptr(), self.toks.len());
-        for &(key, s) in &self.pending {
-            // SAFETY: pending slots are below table.len().
-            let info = probe(unsafe { table.add(s as usize) }, key);
+        for &(key, off) in &self.pending {
+            // SAFETY: pending offsets are those of slots of the table.
+            let info = probe(unsafe { table.byte_add(off as usize) }, key);
             let id = info & MISS;
             if info & ANCHOR != 0 {
                 self.anchors.push(len as u32);
