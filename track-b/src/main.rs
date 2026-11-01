@@ -1109,10 +1109,8 @@ impl<'a> Scan<'a> {
                 let mut out = buf.wrapping_add(self.pending.len());
                 let (vocab, phf, table) = (self.vocab, self.vocab.phf, self.vocab.table.as_ptr());
                 while text != 0 {
-                    let (b, e) = (
-                        text.trailing_zeros() as usize,
-                        ends.trailing_zeros() as usize,
-                    );
+                    let b = text.trailing_zeros() as usize;
+                    let e = ends.trailing_zeros() as usize;
                     (text, ends) = (text & (text - 1), ends & (ends - 1));
                     let p = at + b;
                     // 1 - len, so that the key's KEEP window is a fixed offset from it.
@@ -1191,12 +1189,8 @@ impl<'a> Scan<'a> {
     /// found. (In the earlier block design, fetching the presence words too cost
     /// more than it saved, and one loop for both steps was slower.)
     fn look_up(&mut self, bit: u64) {
-        let (miss, rows, table) = (
-            self.vocab.count,
-            self.wide.len() / 4 - 1,
-            self.vocab.table.as_ptr(),
-        );
-        let doc = self.doc;
+        let (miss, table) = (self.vocab.count, self.vocab.table.as_ptr());
+        let (doc, rows) = (self.doc, self.wide.len() / 4 - 1);
         // This document's block in the superblock: its word in each row.
         let block = (doc / 64 % (SUPER / 64)) as usize;
         let wide = self.wide.as_mut_ptr().wrapping_add(block * (rows + 1));
@@ -1308,11 +1302,8 @@ impl<'a> Scan<'a> {
     fn trigger(&mut self, plan: &Plan) {
         let doc = self.doc;
         let (group, entries) = (plan.group.as_ptr(), plan.entries.as_ptr());
-        let (work, lastdoc, stamp) = (
-            self.work.as_mut_ptr(),
-            self.lastdoc.as_mut_ptr(),
-            self.stamp,
-        );
+        let (work, stamp) = (self.work.as_mut_ptr(), self.stamp);
+        let lastdoc = self.lastdoc.as_mut_ptr();
         let mut m = 0;
         for t in self.trig.iter().map(|&info| (info & ID) as usize) {
             // SAFETY: trigger terms are below bool_terms, and group has
@@ -1331,11 +1322,10 @@ impl<'a> Scan<'a> {
         unsafe { self.work.set_len(m) };
         let state = self.answers.state.as_ptr();
         for (k, &(from, to)) in self.work.iter().enumerate() {
-            if let Some(&(ahead, _)) = self.work.get(k + RANGES_AHEAD) {
-                // SAFETY: an entry of the plan, which the first pass fetched.
-                let e = unsafe { &*entries.add(ahead as usize) };
-                prefetch(state, e.answer as usize);
-            }
+            // The state of the range RANGES_AHEAD on (entry 0's near the end).
+            let ahead = self.work.get(k + RANGES_AHEAD).map_or(0, |r| r.0) as usize;
+            // SAFETY: an entry of the plan, which the first pass fetched.
+            prefetch(state, unsafe { (*entries.add(ahead)).answer } as usize);
             // SAFETY: group holds ranges of entries.
             for e in unsafe { plan.entries.get_unchecked(from as usize..to as usize) } {
                 // Bit k: term k is in this document. SAFETY: entry terms are
@@ -1374,7 +1364,6 @@ impl<'a> Scan<'a> {
             };
             self.answers.add_wide(entry.answer, hits, base);
         }
-        let stride = plan.rows + 1;
         (0..4).for_each(|b| self.wide[b * stride..b * stride + plan.rows].fill(0));
     }
 }
@@ -1447,11 +1436,11 @@ impl Answers {
     /// `add` for the 256 documents from `base`, one word of `hits` per 64.
     fn add_wide(&mut self, answer: u32, hits: __m256i, base: u32) {
         // SAFETY: AVX2 is enabled for the whole build.
-        let has_hits = |v| unsafe { _mm256_testz_si256(v, v) } == 0;
+        let has_hits = unsafe { _mm256_testz_si256(hits, hits) } == 0;
         if self.state[answer as usize] >> SUM_BITS >= FIRST_IDS {
             let (n, positions) = count_positions(hits);
             self.state[answer as usize] += n << SUM_BITS | (n * base as u64 + positions);
-        } else if has_hits(hits) {
+        } else if has_hits {
             // Still logging first ids: a word at a time.
             // SAFETY: __m256i and [u64; 4] have the same size, and any bits are valid.
             let words: [u64; 4] = unsafe { std::mem::transmute(hits) };
