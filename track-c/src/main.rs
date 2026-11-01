@@ -25,9 +25,9 @@
 //! 4. Distinct names per country: a name's identity is its raw inner bytes (inside
 //!    quotes, `""` maps one to one to the unescaped value; an empty name is empty
 //!    whether quoted or not), reduced to a 56-bit hash, of which the name tables
-//!    tell apart 50 bits at 12 threads, 54 on one (see `add`); with the spec's
-//!    100,000 names the chance that two share them is about 4.4e-6 per dataset at
-//!    12 threads, 2.8e-7 on one. Parsing only files a (hash,
+//!    tell apart 49.6 bits at 12 threads, 46 on one (see `add`); with the spec's
+//!    100,000 names the chance that two share them is about 5.9e-6 per dataset at
+//!    12 threads, 7.1e-5 on one. Parsing only files a (hash,
 //!    group) pair under one of 4 partitions per thread picked by the hash. After
 //!    each run it parses, a thread hands its buffers of pairs to their owners'
 //!    inboxes, and its own tables take what waits in its inbox: small tables of
@@ -62,7 +62,8 @@ const PARTITIONS_PER_THREAD: usize = 4;
 /// Group indices are bytes, so that tables indexed by a group need no bounds
 /// checks: countries in the order they are first seen, `_UNMATCHED` the last one.
 const GROUPS: usize = 256;
-/// Words of group bits per name.
+/// Words of group bits per name. Groups 240..255 are never used (spec 2.3: at most
+/// 240 countries), so word 3's bits 48..62 hold 15 more bits of the name's hash.
 const WORDS: usize = GROUPS / 64;
 /// regions.csv is entered in this many parts, which threads claim as they start,
 /// so the ones that start first do more of it.
@@ -74,13 +75,13 @@ const REGION_CHUNKS: usize = 64;
 type Totals = [i64; 7];
 const EMPTY: Totals = [0, 0, 0, i64::MAX, i64::MIN, 0, 0];
 
-/// One partition's names: an open-addressing table of keys (0 = empty) in buckets
-/// of 4 slots, at most 5/8 full so that a lookup is nearly always one bucket; and a
-/// row of WORDS words of group bits per name, added per new name. A key is the
-/// name's hash with its low bits replaced by the name's row (and a low byte of 0xFF,
-/// never 0), so that a hit needs no second load for the row. (Rows by slot instead,
-/// in a 7/8 full table: 23% less memory, but +0.8M branch misses.)
-type Table = (Vec<u64>, Vec<u64>);
+/// One partition's names: an open-addressing table of 32-bit keys (0 = empty) in
+/// buckets of 8 slots, at most 5/8 full so that a lookup is nearly always one
+/// bucket; and a row of WORDS words of group bits per name, added per new name. A
+/// key holds the name's row + 1 (never 0) and hash bits above it, so that a hit
+/// needs no second load for the row. (Rows by slot instead, in a 7/8 full table:
+/// 23% less memory, but +0.8M branch misses. 64-bit keys: 0.8 MB more.)
+type Table = (Vec<u32>, Vec<u64>);
 
 /// One parsed record: id, region_id, amount in cents, name_bytes << 32 |
 /// note_bytes, the name's hash, and where the next record starts.
@@ -191,9 +192,9 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
                 let mut keys = keys.lock().unwrap();
                 if group.load(Relaxed) == 0 {
                     keys.push(lines[comma + 1..comma + 4].to_vec());
-                    // Group numbers 1..=255; the last group, 256, is `_UNMATCHED`.
-                    let number = u8::try_from(keys.len()).expect("at most 255 countries");
-                    group.store(number, Relaxed);
+                    // Group numbers 1..=240 (see WORDS); `_UNMATCHED` is 256.
+                    assert!(keys.len() <= 240, "at most 240 countries");
+                    group.store(keys.len() as u8, Relaxed);
                 }
             }
             slot.store(group.load(Relaxed), Relaxed);
@@ -356,43 +357,55 @@ fn money(cents: i64) -> String {
 fn add(table: &mut Table, pairs: &[u64], totals: &mut [Totals; GROUPS]) {
     // Fields as locals: no store through them can change the others.
     let (keys, seen) = table;
-    let (buckets, full) = (keys.len() / 4, keys.len() / 8 * 5 * WORDS);
-    // A key's bits 8..24 hold its row (a table holds at most 40,960, as the u16 ids
-    // before). Its 40 hash bits above them and the bucket's bits (10 at 12 threads,
-    // 14 on one; the partition's bits are among the 40) tell names apart: with the
-    // generator's 100,000 names, two share all 50 with odds of about
-    // C(100000, 2) / 2^50 = 4.4e-6 per dataset at 12 threads, 2.8e-7 on one.
+    let (buckets, full) = (keys.len() / 8, keys.len() / 8 * 5 * WORDS);
+    // A key's low bits hold its row + 1 (below the slot count), the bits above them
+    // the pair's bits 24.. above as many: 20 hash bits (16 on one thread; a table has
+    // 4096 slots at 12 threads, 65,536 on one). The row's check bits hold hash bits
+    // 21..36. With
+    // the bucket's bits (9 at 12 threads, 13 on one) and the partition's (log2 of 48
+    // or of 4, from the top bits), that tells names apart by 49.6 bits at 12 threads,
+    // 46 on one: with the generator's 100,000 names, two share them all with odds of
+    // about C(100000, 2) / 2^49.6 = 5.9e-6 per dataset at 12 threads, 7.1e-5 on one.
+    let rows_mask = keys.len() as u32 - 1;
     for &pair in pairs {
-        let (hash, group) = (pair & !0xFF_FFFF, (pair & 0xFF) as usize);
+        let group = (pair & 0xFF) as usize;
+        let (key, check) = ((pair >> 24) as u32 & !rows_mask, pair >> 21 & 0x7FFF);
         // The top hash bits picked the partition; the bits above the group pick a
-        // bucket of 4 slots, compared at once. Slots fill in order and are never
-        // emptied, so the first slot that holds the key or is empty is the name's.
+        // bucket of 8 slots, compared at once. Slots fill in order and are never
+        // emptied, so the first slot that holds the name or is empty is the name's.
         let mut bucket = (pair >> 8) as usize & (buckets - 1);
-        // SAFETY: buckets are masked to the table (a multiple of 4 slots), a key's
+        // SAFETY: buckets are masked to the table (a multiple of 8 slots), a key's
         // row has its WORDS words in `seen`, which covers every group. AVX2 is
         // enabled.
         unsafe {
-            let wanted = _mm256_set1_epi64x(hash as i64);
-            let mask = _mm256_set1_epi64x(!0xFF_FFFF);
-            let slot = loop {
-                let v = _mm256_loadu_si256(keys.as_ptr().add(bucket * 4).cast());
-                let free = _mm256_cmpeq_epi64(v, _mm256_setzero_si256());
-                let hit = _mm256_cmpeq_epi64(_mm256_and_si256(v, mask), wanted);
+            let wanted = _mm256_set1_epi32(key as i32);
+            let mask = _mm256_set1_epi32(!rows_mask as i32);
+            let row = 'found: loop {
+                let v = _mm256_loadu_si256(keys.as_ptr().add(bucket * 8).cast());
+                let free = _mm256_cmpeq_epi32(v, _mm256_setzero_si256());
+                let hit = _mm256_cmpeq_epi32(_mm256_and_si256(v, mask), wanted);
                 let hit = _mm256_or_si256(hit, free);
-                let hit = _mm256_movemask_pd(_mm256_castsi256_pd(hit));
-                if hit != 0 {
-                    break bucket * 4 + hit.trailing_zeros() as usize;
+                // Slots whose hash bits match, or empty, in order: a match whose
+                // check bits differ is another name.
+                let mut hits = _mm256_movemask_ps(_mm256_castsi256_ps(hit));
+                while hits != 0 {
+                    let slot = keys.get_unchecked_mut(bucket * 8 + hits.trailing_zeros() as usize);
+                    if *slot == 0 {
+                        assert!(seen.len() < full, "more names than the tables hold");
+                        *slot = key | (seen.len() / WORDS + 1) as u32;
+                        seen.extend_from_slice(&[0, 0, 0, check << 48]);
+                        break 'found seen.len() / WORDS - 1;
+                    }
+                    let row = (*slot & rows_mask) as usize - 1;
+                    // Word 3's bits 48..62, without bit 63 (`_UNMATCHED`).
+                    if seen.get_unchecked(row * WORDS + 3) << 1 >> 49 == check {
+                        break 'found row;
+                    }
+                    hits &= hits - 1;
                 }
                 bucket = (bucket + 1) & (buckets - 1);
             };
-            let key = keys.get_unchecked_mut(slot);
-            if *key == 0 {
-                assert!(seen.len() < full, "more names than the tables hold");
-                *key = hash | (seen.len() / WORDS << 8) as u64 | 0xFF;
-                seen.extend_from_slice(&[0; WORDS]);
-            }
-            let id = (*key >> 8) as u16 as usize;
-            let word = seen.get_unchecked_mut(id * WORDS + group / 64);
+            let word = seen.get_unchecked_mut(row * WORDS + group / 64);
             let bit = 1 << (group % 64);
             totals[group][5] += (*word & bit == 0) as i64; // names_distinct
             *word |= bit;
