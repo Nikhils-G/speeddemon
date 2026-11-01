@@ -106,6 +106,8 @@ fn main() {
     // The corpus: `docs` without the mmap::PAD zero bytes that follow it.
     let text = &docs[..docs.len() - mmap::PAD];
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    // Waiting workers map the corpus in ahead of the scan (see `ahead`).
+    _ = AHEAD.set((text, threads.max(MIN_SLICES)));
     let (queries, mut vocab) = parse_queries(open("queries.txt"), threads);
     let slices = slices(text, threads.max(MIN_SLICES));
 
@@ -290,9 +292,31 @@ fn wait(word: &AtomicUsize, done: impl Fn(usize) -> bool) {
     }
 }
 
+/// The corpus and the number of equal parts it is mapped in by (main's nominal
+/// number of slices), once known: workers that wait for a job map its pages in
+/// ahead of the scan (`ahead`). And the next chunk to map.
+static AHEAD: OnceLock<(&'static [u8], usize)> = OnceLock::new();
+static AHEAD_NEXT: AtomicUsize = AtomicUsize::new(0);
+
+/// Maps in the next 64 KB of the corpus, for a worker that waits for a job, so
+/// that the scan finds its pages mapped (it would take the same page faults).
+/// Chunk k is the (k / n)-th 64 KB of the (k % n)-th of n equal parts, so every
+/// slice gains alike. None once all are mapped. (madvise(MADV_POPULATE_READ)
+/// instead held mmap_lock and stalled the main thread's allocations; a page fault
+/// takes only its VMA's lock.)
+fn ahead() -> Option<()> {
+    let &(text, n) = AHEAD.get()?;
+    let (k, part) = (AHEAD_NEXT.fetch_add(1, Relaxed), text.len().div_ceil(n));
+    let at = k % n * part + (k / n << 16);
+    // One read: the kernel maps the 16 pages around it (fault-around).
+    text.get(at).map(|&b| std::hint::black_box(b));
+    (k / n << 16 < part).then_some(())
+}
+
 /// Worker i of `par`'s pool: runs each job with its i.
 fn worker(i: usize) {
     for generation in 1.. {
+        while GENERATION.load(Acquire) < generation && ahead().is_some() {}
         wait(&GENERATION, |g| g >= generation);
         // The read lock is held until the job is done: `par` writes the next job
         // only once every worker has finished this one.
