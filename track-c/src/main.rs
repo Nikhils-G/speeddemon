@@ -5,9 +5,12 @@
 //! and scale), not only on the general grammar of 2.1, and does not check all of it.
 //! Input that breaks 2.2 and moves a record boundary (tested: a lone quote, a lost
 //! LF) stops the process with a nonzero exit: an assert, or an index out of bounds.
-//! A record that breaks 2.2 but keeps its LF in place is answered as parsed (tested:
-//! a wrong field count, a quoted id or region id, an unquoted name, a stray CR or BOM,
-//! a second dot, a one-decimal amount).
+//! A record that breaks 2.2 but keeps its LF in place is answered as parsed, with
+//! exit 0, where the reference may give another answer or reject the file (tested: a
+//! wrong field count, a quoted id or region id, a stray CR or BOM, a second dot, a
+//! one-decimal amount). Unquoted non-empty names and notes, which 2.1 allows but 2.2
+//! never writes, give wrong name_bytes and note_bytes (the other columns are right).
+//! A last record without a terminator, which 2.1 allows, is read like any other.
 //!
 //! How it is fast, and why it is still exact:
 //! 1. Both files are mmap'd (pre-warmed page cache: no memory charge, no copy).
@@ -325,8 +328,9 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
         wait(&flushed, threads);
         // No thread reads the input any more. Its pages are dropped in two parts, each
         // thread's slice in one call: the first two thirds now, the last third (below)
-        // while thread 0 writes the output. (Replica, against all of it now: two thirds
-        // -0.8% to -1.0%, a half -0.6%, three fifths -0.7%, three quarters -0.4%. Each 8
+        // while thread 0 writes the output. (Replica, against all of it now, 201 pairs
+        // over 3 x 3 builds: -0.26% to -0.60%, mean -0.45%; in single-build probes, a
+        // half, three fifths and three quarters gained less than two thirds. Each 8
         // runs' pages as they were parsed: 96 calls, each a round of TLB-shootdown
         // interrupts to every other thread.)
         // The k-th of `of` equal parts of 0..n.
@@ -343,8 +347,8 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
         // others meanwhile drop their table's pages and their share of the join
         // table's, of regions.csv's and of the input's last third, which exit would
         // otherwise free one by one on one core, and end. (Replica: their tables, the
-        // join table and regions.csv: -0.6% to -0.9%; the join table's slices dropped
-        // before the takes instead: +0.3%.)
+        // join table and regions.csv: -0.45% to -0.94% over 3 builds; the join table's
+        // slices dropped before the takes instead: +0.3%.)
         if w == 0 {
             write_output(out_dir, &sums.lock().unwrap(), &countries.lock().unwrap());
             std::process::exit(0);
@@ -776,12 +780,13 @@ fn field<'a>(text: &'a [u8], at: &mut usize) -> (&'a [u8], u64) {
         // A quoted value ends at the next `"` that is not one of a `""` pair.
         match (quoted, &text[*at..]) {
             (true, [b'"', b'"', ..]) => (*at, escapes) = (*at + 2, escapes + 1),
-            (true, [b'"', ..]) | (false, [b',' | b'\r' | b'\n', ..]) => break,
+            (true, [b'"', ..]) | (false, [b',' | b'\r' | b'\n', ..] | []) => break,
             _ => *at += 1,
         }
     }
     let raw = &text[start..*at];
-    *at += 1 + quoted as usize;
+    // The end of the file ends the last record too (spec 2.1: no final terminator).
+    *at = (*at + 1 + quoted as usize).min(text.len());
     (raw, (raw.len() - escapes) as u64)
 }
 
