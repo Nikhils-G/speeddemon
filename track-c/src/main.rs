@@ -464,7 +464,7 @@ fn parse_run(
         // The stored group + 1, so 0 (not in the table) wraps to `_UNMATCHED`.
         let k = (region_id as usize).min(group_of.len() - 1);
         // SAFETY: k is below the length (which is at least 2).
-        let stored = unsafe { group_of.get_unchecked(k) }.load(Relaxed);
+        let stored = unsafe { group_of.get_unchecked(k & 0x7FFFF) }.load(Relaxed);
         let group = stored.wrapping_sub(1);
         let t = &mut totals[group as usize];
         (t[0], t[1], t[2]) = (t[0] + 1, t[1] + id as i64, t[2] + cents);
@@ -478,7 +478,7 @@ fn parse_run(
         }
         // The partition from the top hash bits, by multiply-shift: any count.
         let p = ((hash >> 32) * pairs.len() as u64 >> 32) as usize;
-        std::hint::black_box(p);
+        pairs[p].push(hash & !0xFF | group as u64);
     };
     let mid = run_start(&text[..end], start, 1, 2);
     let (mut i, mut j) = (start, mid);
