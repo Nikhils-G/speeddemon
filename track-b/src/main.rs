@@ -51,8 +51,8 @@ const OR: u32 = 3;
 const SAMPLE_BYTES: usize = 1 << 20;
 /// A query whose cover terms are expected in more blocks than this (as a share,
 /// summed over the terms) is evaluated in every superblock: one evaluation then
-/// covers four blocks. (On the box 0.25 beat 0.125; this probe tries 0.5.)
-const ALWAYS: f64 = 0.5;
+/// covers four blocks. (0.125 and 0.5 were measured slower.)
+const ALWAYS: f64 = 0.25;
 /// Documents per superblock: four blocks of 64.
 const SUPER: u32 = 256;
 /// A thread's sum of matching ids is packed under its count in one u64.
@@ -128,6 +128,9 @@ fn main() {
         let first = |log: &Vec<u64>| log.partition_point(|&e| e >> 32 < lines.start as u64);
         let mut cursors: Vec<usize> = results.iter().map(|r| first(&r.1)).collect();
         for line in lines {
+            // The threads' states of the line 8 ahead: they are random reads.
+            let ahead = plan.answer_of.get(line + 8).map_or(0, |&a| a as usize);
+            results.iter().for_each(|r| prefetch(r.0.as_ptr(), ahead));
             let answer = plan.answer_of[line] as usize;
             let s: u64 = results.iter().map(|r| r.0[answer]).sum();
             // The output row: count, sum, then the threads' first ids (12 fields at most).
