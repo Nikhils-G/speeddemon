@@ -1284,28 +1284,29 @@ impl<'a> Scan<'a> {
         self.trig.reserve(self.pending.len());
         let (toks, mut len) = (self.toks.as_mut_ptr(), self.toks.len());
         let (trig, mut nt) = (self.trig.as_mut_ptr(), self.trig.len());
-        let anchor = self.plan.map_or(std::ptr::null(), |p| p.anchor.as_ptr());
+        self.anchors.reserve(self.pending.len());
+        let (anchors, mut na) = (self.anchors.as_mut_ptr(), self.anchors.len());
         for &(key, off) in &self.pending {
             // SAFETY: off is the byte offset of a slot of the table: Phf::slot gives
             // one below 2^(64 - shift), and get_long a long term's or the last one.
             let info = unsafe { probe(table.byte_add(off as usize), key, miss) };
-            if info & ANCHOR != 0 {
-                self.anchors.push(len as u32);
-                // Its phrases' range, read at the document's end.
-                prefetch(anchor, (info & ID) as usize);
-            }
             // SAFETY: room for every pending token was reserved above.
             unsafe {
+                // Branch-free: each position is written, and kept if its token is
+                // an anchor (which is too random to predict).
+                anchors.add(na).write(len as u32);
                 toks.add(len).write(info);
                 // Branch-free: every trigger occurrence is kept (end_doc takes
                 // each term once).
                 trig.add(nt).write(info);
             }
             nt += (info & TRIG != 0) as usize;
+            na += (info & ANCHOR != 0) as usize;
             len += 1;
         }
-        // SAFETY: the first len and nt entries are written.
+        // SAFETY: the first len, nt and na entries are written.
         unsafe { (self.toks.set_len(len), self.trig.set_len(nt)) };
+        unsafe { self.anchors.set_len(na) };
         // SAFETY: room for 8 more ids was reserved: `miss`, which no phrase term has.
         unsafe { toks.add(len).cast::<[u32; 8]>().write([miss; 8]) };
         self.pending.clear();
