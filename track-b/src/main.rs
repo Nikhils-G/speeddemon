@@ -24,7 +24,7 @@ mod mmap;
 use std::arch::asm;
 use std::arch::x86_64::*;
 use std::cmp::Reverse;
-use std::mem::{replace, transmute};
+use std::mem::{replace, take, transmute};
 use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU8, Ordering::Relaxed};
 
 #[cfg(not(all(target_feature = "avx2", target_feature = "bmi2")))]
@@ -83,9 +83,8 @@ fn main() {
     vocab.finish(&plan);
     // Give the setup's freed memory back before the scan: glibc keeps it after
     // the large blocks it has seen freed (about 4 MB of the memory peak).
-    unsafe extern "C" { fn malloc_trim(pad: usize) -> i32; }
     // SAFETY: a glibc call that takes no pointers.
-    unsafe { malloc_trim(0) };
+    unsafe { mmap::malloc_trim(0) };
 
     let results = par(slices.len(), &|i| {
         let (start, end, first) = slices[i];
@@ -160,16 +159,17 @@ fn part(len: usize, p: usize, parts: usize) -> std::ops::Range<usize> {
 /// `(spans, terms)`. Per line of queries.txt, its span `(start, len, phrase)`:
 /// its terms `terms[start..start + len]`, and whether it is a phrase. The terms
 /// are BOOL terms as `id | op << 30`, the first with OR, and phrase terms as ids.
-type Queries = (Vec<(u32, u32, bool)>, Vec<u32>);
+type Queries = (Vec<Span>, Vec<u32>);
+type Span = (u32, u32, bool);
 
 /// Splits `chunk`, whole lines of `padded` (the file and mmap::PAD zero bytes),
 /// into its lines, as in `Queries` but from 0, and their terms: each as its
 /// offset in `padded` and its length | op << 30 (in a BOOL query). Also the
 /// hashes (with `seed`) of the terms' table keys (the zero key for a long term)
 /// with their offsets and key lengths, grouped by hash & 63 (`starts`), and the
-/// long terms. (The long terms' zero key then gets an id that no term uses:
-/// harmless.) The vectors are sized for the most terms a chunk can hold, so they
-/// never grow: their untouched pages cost nothing.
+/// long terms. (The long terms' zero key gets an id that no term uses.) The
+/// vectors are sized for the most terms a chunk can hold, so they never grow:
+/// their untouched pages cost nothing.
 fn split_lines(chunk: &'static [u8], padded: &'static [u8], seed: u64) -> Split {
     let most = chunk.len() / 2 + 1;
     let (mut lines, mut long) = (Vec::with_capacity(most / 3), Vec::new());
@@ -184,27 +184,26 @@ fn split_lines(chunk: &'static [u8], padded: &'static [u8], seed: u64) -> Split 
         for (i, word) in words.split(|&b| b == b' ').enumerate() {
             if phrase || i % 2 == 0 {
                 let at = (word.as_ptr() as usize - padded.as_ptr() as usize) as u32;
-                // Length 0 gives the zero key, which marks a long term.
-                let len = if word.len() > KEY { 0 } else { word.len() as u32 };
                 terms.push((at, word.len() as u32 | op << 30));
                 long.extend((word.len() > KEY).then_some(word));
-                keys.push((hash(key_at(padded, at as usize, len as usize), seed), at, len));
+                // Key length 0 gives the zero key, which marks a long term.
+                let len = word.len() as u32 * (word.len() <= KEY) as u32;
+                let key = key_at(padded, at as usize, len as usize);
+                keys.push((hash(key, seed), at, len));
             } else {
-                op = match word[0] {
-                    b'A' => AND,
-                    b'N' => NOT,
-                    _ => OR,
-                };
+                // `AND`, `NOT` and `OR` start with bytes ending in binary 01, 10 and 11.
+                op = [0, AND, NOT, OR][(word[0] & 3) as usize];
             }
         }
         lines.push((start as u32, (terms.len() - start) as u32, phrase));
     }
     // Grouped by hash & 63.
-    let (starts, grouped) = csr(&[keys.iter().map(|&k| ((k.0 & 63) as u32, k)).collect()], 64);
-    (lines, terms, (starts, grouped), long)
+    let by_group = keys.iter().map(|&k| ((k.0 & 63) as u32, k)).collect();
+    let (starts, grouped) = csr(&[by_group], 64);
+    (lines, terms, starts, grouped, long)
 }
 
-type Split = (Vec<(u32, u32, bool)>, Vec<Term>, (Vec<u32>, Vec<Key>), Vec<Long>);
+type Split = (Vec<Span>, Vec<Term>, Vec<u32>, Vec<Key>, Vec<Long>);
 type Long = &'static [u8];
 /// A term's offset, and its length | op << 30.
 type Term = (u32, u32);
@@ -346,7 +345,7 @@ impl Vocab {
     /// and mmap::PAD zero bytes.
     fn new(splits: Vec<Split>, seed: u64, file: Long) -> Option<(Self, Vec<Vec<u32>>, Vec<Split>)> {
         let n = splits.len();
-        let total: usize = splits.iter().map(|s| s.2.1.len()).sum();
+        let total: usize = splits.iter().map(|s| s.3.len()).sum();
         // The key bytes of a hash. SAFETY: __m128i and u128 have the same size,
         // and any bits are valid.
         let key = |e: &Key| -> u128 { unsafe { transmute(key_at(file, e.1 as _, e.2 as _)) } };
@@ -354,7 +353,7 @@ impl Vocab {
         let groups = par(n, &|q| {
             let g = part(64, q, n);
             let mut keys = Vec::with_capacity(2 * total / n + 64);
-            for (starts, grouped) in splits.iter().map(|s| &s.2) {
+            for (_, _, starts, grouped, _) in &splits {
                 keys.extend_from_slice(&grouped[starts[g.start] as usize..starts[g.end] as usize]);
             }
             // By bucket, then hash: the rotation puts the bucket bits on top.
@@ -369,7 +368,7 @@ impl Vocab {
         let bits = (distinct * 3 / 2).max(1024).next_power_of_two().ilog2() + seed as u32 / 3;
         let (slots, shift, region) = (1 << bits, 64 - bits, bits - 6);
         let mut long = std::collections::HashMap::new();
-        for &term in splits.iter().flat_map(|s| &s.3) {
+        for &term in splits.iter().flat_map(|s| &s.4) {
             let id = (distinct + long.len()) as u32;
             long.entry(term).or_insert(id);
         }
@@ -527,13 +526,13 @@ impl Plan {
         // first among them, each part by sampled frequency, most frequent first,
         // so the presence words and entries the scan uses most share cache lines.
         // A counting sort: kind 3, kind 1, then phrase-only terms in id order.
-        let most = sample_df.iter().copied().max().unwrap_or(0) as usize + 1;
+        let most = sample_df.iter().copied().max().unwrap_or(0) + 1;
         let key = |t: usize| match kind[t] {
             0 => 2 * most,
-            k => (3 - k as usize) / 2 * most + most - 1 - sample_df[t] as usize,
+            k => (3 - k as u32) / 2 * most + most - 1 - sample_df[t],
         };
-        let keyed = (0..sample_df.len()).map(|t| (key(t) as u32, t as u32)).collect();
-        let (_, order) = csr(&[keyed], 2 * most + 1);
+        let keyed = (0..sample_df.len()).map(|t| (key(t), t as u32)).collect();
+        let (_, order) = csr(&[keyed], 2 * most as usize + 1);
         let nb = kind.iter().filter(|&&k| k > 0).count();
         let rows = kind.iter().filter(|&&k| k == 3).count();
         let mut rank = vec![0; order.len()];
@@ -544,13 +543,13 @@ impl Plan {
         let cost = |t: u32| cost(order[t as usize]);
         let lines_part = |p: usize| {
             let mine = part(lines, p, parts);
-            let (mut by_trigger, mut by_anchor, mut always) =
-                (Vec::with_capacity(6 * mine.len()), Vec::with_capacity(mine.len()), Vec::new());
+            let mut by_trigger = Vec::with_capacity(6 * mine.len());
+            let (mut by_anchor, mut always) = (Vec::with_capacity(mine.len()), Vec::new());
             // This part's terms, renumbered: they follow each other in `terms`.
             let first = spans.get(mine.start).map_or(terms.len(), |s| s.0 as usize);
             let end = spans.get(mine.end).map_or(terms.len(), |s| s.0 as usize);
-            let renumbered: Vec<u32> =
-                terms[first..end].iter().map(|&w| rank[(w & TERM) as usize] | w & !TERM).collect();
+            let renumber = |&w: &u32| rank[(w & TERM) as usize] | w & !TERM;
+            let renumbered: Vec<u32> = terms[first..end].iter().map(renumber).collect();
             for line in mine {
                 let (start, len, phrase) = spans[line];
                 let words = &renumbered[start as usize - first..(start + len) as usize - first];
@@ -584,11 +583,10 @@ impl Plan {
             }
             (by_trigger, by_anchor, always, renumbered)
         };
-        let (mut by_trigger, mut by_anchor, mut always) = (Vec::new(), Vec::new(), Vec::new());
-        let mut terms = Vec::with_capacity(terms.len());
-        for (t, a, e, r) in par(parts, &lines_part) {
-            (by_trigger.push(t), by_anchor.push(a), always.extend(e), terms.extend(r));
-        }
+        let mut out = par(parts, &lines_part);
+        let (by_trigger, by_anchor): (Vec<_>, Vec<_>) = out.iter_mut().map(|o| (take(&mut o.0), take(&mut o.1))).unzip();
+        let mut always: Vec<_> = out.iter().flat_map(|o| o.2.iter().copied()).collect();
+        let terms: Vec<_> = out.iter().flat_map(|o| o.3.iter().copied()).collect();
         // By length and operators, so that `end_super` predicts its branches.
         always.sort_unstable_by_key(|e| (e.earlier, e.terms.map(|word| word >> 30)));
         let mut plan = Plan::default();
@@ -638,7 +636,9 @@ fn cover(terms: &[u32], cost: impl Fn(u32) -> f64) -> ([u32; MAX_BOOL_TERMS], us
 /// in their original order (the parts' pairs one part after another).
 fn csr<T: Copy + Default>(parts: &[Vec<(u32, T)>], keys: usize) -> (Vec<u32>, Vec<T>) {
     let mut start = vec![0u32; keys + 1];
-    parts.iter().flatten().for_each(|&(k, _)| start[k as usize + 1] += 1);
+    for &(k, _) in parts.iter().flatten() {
+        start[k as usize + 1] += 1;
+    }
     (0..keys).for_each(|k| start[k + 1] += start[k]);
     let (mut next, mut values) = (start.clone(), vec![T::default(); start[keys] as usize]);
     for &(k, value) in parts.iter().flatten() {

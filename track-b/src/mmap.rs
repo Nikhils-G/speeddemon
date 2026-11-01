@@ -1,4 +1,4 @@
-//! Read-only mmap through libc, declared by hand so the crate has no dependencies.
+//! Read-only mmap and other libc calls, declared by hand so the crate has no dependencies.
 
 use std::io::Error;
 use std::os::fd::AsRawFd;
@@ -7,6 +7,8 @@ unsafe extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
     fn prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i32;
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+    /// glibc: gives the free memory of every heap back to the system.
+    pub fn malloc_trim(pad: usize) -> i32;
 }
 
 /// Turns off transparent huge pages for this process. With THP set to "always",
