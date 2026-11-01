@@ -763,7 +763,7 @@ impl Plan {
         (plan.anchor, plan.anchored) = std::thread::scope(|s| {
             let anchors = s.spawn(|| {
                 // By length and operators, so that `end_super` predicts its branches.
-                always.sort_unstable_by_key(|e| (e.len, e.terms.map(|word| word >> 30)));
+                always.sort_unstable_by_key(|e| e.terms.iter().fold(e.len, |key, &word| key << 2 | word >> 30));
                 csr(&by_anchor, order.len())
             });
             (plan.group, plan.entries) = csr(&by_trigger, bool_terms + 1);
@@ -783,7 +783,7 @@ impl Plan {
     /// their order, then the phrases. Every line gets a number: it has an entry
     /// (a cover has at least one term), is an `always` one or is a phrase.
     fn number_answers(&mut self, always: &mut [Entry], lines: usize) {
-        self.answer_of = vec![u32::MAX; lines];
+        (self.answer_of, self.line_of) = (vec![u32::MAX; lines], Vec::with_capacity(lines));
         let mut number = |line: &mut u32| {
             if self.answer_of[*line as usize] == u32::MAX {
                 self.answer_of[*line as usize] = self.line_of.len() as u32;
@@ -848,17 +848,21 @@ fn cover(terms: &[u32], cost: impl Fn(u32) -> f64) -> ([u32; MAX_BOOL_TERMS], us
 
 /// Groups values by key: values of key k are `values[start[k]..start[k + 1]]`,
 /// in their original order (the parts' pairs one part after another).
-fn csr<T: Copy + Default>(parts: &[Vec<(u32, T)>], keys: usize) -> (Vec<u32>, Vec<T>) {
+fn csr<T: Copy>(parts: &[Vec<(u32, T)>], keys: usize) -> (Vec<u32>, Vec<T>) {
+    // The end of each key's run, then each value put before it, last value first:
+    // the ends step down to the starts.
     let mut start = vec![0u32; keys + 1];
     for &(k, _) in parts.iter().flatten() {
-        start[k as usize + 1] += 1;
+        start[k as usize] += 1;
     }
-    (0..keys).for_each(|k| start[k + 1] += start[k]);
-    let (mut next, mut values) = (start.clone(), vec![T::default(); start[keys] as usize]);
-    for &(k, value) in parts.iter().flatten() {
-        values[next[k as usize] as usize] = value;
-        next[k as usize] += 1;
+    (1..=keys).for_each(|k| start[k] += start[k - 1]);
+    let mut values = Vec::with_capacity(start[keys] as usize);
+    for &(k, value) in parts.iter().flatten().rev() {
+        start[k as usize] -= 1;
+        values.spare_capacity_mut()[start[k as usize] as usize].write(value);
     }
+    // SAFETY: the counts add up to start[keys], so each of its slots was written once.
+    unsafe { values.set_len(start[keys] as usize) };
     (start, values)
 }
 
