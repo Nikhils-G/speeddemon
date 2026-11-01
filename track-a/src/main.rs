@@ -487,16 +487,31 @@ unsafe fn parse(chunks: [&[u8]; 2], table: &Interner, free: &mut &'static mut [u
             (endpoint, len) = table.id(from);
         }
         // The latency: 1 to 10 digits from 5 bytes after the endpoint (its space,
-        // the three status digits and a space), to the LF. One that does not fit a
-        // record (1.2% of lines) goes to the escapes, and the record holds ESCAPE.
+        // the three status digits and a space), to the LF. Its first 8 bytes,
+        // zero-extended: up to 6 digits (99% of lines) are converted where they lie,
+        // and fit a record.
         let to = from.add(len);
-        let (latency, count) = parse_digits(to.add(5));
-        if latency >= ESCAPE as u64 {
-            escapes[k].push(latency as u32); // exact: latencies fit 32 bits (the spec)
-        }
+        let tail = _mm_loadl_epi64(to.add(5).cast());
+        let lf = _mm_cmpeq_epi8(tail, _mm_set1_epi8(b'\n' as i8));
+        let mut count = _mm_movemask_epi8(lf).trailing_zeros() as usize;
+        let latency = if count <= 6 {
+            let v = _mm_sub_epi8(tail, _mm_set1_epi8(b'0' as i8));
+            let v = _mm_maddubs_epi16(v, _mm_loadu_si128(DIGITS.0.as_ptr().add(8 * count).cast()));
+            let v = _mm_madd_epi16(v, _mm_loadu_si128(DIGITS.1.as_ptr().add(4 * count).cast()));
+            _mm_cvtsi128_si32(_mm_add_epi32(v, _mm_srli_epi64(v, 32))) as u32
+        } else {
+            // A latency that does not fit a record goes to the escapes, and the
+            // record holds ESCAPE.
+            let latency;
+            (latency, count) = parse_digits(to.add(5));
+            if latency >= ESCAPE as u64 {
+                escapes[k].push(latency as u32); // exact: latencies fit 32 bits (the spec)
+            }
+            latency.min(ESCAPE as u64) as u32
+        };
         // The status's first digit is right after the endpoint's space; '5' is 5xx.
         let error = ((*to.add(1) == b'5') as u32) << ERROR_SHIFT;
-        *record[k] = endpoint | error | latency.min(ESCAPE as u64) as u32;
+        *record[k] = endpoint | error | latency;
         record[k] = record[k].add(1);
         *line = to.add(5 + count + 1);
         true
@@ -519,6 +534,28 @@ unsafe fn parse(chunks: [&[u8]; 2], table: &Interner, free: &mut &'static mut [u
 
 /// 128 bytes of 0xFF then 128 zeros: the 128 bytes from `128 - len` keep the first `len`.
 static KEEP: [[u8; 128]; 2] = [[0xFF; 128], [0; 128]];
+
+/// For n = 0..=6 digits at bytes 0..n of a vector, minus '0': at DIGITS.0[8n..],
+/// maddubs weights that make pairs (10a + b, or a alone for the last of an odd
+/// count), and at DIGITS.1[4n..], madd weights that give the pairs their place
+/// values, in two sums then added. Bytes from n on weigh 0, so the digits need no
+/// moving. Entries are 8 bytes apart, for one scaled address: a 16-byte load also
+/// reads the next entry, which only weighs the vector's upper half, not summed.
+static DIGITS: ([i8; 72], [i16; 36]) = {
+    let (mut pairs, mut scale) = ([0; 72], [0; 36]);
+    let mut i = 0;
+    while i < 56 {
+        let (n, j) = (i / 8, i % 8);
+        if j < n {
+            pairs[i] = if j % 2 == 0 && j + 1 < n { 10 } else { 1 };
+        }
+        if j < 4 && 2 * j < n {
+            scale[4 * n + j] = 10i16.pow((n - 2 * j).saturating_sub(2) as u32);
+        }
+        i += 1;
+    }
+    (pairs, scale)
+};
 
 /// An endpoint's identity: its bytes (at most 125), a space, then zeros to 128 bytes.
 /// No endpoint byte is a space or zero, so equal keys mean equal endpoints.
