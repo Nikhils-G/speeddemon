@@ -148,18 +148,18 @@ fn main() {
     // How many hours still read each part's records: the hour that brings its
     // part's count to zero gives the rest of them back.
     let readers: Vec<AtomicUsize> = parts.iter().map(|_| AtomicUsize::new(0)).collect();
-    let (slice, next) = (AtomicUsize::new(0), AtomicUsize::new(0));
-    let (written, share) = (std::sync::Barrier::new(threads), AtomicUsize::new(0));
-    // Bytes of records given back so far, and of output written (see `flush`).
-    let (given, wrote) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    // Shared counters: the next slice to parse, the next hour of the queue, the threads
+    // done with pass 1, the next share of the output's page-table entries to drop, and
+    // the bytes of records given back so far and of output written (see `flush`).
+    let [slice, next, parsed, share, given, wrote] = [(); 6].map(|_| AtomicUsize::new(0));
     // One pool of threads, this one included: as many threads as CPUs. (With this
     // thread apart, merging, 13 threads shared 12 CPUs, likely leaving two workers on
     // one CPU for the whole parse (PERF.md, step 38): replica, 300 runs each, 21 to 43
     // runs over +8% against 6 to 10 now, and a median 0.9% slower.) The last thread to
     // finish pass 1 merges. The log's address goes as a number: a raw pointer cannot go
     // to another thread.
-    let (parsed, base_addr) = (AtomicUsize::new(0), base as usize);
-    thread::scope(|s| {
+    let (written, base_addr) = (std::sync::Barrier::new(threads), base as usize);
+    let total = thread::scope(|s| {
         let work = || {
             // 3. Pass 1.
             // This thread's records, each part taking the start of what is left.
@@ -167,8 +167,7 @@ fn main() {
             // written are ever backed by memory. One mapping per thread, not per
             // slice: a mapping per slice made eight slices a thread 2 ms slower.
             // (A slice of n bytes has at most n / MIN_LINE + 1 lines.)
-            let most = len / MIN_LINE + slices;
-            let mut free = &mut vec![0; most].leak()[..];
+            let mut free = &mut vec![0; len / MIN_LINE + slices].leak()[..];
             let claim = || slice.fetch_add(2, Relaxed);
             for p in std::iter::repeat_with(claim).take_while(|&p| p < slices) {
                 let pair = [&log[cut(p)..cut(p + 1)], &log[cut(p + 1)..cut(p + 2)]];
@@ -225,8 +224,8 @@ fn main() {
                     // SAFETY: bytes at..at + len of the mapping are this hour's alone, and
                     // at + len <= total <= bound: a line is at most 213 bytes (see bound).
                     let out = unsafe { std::slice::from_raw_parts_mut((file + at) as _, len) };
-                    let key = hours[hour][0].begin.key;
-                    let head = (key << 24).to_be_bytes(); // the hour key's 13 bytes
+                    // The hour key's 13 bytes.
+                    let head = (hours[hour][0].begin.key << 24).to_be_bytes();
                     // Last line first, each one ending where the next one starts.
                     let mut at = len;
                     let named = endpoints.iter().zip(groups).filter(|(_, stat)| stat[0] > 0);
@@ -259,7 +258,6 @@ fn main() {
                 // word (one increment per record), then set start[i + 1] to the
                 // start of id i's group and place each latency at it: start[i]
                 // then runs from id i's first value to its end.
-                counts.fill(0);
                 // (Each run is copied at the head of the loop: read in place, its
                 // fields compiled to other instructions in both loops.)
                 for &Run { begin, part, end } in runs {
@@ -308,7 +306,8 @@ fn main() {
                 let (mut groups, mut len) = (Vec::with_capacity(endpoints.len()), 0);
                 for &(id, name) in endpoints {
                     let group = &mut values[start[id] as usize..start[id + 1] as usize];
-                    groups.push(stats(group, (counts[id] >> 32) as u32));
+                    // Taken: zero again for the next hour.
+                    groups.push(stats(group, (std::mem::take(&mut counts[id]) >> 32) as u32));
                     len += line_len(name, groups.last().unwrap());
                 }
                 lens[hour].set(len).unwrap();
@@ -329,21 +328,19 @@ fn main() {
             // the test server). Dropped while other threads still wrote, they slowed
             // those writes by as much (PERF.md, experiments). Shares are cut at pages.
             written.wait();
-            let total = offset(lens.len()).unwrap();
-            let k = share.fetch_add(1, Relaxed);
+            let (total, k) = (offset(lens.len()).unwrap(), share.fetch_add(1, Relaxed));
             let at = |k: usize| (file + total * k / threads).next_multiple_of(PAGE);
             // SAFETY: whole pages of the shared output mapping (page-aligned), all
             // written and not touched again. MADV_DONTNEED drops only their
             // page-table entries: the pages stay in the file.
             unsafe { madvise(at(k) as *mut u8, at(k + 1) - at(k), MADV_DONTNEED) };
+            total
         };
         for _ in 1..threads {
             s.spawn(work);
         }
-        work(); // the last worker is this thread
+        work() // the last worker is this thread
     });
-    let (_, _, lens, _) = merged.get().unwrap();
-    let total: usize = lens.iter().map(|len| len.get().unwrap()).sum();
     output.set_len(total as u64).expect("size the summary");
     // The output is complete in the page cache. Exit now: dropping the tables
     // above, one free at a time, took a few milliseconds on the scoring box.
