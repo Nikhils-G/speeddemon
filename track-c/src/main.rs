@@ -295,12 +295,13 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
         }
         wait(&chunks_done, REGION_CHUNKS);
         // Two threads can start on one CPU while another one idles, and the scheduler
-        // then leaves them there for most of the run (+20% in about 1 board run in 4).
-        // The second one to get here moves to a CPU it may use that no thread has
-        // claimed, if any.
+        // then leaves them there for most of the run (+20%; on the replica, in 3% of
+        // runs). The second one to get here moves to a CPU it may use that no thread
+        // has claimed, if any. A failed call leaves it where it is: sched_getcpu's -1
+        // reads as CPU 63, outside `allowed` unless the machine has 64 CPUs.
         // SAFETY: a libc call that touches no memory of ours.
         let cpu = unsafe { sched_getcpu() } as u32 % 64;
-        let seen = on.fetch_or(1 << cpu, AcqRel);
+        let seen = on.fetch_or(1 << cpu, AcqRel) & allowed;
         // The lowest CPU it may use that no thread has claimed (0 if none is left).
         let free = !seen & allowed;
         let bit = free & free.wrapping_neg();
