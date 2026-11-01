@@ -495,10 +495,6 @@ struct Plan {
     /// BOOL entries triggered by slot t: `entries[group[t]..group[t + 1]]`.
     group: Vec<u32>,
     entries: Vec<Entry>,
-    /// Per entry, two slots of terms that every match contains (see `precheck`).
-    pre: Vec<(u32, u32)>,
-    /// Bit t: slot t triggers entries.
-    trig: Vec<u64>,
     /// BOOL entries evaluated in every superblock, on rows of `Scan::wide`.
     always: Vec<Entry>,
     /// The terms of `always` have the ids 0..rows, which are also their rows.
@@ -614,9 +610,6 @@ impl Plan {
         always.sort_unstable_by_key(|e| (e.earlier, e.terms.map(|word| word >> 30)));
         let mut plan = Plan::default();
         (plan.group, plan.entries) = csr(&by_trigger, nb + 1);
-        plan.pre = plan.entries.iter().map(|e| precheck(e, nb as u32 + 1)).collect();
-        plan.trig = vec![0; nb / 64 + 1];
-        (0..=nb).filter(|&t| plan.group[t] != plan.group[t + 1]).for_each(|t| plan.trig[t / 64] |= 1 << (t % 64));
         (plan.anchor, plan.anchored) = csr(&by_anchor, order.len());
         // Answers numbered in the order the scan visits them: the `always` ones
         // first, so that each superblock reads and writes their state as one
@@ -658,22 +651,6 @@ fn cover(terms: &[u32], cost: impl Fn(u32) -> f64) -> ([u32; MAX_BOOL_TERMS], us
     (cover, n)
 }
 
-/// Two slots of terms that every match of the entry contains, the two highest
-/// (the rarest: ids go by frequency), or the all-ones `pad`: if the two words
-/// have no document in common, the entry has no match in the block. Left to
-/// right, a match contains the first term; AND adds a term, NOT none, and OR
-/// keeps only its own term, if it was required already.
-fn precheck(e: &Entry, pad: u32) -> (u32, u32) {
-    let mut req = vec![e.terms[0] & TERM];
-    for &word in e.terms[1..].iter().filter(|&&w| w & TERM != pad) {
-        req.retain(|&t| word >> 30 != OR || t == word & TERM);
-        req.extend((word >> 30 == AND).then_some(word & TERM));
-    }
-    req.sort_unstable();
-    let top = |k: usize| *req.iter().rev().nth(k).or(req.last()).unwrap_or(&pad);
-    (top(0), top(1))
-}
-
 /// Groups values by key: values of key k are `values[start[k]..start[k + 1]]`,
 /// in their original order (the parts' pairs one part after another).
 fn csr<T: Copy + Default>(parts: &[Vec<(u32, T)>], keys: usize) -> (Vec<u32>, Vec<T>) {
@@ -702,10 +679,8 @@ struct Scan<'a> {
     /// The slots set in this block (`touched[..n]`), to evaluate and clear.
     touched: Vec<u32>,
     n: usize,
-    /// The touched slots that trigger entries, and the entries that pass their
-    /// precheck.
-    hot: Vec<u32>,
-    live: Vec<u32>,
+    /// The entry ranges `(start, end)` of the touched slots that trigger any.
+    work: Vec<(u32, u32)>,
     /// Row r < plan.rows: the words of BOOL term r in the 4 blocks of this
     /// superblock. Row `rows` takes the other terms; row `rows + 1` is all ones.
     wide: Vec<Row>,
@@ -735,8 +710,7 @@ impl<'a> Scan<'a> {
             w,
             touched: vec![0; nb + 2],
             n: 0,
-            hot: vec![0; nb + 2],
-            live: Vec::with_capacity(plan.map_or(0, |p| p.entries.len())),
+            work: Vec::with_capacity(nb + 2),
             wide,
             pending: Vec::new(),
             toks: Vec::new(),
@@ -932,61 +906,53 @@ impl<'a> Scan<'a> {
     fn end_block(&mut self, base: u32) {
         let w = &mut self.w;
         if let Some(plan) = self.plan {
-            // In passes, so that the cold lines of an evaluation are fetched
-            // well before it. First the touched slots that trigger entries (a
-            // third). Then per slot, the entries of its range that pass their
-            // precheck (two in three), fetching the range 16 slots ahead, the
-            // first entry's precheck pair 8 ahead and the pair's words 4 ahead.
-            // Then their evaluation, fetching the entry 8 ahead and the words
-            // and state of the entry 4 ahead.
-            let (hot, mut h) = (self.hot.as_mut_ptr(), 0);
-            for &t in &self.touched[..self.n] {
-                // SAFETY: hot has room for every touched slot.
-                unsafe { hot.add(h).write(t) };
-                h += (plan.trig[t as usize / 64] >> (t % 64) & 1) as usize;
+            // Two passes, so that the cold lines of an evaluation are fetched
+            // well before it. The first keeps the entry ranges of the touched
+            // slots that trigger any (about a third) and fetches their first
+            // entries; the second, 4 ranges ahead, fetches the words and the
+            // state the first entry of a range reads, then evaluates it.
+            let (touched, group) = (&self.touched[..self.n], plan.group.as_ptr());
+            let (entries, work) = (plan.entries.as_ptr(), self.work.as_mut_ptr());
+            let mut m = 0;
+            for (i, &t) in touched.iter().enumerate() {
+                prefetch(group, *touched.get(i + 16).unwrap_or(&0) as usize);
+                // SAFETY: touched slots are at most nb, and group has nb + 2 entries.
+                let (from, to) = unsafe { (*group.add(t as usize), *group.add(t as usize + 1)) };
+                // An empty range fetches entry 0 instead, which stays in L1.
+                let first = if_zero((from ^ to) as u64, 0, from as u64);
+                prefetch(entries, first as usize);
+                // SAFETY: work has room for every touched slot.
+                unsafe { work.add(m).write((from, to)) };
+                m += (from != to) as usize;
             }
-            // SAFETY: slots are below w.len(), hot slots at most nb (group has
-            // nb + 2 entries, slot 0 stands in past the end), and group's entry
-            // indices index pre.
-            let word = |s: u32| unsafe { *w.get_unchecked(s as usize) };
-            let (hot, group, pre) = (&self.hot[..h], plan.group.as_ptr(), plan.pre.as_ptr());
-            let first = |i: usize| unsafe { *group.add(*hot.get(i).unwrap_or(&0) as usize) };
-            let (live, mut l) = (self.live.as_mut_ptr(), 0);
-            for (i, &t) in hot.iter().enumerate() {
-                prefetch(group, *hot.get(i + 16).unwrap_or(&0) as usize);
-                prefetch(pre, first(i + 8) as usize);
-                // SAFETY: as above; live has room for every entry.
-                unsafe {
-                    let (a, b) = *pre.add(first(i + 4) as usize);
-                    (prefetch(w.as_ptr(), a as usize), prefetch(w.as_ptr(), b as usize));
-                    for e in *group.add(t as usize)..*group.add(t as usize + 1) {
-                        let (a, b) = *pre.add(e as usize);
-                        live.add(l).write(e);
-                        l += (word(a) & word(b) != 0) as usize;
-                    }
+            // SAFETY: the first m ranges were written.
+            unsafe { self.work.set_len(m) };
+            let state = self.answers.state.as_ptr();
+            for (k, &(from, to)) in self.work.iter().enumerate() {
+                // SAFETY: an entry of the plan (entry 0 at the end), which the first
+                // pass fetched.
+                let e = unsafe { &*entries.add(self.work.get(k + 4).map_or(0, |r| r.0) as usize) };
+                for &word in &e.terms {
+                    prefetch(w.as_ptr(), (word & TERM) as usize);
                 }
-            }
-            // SAFETY: the first l were written.
-            unsafe { self.live.set_len(l) };
-            let (entries, state) = (plan.entries.as_ptr(), self.answers.state.as_ptr());
-            for (k, &i) in self.live.iter().enumerate() {
-                prefetch(entries, self.live.get(k + 8).map_or(0, |&i| i) as usize);
-                // SAFETY: entries of the plan (entry 0 at the end).
-                let (next, e) = unsafe { (&*entries.add(*self.live.get(k + 4).unwrap_or(&0) as usize), &*entries.add(i as usize)) };
-                for &t in &next.terms {
-                    prefetch(w.as_ptr(), (t & TERM) as usize);
+                prefetch(state, e.answer as usize);
+                // SAFETY: group holds ranges of entries.
+                for e in unsafe { plan.entries.get_unchecked(from as usize..to as usize) } {
+                    // All ones when bit 0 of b is set: bit(op) for NOT and OR,
+                    // bit(op >> 1) only for OR.
+                    let bit = |b: u32| 0u64.wrapping_sub((b & 1) as u64);
+                    let r = e.terms.iter().fold(0u64, |r, &word| {
+                        // SAFETY: every term word's slot is below nb or the pad
+                        // slot nb + 1, and w has nb + 2 words.
+                        let x = unsafe { *w.get_unchecked((word & TERM) as usize) };
+                        // AND: r & x. NOT: r & !x. OR: (r & !x) | x = r | x.
+                        (r & (x ^ bit(word >> 30))) | (x & bit(word >> 31))
+                    });
+                    // A branch on the few entries with earlier cover terms.
+                    let present = |k| w[(e.terms[k] & TERM) as usize] & bit(e.earlier >> k) != 0;
+                    let seen = e.earlier != 0 && (0..MAX_BOOL_TERMS).any(present);
+                    self.answers.add(e.answer, if seen { 0 } else { r }, base);
                 }
-                prefetch(state, next.answer as usize);
-                // All ones when bit 0 of b is set: bit(op) for NOT and OR,
-                // bit(op >> 1) only for OR.
-                let bit = |b: u32| 0u64.wrapping_sub((b & 1) as u64);
-                // AND: r & x. NOT: r & !x. OR: (r & !x) | x = r | x.
-                let step = |r, &t: &u32| (r & (word(t & TERM) ^ bit(t >> 30))) | (word(t & TERM) & bit(t >> 31));
-                let r = e.terms.iter().fold(0u64, step);
-                // A branch on the few entries with earlier cover terms.
-                let present = |k| word(e.terms[k] & TERM) & bit(e.earlier >> k) != 0;
-                let seen = e.earlier != 0 && (0..MAX_BOOL_TERMS).any(present);
-                self.answers.add(e.answer, if seen { 0 } else { r }, base);
             }
         }
         let (rows, block) = (self.wide.len() - 2, (base / 64 % (SUPER / 64)) as usize);
@@ -1164,6 +1130,17 @@ fn masks(docs: &[u8], at: usize, end: usize) -> (u64, u64) {
 fn prefetch<T>(base: *const T, i: usize) {
     // SAFETY: a prefetch reads nothing and never faults, whatever the address.
     unsafe { _mm_prefetch::<_MM_HINT_T0>(base.wrapping_add(i).cast()) }
+}
+
+/// `if c == 0 { a } else { b }` as a cmov: LLVM turns such selects of loaded
+/// values into branches, which mispredict when c is random.
+fn if_zero(c: u64, a: u64, b: u64) -> u64 {
+    let mut r = b;
+    // SAFETY: register-only instructions.
+    unsafe {
+        asm!("test {c}, {c}", "cmovz {r}, {a}", c = in(reg) c, a = in(reg) a, r = inout(reg) r, options(pure, nomem, nostack))
+    };
+    r
 }
 
 /// `vpmovmskb` hidden from LLVM: on CPUs without AVX-512 it rewrites the
