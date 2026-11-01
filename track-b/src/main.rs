@@ -89,23 +89,32 @@ fn main() {
 
     let results = par(slices.len(), &|i| {
         let (start, end, first) = slices[i];
-        let scan = Scan::new(&vocab, Some(&plan), &[]).run(docs, start, end, first);
+        // Only the answers and the last id are kept: the scan's other tables
+        // are freed here, and the first ids below reuse their memory.
+        let (Answers { state, log, logged }, doc) = {
+            let scan = Scan::new(&vocab, Some(&plan), &[]).run(docs, start, end, first);
+            (scan.answers, scan.doc)
+        };
         // Drop the slice's pages now, in parallel, instead of the kernel
         // unmapping all 62,000 at exit on one core.
         mmap::release(&docs[start..end]);
-        let mut log = scan.answers.log;
-        log.truncate(scan.answers.logged);
-        // Back to line numbers; sorted, the log holds each line's first ids in
-        // order.
-        let line = |e: u64| (plan.line_of[(e >> 32) as usize] as u64) << 32 | e & u32::MAX as u64;
-        log.iter_mut().for_each(|e| *e = line(*e));
-        log.sort_unstable();
         // The ids go on in the next slice. Every per-thread sum of ids is below
         // N^2 / 2, which must fit in SUM_BITS.
-        let next = slices.get(i + 1).map_or(scan.doc + 1, |s| s.2);
-        let ok = slices[0].2 == 0 && next == scan.doc + 1 && scan.doc < 1 << 20;
+        let next = slices.get(i + 1).map_or(doc + 1, |s| s.2);
+        let ok = slices[0].2 == 0 && next == doc + 1 && doc < 1 << 20;
         assert!(ok, "docs.txt: ids must be 0, 1, 2, ... below 2^20");
-        (scan.answers.state, log)
+        // The first ids by line number, without a sort: an answer logged the
+        // first min(count, 10) of its ids, in order, so each line's place in
+        // the result is known from the counts.
+        let place = |n: &mut u32, &a: &u32| Some(replace(n, *n + (state[a as usize] >> SUM_BITS).min(10) as u32));
+        let mut at: Vec<u32> = plan.answer_of.iter().scan(0, place).collect();
+        let mut firsts = vec![0; logged];
+        for &e in &log[..logged] {
+            let line = plan.line_of[(e >> 32) as usize] as usize;
+            firsts[at[line] as usize] = (line as u64) << 32 | e & u32::MAX as u64;
+            at[line] += 1;
+        }
+        (state, firsts)
     });
 
     // Format in parallel, one range of lines per thread. Per line: the threads'
