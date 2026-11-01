@@ -27,10 +27,11 @@
 //!    counting ranks with AVX2 in groups of up to 64 values (95% of the groups), by
 //!    selection in larger ones.
 //! 5. Each hour is formatted straight into the output file, mapped shared, last
-//!    line first, as soon as the hours before it have their lengths; a thread takes
-//!    further hours meanwhile. Records shrink as the output grows. Once all of it
-//!    is written, the threads drop its page-table entries in parallel, so the exit
-//!    does not.
+//!    line first, once the hours before it have their lengths and the records given
+//!    back make room for it; a thread takes further hours meanwhile. So the output
+//!    takes the place of the records, rather than adding to the memory peak. Once
+//!    all of it is written, the threads drop its page-table entries in parallel, so
+//!    the exit does not.
 
 #[cfg(not(target_feature = "avx2"))]
 compile_error!("track-a needs AVX2: build with RUSTFLAGS=\"-C target-cpu=native\"");
@@ -65,7 +66,8 @@ fn main() {
     // 4. the merge, on this thread meanwhile, once the last slice is in: the hours,
     //    the endpoints' byte order and the output mapping, handed over at once;
     // 5. pass 2, in each thread: per hour, group the records by endpoint, compute
-    //    the statistics, and write each hour once the earlier ones have lengths;
+    //    the statistics, and write each hour once the earlier ones have lengths and
+    //    the records given back make room for it;
     // 6. teardown: each thread drops a share of the output's page-table entries,
     //    then this thread cuts the file to its length and exits.
     //
@@ -138,6 +140,8 @@ fn main() {
     let readers: Vec<AtomicUsize> = parts.iter().map(|_| AtomicUsize::new(0)).collect();
     let (slice, next) = (AtomicUsize::new(0), AtomicUsize::new(0));
     let (written, share) = (std::sync::Barrier::new(threads), AtomicUsize::new(0));
+    // Bytes of records given back so far, and of output written (see `flush`).
+    let (given, wrote) = (AtomicUsize::new(0), AtomicUsize::new(0));
     thread::scope(|s| {
         for _ in 0..threads {
             s.spawn(|| {
@@ -163,12 +167,27 @@ fn main() {
                 }
                 // 5. Pass 2, once the merge has handed everything over.
                 let (hours, file, lens, endpoints) = merged.wait();
+                // The number of records in hour h: each run's end minus its first record.
+                let size = |h: usize| hours[h].iter().map(|&((_, at, _), _, to)| to - at).sum();
+                let largest = (0..hours.len()).map(size).max().unwrap_or(0);
                 // Where an hour's output starts, once the lengths of all earlier hours are known.
                 let offset = |hour| lens[..hour].iter().try_fold(0, |at, n| Some(at + n.get()?));
-                // Writes the pending hours whose start is known.
-                let flush = |pending: &mut Vec<(usize, usize, Vec<Stats>)>| {
+                // Three quarters of the bytes that the values buffers below can hold.
+                let held = threads * largest * size_of::<u32>() * 3 / 4;
+                // Writes the pending hours whose start is known. While the hours are being
+                // computed (`gated`), an hour also waits until the records given back cover
+                // the output written, its own and `held`. Output written as soon as it could
+                // be stacked on the records and the values buffers 2-3 ms into pass 2, the
+                // memory peak: gated, the highest of 5 runs is 0.7 MB lower at equal speed.
+                // (All the buffers' room: 0.4 MB lower again, 0.9% slower, as more hours are
+                // left to write at the end.)
+                let flush = |pending: &mut Vec<(usize, usize, Vec<Stats>)>, gated: bool| {
                     pending.retain(|&(hour, len, ref groups)| {
                         let Some(at) = offset(hour) else { return true };
+                        if gated && wrote.load(Relaxed) + len + held > given.load(Relaxed) {
+                            return true;
+                        }
+                        wrote.fetch_add(len, Relaxed);
                         // SAFETY: bytes at..at + len of the mapping are this hour's alone, and
                         // at + len <= total <= bound: a line is at most 213 bytes (see bound).
                         let out = unsafe { std::slice::from_raw_parts_mut((file + at) as _, len) };
@@ -189,9 +208,6 @@ fn main() {
                 // records from every part, groups them by endpoint id, computes each group's
                 // statistics and the hour's length, then writes each of its hours once the
                 // earlier hours' lengths are known, taking further hours meanwhile.
-                // The number of records in hour h: each run's end minus its first record.
-                let size = |h: usize| hours[h].iter().map(|&((_, at, _), _, to)| to - at).sum();
-                let largest = (0..hours.len()).map(size).max().unwrap_or(0);
                 // Hours are taken in blocks of `threads` hours, one per thread, the
                 // largest hour of each block first (every thread builds the same
                 // queue). Taken in time order, a large hour started last in its block
@@ -245,6 +261,7 @@ fn main() {
                         // (A part's escapes are a few KB: no whole page to give back.)
                         let last = runs.get(k + 1).is_none_or(|&(_, next, _)| next != p);
                         if last && readers[p].fetch_sub(1, AcqRel) == 1 {
+                            given.fetch_add(size_of_val(*records), Relaxed);
                             // SAFETY: anonymous memory (see `free`) that every hour reading
                             // it has placed, so nothing reads it again.
                             unsafe { release(*records) };
@@ -260,15 +277,15 @@ fn main() {
                     }
                     lens[hour].set(len).unwrap();
                     pending.push((hour, len, groups));
-                    flush(&mut pending);
+                    flush(&mut pending, true);
                 }
                 drop(values); // not needed while the last hours wait to be written
                 // Sleep until the hours before this thread's last one have their
-                // lengths, then write the rest. (A yield loop here spun on CPUs whose
-                // other hardware thread was still computing an hour.)
+                // lengths, then write the rest, ungated. (A yield loop here spun on CPUs
+                // whose other hardware thread was still computing an hour.)
                 let last = pending.iter().map(|p| p.0).max().unwrap_or(0);
                 lens[..last].iter().for_each(|n| _ = n.wait());
-                flush(&mut pending);
+                flush(&mut pending, false);
                 // 6. Teardown.
                 // Once every thread is here the output is written: each then drops the
                 // page-table entries of a share of its mapping (the pages stay in the
@@ -455,10 +472,10 @@ unsafe fn parse(chunks: [&[u8]; 2], table: &Interner, free: &mut &'static mut [u
     let most = chunks.map(|chunk| chunk.len() / MIN_LINE + 1);
     assert!(free.len() >= most[0] + most[1]);
     let (first, second) = std::mem::take(free).split_at_mut(most[0]);
-    // Each slice's next line and its end, its records' start and next place, the
-    // previous line's hour bytes, the latencies that do not fit a record, its runs.
-    let mut line = chunks.map(|c| c.as_ptr());
-    let stop = chunks.map(|c| c.as_ptr_range().end);
+    // Each slice's unparsed bytes (from its next line to its end), its records' start
+    // and next place, the previous line's hour bytes, the latencies that do not fit a
+    // record, its runs.
+    let mut unparsed = chunks.map(|c| c.as_ptr_range());
     let start = [first.as_mut_ptr(), second.as_mut_ptr()];
     let mut record = start;
     let (mut last, mut escapes, mut runs) = ([u64::MAX; 2], [vec![], vec![]], [vec![], vec![]]);
@@ -474,14 +491,14 @@ unsafe fn parse(chunks: [&[u8]; 2], table: &Interner, free: &mut &'static mut [u
     //   before it to 64 after it (by 157), the long way 128 after it (by 221);
     // - it ends by 91 (28 + 63), not before its start, or in the long way by 218
     //   (93 + 125), where the assert stops an over-125-byte name;
-    // - the latency's 8 or 16 bytes start by 223 (218 + 5) and end by 239.
+    // - the latency's 16 bytes start by 223 (218 + 5) and end by 239.
     // Records are written within each slice's room (asserted above): at most
     // `most[k]` lines, one record each. `free` is not used meanwhile. The slices may
     // go back to the kernel at the end (the caller's contract): their endpoint names
     // were copied (see Interner::add).
     let mut step = |k: usize| unsafe {
-        let line = &mut line[k];
-        if *line >= stop[k] {
+        let line = &mut unparsed[k].start;
+        if *line >= unparsed[k].end {
             return false;
         }
         // Lines from one shard arrive in time order, so most lines repeat the
@@ -507,33 +524,30 @@ unsafe fn parse(chunks: [&[u8]; 2], table: &Interner, free: &mut &'static mut [u
         // (none: the endpoint goes on past the window, and the long way finds its
         // end; a zero window stays zero and goes the long way too).
         let rest = window & window.wrapping_sub(1);
-        let mut len = (rest.trailing_zeros() as usize).wrapping_sub(first + 1);
+        let len = (rest.trailing_zeros() as usize).wrapping_sub(first + 1);
         // Endpoints that end in the window (92% of lines) are looked up inline; the
         // rest, and the inline lookup's misses, go the long way.
-        let (mut endpoint, mut hit) = (0, false);
-        if rest != 0 {
-            (endpoint, hit) = table.find(&[load(from), load(from.add(32))], from, len);
-        }
-        if !hit {
-            (endpoint, len) = table.id(from);
-        }
+        let found = (rest != 0).then(|| table.find(&[load(from), load(from.add(32))], from, len));
+        let (endpoint, len) = match found {
+            Some((endpoint, true)) => (endpoint, len),
+            _ => table.id(from),
+        };
         // The latency: 1 to 10 digits from 5 bytes after the endpoint (its space,
-        // the three status digits and a space), to the LF. Its first 8 bytes,
-        // zero-extended: up to 6 digits (99% of lines) are converted where they lie,
-        // and fit a record.
+        // the three status digits and a space), to the LF, all within the 16 bytes
+        // from there: up to 6 digits (99% of lines) are converted where they lie, and
+        // fit a record.
         let to = from.add(len);
-        let tail = _mm_loadl_epi64(to.add(5).cast());
+        let tail = _mm_loadu_si128(to.add(5).cast());
         let lf = _mm_cmpeq_epi8(tail, _mm_set1_epi8(b'\n' as i8));
-        let mut count = _mm_movemask_epi8(lf).trailing_zeros() as usize;
+        // 32 if there is no LF in the 16 bytes (a file that breaks the spec).
+        let count = _mm_movemask_epi8(lf).trailing_zeros() as usize;
         let latency = if count <= 6 {
             let v = _mm_sub_epi8(tail, _mm_set1_epi8(b'0' as i8));
             let v = _mm_maddubs_epi16(v, _mm_loadu_si128(DIGITS.0.as_ptr().add(8 * count).cast()));
             let v = _mm_madd_epi16(v, _mm_loadu_si128(DIGITS.1.as_ptr().add(4 * count).cast()));
             _mm_cvtsi128_si32(_mm_add_epi32(v, _mm_srli_epi64(v, 32))) as u32
         } else {
-            let latency;
-            (latency, count) = parse_digits(to.add(5), &mut escapes[k]);
-            latency
+            parse_digits(to.add(5), count, &mut escapes[k])
         };
         // The status's first digit is right after the endpoint's space; '5' is 5xx.
         let error = ((*to.add(1) == b'5') as u32) << ERROR_SHIFT;
@@ -587,37 +601,34 @@ static DIGITS: ([i8; 72], [i16; 36]) = (
 type Key = [__m256i; 4];
 
 /// `vpmovmskb`: bit i of the mask is the top bit of byte i of `v`.
-#[inline(always)]
 fn movemask(v: __m256i) -> u64 {
     // SAFETY: AVX2 is enabled for this build.
     unsafe { _mm256_movemask_epi8(v) as u32 as u64 }
 }
 
-/// The record's latency and the number of the 7 to 10 ASCII digits at `at` (1.2% of
-/// lines; the parse converts up to 6 itself), one digit at a time up to the LF. A
-/// latency that does not fit a record goes to `escapes`, and the record holds ESCAPE.
+/// The record's latency from the `count` ASCII digits at `at`, 7 to 10 (1.2% of lines;
+/// the parse converts up to 6 itself), one digit at a time. A latency that does not
+/// fit a record goes to `escapes`, and the record holds ESCAPE.
 ///
-/// The spec guarantees those digits and that LF, and nothing checks them here: a
-/// latency that breaks the spec gives a wrong value, never a read out of bounds, as
-/// at most the 16 bytes at `at` are read.
+/// The spec guarantees those digits, and nothing checks them here: a latency that
+/// breaks the spec gives a wrong value, never a read out of bounds, as at most the
+/// 16 bytes at `at` are read.
 ///
 /// # Safety
 ///
 /// The 16 bytes at `at` must be readable.
 #[cold]
 #[inline(never)]
-unsafe fn parse_digits(at: *const u8, escapes: &mut Vec<u32>) -> (u32, usize) {
-    let (mut latency, mut count) = (0u64, 0);
-    // SAFETY: count < 16, so each read is one of the 16 readable bytes (the caller's
-    // contract).
-    while count < 16 && unsafe { *at.add(count) } != b'\n' {
-        latency = latency * 10 + unsafe { *at.add(count) }.wrapping_sub(b'0') as u64;
-        count += 1;
+unsafe fn parse_digits(at: *const u8, count: usize, escapes: &mut Vec<u32>) -> u32 {
+    let mut latency = 0;
+    // SAFETY: at most the 16 readable bytes at `at` (the caller's contract).
+    for &digit in unsafe { std::slice::from_raw_parts(at, count.min(16)) } {
+        latency = latency * 10 + digit.wrapping_sub(b'0') as u64;
     }
     if latency >= ESCAPE as u64 {
         escapes.push(latency as u32); // exact: latencies fit 32 bits (the spec)
     }
-    (latency.min(ESCAPE as u64) as u32, count)
+    latency.min(ESCAPE as u64) as u32
 }
 
 /// Open-addressing endpoint table shared by the parsing threads: lookups are plain
@@ -642,7 +653,6 @@ const SLOTS: usize = 8 * MAX_ENDPOINTS;
 impl Interner {
     /// The slot an endpoint starts its probe at: its length, its first 8 bytes and
     /// its last 8, two CRC steps. SLOTS is a power of two, so `%` is a mask.
-    #[inline(always)]
     fn home(len: usize, first: u64, last: u64) -> usize {
         // SAFETY: SSE4.2 is enabled for this build.
         unsafe { _mm_crc32_u64(_mm_crc32_u64(len as u64, first), last) as usize % SLOTS }
@@ -657,7 +667,6 @@ impl Interner {
     /// # Safety
     ///
     /// The 8 bytes before `from` and the `len` bytes from it must be readable.
-    #[inline(always)]
     unsafe fn find(&self, bytes: &[__m256i; 2], from: *const u8, len: usize) -> (u32, bool) {
         // SAFETY: AVX2 and SSE4.2 are enabled; `from - 8 .. from + len` is readable
         // (the caller's contract). A published id is below MAX_ENDPOINTS, and its key
@@ -703,12 +712,11 @@ impl Interner {
             let keep = KEEP.as_ptr().cast::<u8>().add(127 - len);
             let key = std::array::from_fn(|i| _mm256_and_si256(line[i], load(keep.add(32 * i))));
             // The same bytes as `find` hashes, from 8 bytes up (under 8 it never finds one).
-            let bytes = key.as_ptr().cast::<u8>();
-            let at = |i: usize| bytes.add(i).cast::<u64>().read_unaligned();
+            let at = |i: usize| key.as_ptr().byte_add(i).cast::<u64>().read_unaligned();
             let mut i = Self::home(len, at(0), at(len.max(8) - 8));
             loop {
                 let id = match self.slots[i].load(Acquire) {
-                    0 => self.add(i, &key, std::slice::from_raw_parts(from, len)),
+                    0 => self.add(&self.slots[i], &key, std::slice::from_raw_parts(from, len)),
                     slot => (slot >> ENDPOINT_SHIFT) as usize,
                 };
                 let known = &*self.keys[id].get();
@@ -722,7 +730,7 @@ impl Interner {
         }
     }
 
-    /// Adds an endpoint not found up to the empty slot `i`, and returns the id that
+    /// Adds an endpoint not found up to the empty `slot`, and returns the id that
     /// slot then holds: if another thread filled it first, its id wins, whether or not
     /// that is this endpoint, and the caller probes on. The id taken here is then not
     /// published (no slot or record holds it), and the thread keeps it for its next
@@ -733,7 +741,7 @@ impl Interner {
     /// printed after the input's pages are released.
     #[cold]
     #[inline(never)]
-    fn add(&self, i: usize, key: &Key, name: &[u8]) -> usize {
+    fn add(&self, slot: &AtomicU32, key: &Key, name: &[u8]) -> usize {
         // An id that lost its slot stays this thread's, for its next insert: at most
         // one id per thread is ever unpublished.
         thread_local!(static SPARE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) });
@@ -744,12 +752,11 @@ impl Interner {
         assert!(id < MAX_ENDPOINTS, "requests.log: too many endpoints");
         // SAFETY: the id is this thread's alone until a slot publishes it.
         unsafe { (*self.keys[id].get(), *self.names[id].get()) = (*key, name.to_vec().leak()) };
-        let won =
-            self.slots[i].compare_exchange(0, (id as u32) << ENDPOINT_SHIFT, Release, Acquire);
+        let won = slot.compare_exchange(0, (id as u32) << ENDPOINT_SHIFT, Release, Acquire);
         if won.is_err() {
             SPARE.set(id);
         }
-        won.map_or_else(|slot| (slot >> ENDPOINT_SHIFT) as usize, |_| id)
+        won.map_or_else(|held| (held >> ENDPOINT_SHIFT) as usize, |_| id)
     }
 }
 
@@ -869,12 +876,10 @@ fn map(at: *mut u8, len: usize, prot: i32, flags: i32, fd: i32) -> *mut u8 {
 /// from the page cache unchanged. It takes a raw pointer (callers pass a slice,
 /// which coerces), so that no reference to the memory is live across the call.
 unsafe fn release<T>(slice: *const [T]) {
-    // SAFETY: `slice` is one allocation (the caller's slice), so its end is in
-    // bounds; madvise only changes how the whole pages inside it are backed, which
-    // the caller allows (see # Safety).
-    unsafe {
-        let start = (slice.cast::<T>() as usize).next_multiple_of(PAGE);
-        let end = slice.cast::<T>().add(slice.len()) as usize / PAGE * PAGE;
-        madvise(start as *mut u8, end.saturating_sub(start), MADV_DONTNEED)
-    };
+    let start = (slice.cast::<T>() as usize).next_multiple_of(PAGE);
+    // SAFETY: `slice` is one allocation (the caller's slice), so its end is in bounds.
+    let end = unsafe { slice.cast::<T>().add(slice.len()) } as usize / PAGE * PAGE;
+    // SAFETY: madvise only changes how the whole pages inside `slice` are backed,
+    // which the caller allows (see # Safety).
+    unsafe { madvise(start as *mut u8, end.saturating_sub(start), MADV_DONTNEED) };
 }
