@@ -51,6 +51,8 @@ const PAD: usize = 256;
 const MIN_LINE: usize = 35;
 /// The longest endpoint the spec allows, in bytes; the parse stops on a longer one.
 const MAX_NAME: usize = 125;
+/// An output line starts with the hour label "YYYY-MM-DDTHH:00:00Z" and a space.
+const LABEL: usize = 21;
 
 fn main() {
     // Transparent huge pages off: with THP set to "always", touching one byte of a
@@ -340,7 +342,7 @@ type Stats = [u32; 6];
 /// the digits of each number, and the LF. 0 for an empty group, which has no line.
 fn line_len(name: &[u8], stat: &Stats) -> usize {
     let digits = |v: u32| v.checked_ilog10().map_or(1, |d| d as usize + 1);
-    let len = 21 + name.len() + stat.iter().map(|&v| 1 + digits(v)).sum::<usize>() + 1;
+    let len = LABEL + name.len() + stat.iter().map(|&v| 1 + digits(v)).sum::<usize>() + 1;
     if stat[0] > 0 { len } else { 0 } // a count of 0: no line
 }
 
@@ -366,10 +368,10 @@ fn write(head: &[u8; 16], name: &[u8], stat: Stats, out: &mut [u8], end: usize) 
     }
     // The 20-byte label (the hour key's 13 bytes "YYYY-MM-DDTHH", then ":00:00Z"), its
     // space, then the name.
-    at -= 21 + name.len();
+    at -= LABEL + name.len();
     out[at..at + 13].copy_from_slice(&head[..13]);
-    out[at + 13..at + 21].copy_from_slice(b":00:00Z ");
-    out[at + 21..at + 21 + name.len()].copy_from_slice(name);
+    out[at + 13..at + LABEL].copy_from_slice(b":00:00Z ");
+    out[at + LABEL..at + LABEL + name.len()].copy_from_slice(name);
     at
 }
 
@@ -678,24 +680,32 @@ impl Interner {
     }
 
     /// Adds an endpoint not found up to the empty slot `i`, and returns the id that
-    /// slot then holds: if another thread filled it first, its id wins. Whether or not
-    /// that is this endpoint, the id taken here is then never in a record: its key and
-    /// name are written, but no slot holds it, so its groups stay empty and print
-    /// nothing. Running out of ids stops the program rather than writing a wrong
-    /// record. A lost id needs two threads to find one slot empty between the load
-    /// and this CAS. The spare room is 2,047 - 1,842 = 205 ids, and at most 13 were
-    /// lost in 100 runs on the full seed at 12 threads (10 at 16; test server, before
-    /// the pair parse): a measured margin, not a bound. The bytes are copied: they
-    /// are compared and printed after the input's pages are released.
+    /// slot then holds: if another thread filled it first, its id wins, whether or not
+    /// that is this endpoint, and the caller probes on. The id taken here is then not
+    /// published (no slot or record holds it), and the thread keeps it for its next
+    /// insert, which overwrites its key and name. So at most one id per thread is ever
+    /// unpublished: 1,842 endpoints and 12 threads need 1,854 of the 2,047 ids, and
+    /// running out of ids (more endpoints than the spec allows) stops the program
+    /// rather than writing a wrong record. The bytes are copied: they are compared and
+    /// printed after the input's pages are released.
     #[cold]
     #[inline(never)]
     fn add(&self, i: usize, key: &Key, name: &[u8]) -> usize {
-        let id = self.count.fetch_add(1, Relaxed) + 1;
+        // An id that lost its slot stays this thread's, for its next insert: at most
+        // one id per thread is ever unpublished.
+        thread_local!(static SPARE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) });
+        let id = match SPARE.take() {
+            0 => self.count.fetch_add(1, Relaxed) + 1,
+            spare => spare,
+        };
         assert!(id < MAX_ENDPOINTS, "requests.log: too many endpoints");
         // SAFETY: the id is this thread's alone until a slot publishes it.
         unsafe { (*self.keys[id].get(), *self.names[id].get()) = (*key, name.to_vec().leak()) };
         let won =
             self.slots[i].compare_exchange(0, (id as u32) << ENDPOINT_SHIFT, Release, Acquire);
+        if won.is_err() {
+            SPARE.set(id);
+        }
         won.map_or_else(|slot| (slot >> ENDPOINT_SHIFT) as usize, |_| id)
     }
 }
