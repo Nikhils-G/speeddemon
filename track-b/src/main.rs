@@ -1492,7 +1492,7 @@ const SAMPLE_BYTES: usize = 1 << 20;
 /// summed over the terms) is evaluated in every superblock: one evaluation then
 /// covers four blocks. (0.125 and 0.5 were measured slower; 512-document
 /// superblocks were 6.5 ms slower on the scoring box.)
-const ALWAYS: f64 = 0.30;
+const ALWAYS: f64 = 0.25;
 /// Documents per superblock: four blocks of 64.
 const SUPER: u32 = 256;
 /// A thread's sum of matching ids is packed under its count in one u64.
@@ -2610,7 +2610,13 @@ impl<'a> Scan<'a> {
     fn end_super(&mut self, base: u32) {
         let Some(plan) = self.plan else { return };
         let wide = self.wide.as_ptr() as *const __m256i;
-        for entry in &plan.always {
+        for (k, entry) in plan.always.iter().enumerate() {
+            // The rows of the entry 4 on are random reads: fetched now, all six
+            // (padded with the all-ones row), so the count is fixed. A row is 32
+            // bytes, so shifting a term word by 5 also drops its op bits.
+            // SAFETY: the index is clamped to the last entry.
+            let ahead = unsafe { plan.always.get_unchecked((k + 4).min(plan.always.len() - 1)) };
+            ahead.terms.iter().for_each(|&word| prefetch(wide.cast::<u8>(), (word << 5) as usize));
             let terms = &entry.terms[..entry.len as usize];
             // SAFETY: 32-byte loads of rows, which are 32-byte aligned (Row is
             // repr(align(32))); the terms of `always` entries are rows below
