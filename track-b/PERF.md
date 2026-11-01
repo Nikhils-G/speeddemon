@@ -40,7 +40,7 @@ box, so no decision rests on one run.
 | 29 | 7fc8af9 | Fewer lines with the hot loops unchanged (Rust 864 → 778 code lines, the token and LF masks from one load; test server −1.3%), and the PGO training run with LLVM's atomic profile counters (fb34663, all tracks) | run-59b2e0a8fdd5 | 0.1353 | | 789 | 75.44 |
 | 30 | 31cbd48 | Query parsing relies on the spec's query grammar (2.3) instead of re-checking it; malformed lines still abort on a slice bound. Neutral on the test server | run-ff1d9b72da23 | 0.1338 | 39.21 | 781 | 75.60 |
 | 31 | 776e1dc | A perfect hash of the query terms instead of the 4-way bucket table (README, design 2): two AES rounds as the hash, one 16-byte slot per term, a branch-free probe, built on 12 threads. Test server −8.4%, 12-thread cycles −11%; box −10.4%. Rerun run-6471e474f20a: 0.1231 s, 39.55 MB, 76.35 | run-4a28a650e9ac | 0.1199 | 39.62 | 818 | 76.64 |
-| 32 | (this) | Fewer lines in cold code only: the hot functions compile to the same instructions as step 31's. Test server: two PGO builds 84.96 and 85.28 ms (median of 31 runs, mean of 3 interleaved rounds) against step 31's three builds 85.98, 85.25 and 85.96 | RUN-ID-PENDING | | | 796 | |
+| 32 | bdf6d27 | Fewer lines in cold code only: the hot functions compile to the same instructions as step 31's. Test server: two PGO builds 84.96 and 85.28 ms (median of 31 runs, mean of 3 interleaved rounds) against step 31's three builds 85.98, 85.25 and 85.96 | run-0741f63811ab | 0.1205 | 39.67 | 796 | 76.67 |
 
 Step 32 is the current code. S is the harness's `static_axes.py` count, which matches the board for
 every run where the board's S was logged. M is blank where it was not logged. Points marked * are
