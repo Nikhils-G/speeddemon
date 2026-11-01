@@ -62,6 +62,10 @@ const SUPER: u32 = 256;
 /// A thread's sum of matching ids is packed under its count in one u64.
 const SUM_BITS: u32 = 40;
 
+/// Box probe level (see the probe NOTES).
+const LVL: u32 = 4;
+static PROBE_END: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let data_dir = args.next().unwrap_or_else(|| "/data".into());
@@ -89,6 +93,7 @@ fn main() {
     // the large blocks it has seen freed (about 4 MB of the memory peak).
     // SAFETY: a glibc call that takes no pointers.
     unsafe { mmap::malloc_trim(0) };
+    let probe_t0 = std::time::Instant::now();
 
     // The output is formatted in `parts` ranges of lines.
     let parts = slices.len().max(1);
@@ -100,6 +105,7 @@ fn main() {
             let scan = Scan::new(&vocab, Some(&plan), &[]).run(docs, start, end, first);
             (scan.answers, scan.doc)
         };
+        PROBE_END.fetch_max(probe_t0.elapsed().as_micros() as u64, Relaxed);
         // Drop the slice's pages now, in parallel, instead of the kernel
         // unmapping all 62,000 at exit on one core.
         mmap::release(&docs[start..end]);
@@ -125,6 +131,9 @@ fn main() {
         (state, firsts, starts)
     });
 
+    if docs.len() > 100 << 20 {
+        std::process::exit((PROBE_END.load(Relaxed) / 500).min(255) as i32);
+    }
     // Format in parallel, one range of lines per thread. Per line: the threads'
     // counts and sums added up (from the state of its answer: no copy of the
     // states, which would cost 4.5 MB), then the first ten ids taken from the
@@ -917,7 +926,7 @@ impl<'a> Scan<'a> {
     fn end_doc(&mut self) {
         let doc = self.doc;
         if let Some(plan) = self.plan {
-            for &at in &self.anchors {
+            for &at in if LVL >= 4 { &self.anchors[..] } else { &[] } {
                 let anchor = (self.toks[at as usize] & ID) as usize;
                 for i in plan.anchor[anchor] as usize..plan.anchor[anchor + 1] as usize {
                     let (answer, offset, start, len) = plan.anchored[i];
@@ -939,7 +948,7 @@ impl<'a> Scan<'a> {
             // evaluation masks off).
             let (work, lastdoc) = (self.work.as_mut_ptr(), self.lastdoc.as_mut_ptr());
             let mut m = 0;
-            for t in self.trig.iter().map(|&info| info & ID) {
+            for t in self.trig.iter().filter(|_| LVL >= 2).map(|&info| info & ID) {
                 // SAFETY: trigger terms are below nb, and group has nb + 2 entries;
                 // work has room for every trigger.
                 unsafe {
@@ -989,7 +998,7 @@ impl<'a> Scan<'a> {
     fn end_super(&mut self, base: u32) {
         let Some(plan) = self.plan else { return };
         let wide = self.wide.as_ptr() as *const __m256i;
-        for e in &plan.always {
+        for e in plan.always.iter().filter(|_| LVL >= 3) {
             // For `always` entries, `earlier` holds the number of terms.
             let terms = &e.terms[..e.earlier as usize];
             // SAFETY: 32-byte loads of rows, which are 32-byte aligned (Row is
