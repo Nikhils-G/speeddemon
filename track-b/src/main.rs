@@ -839,8 +839,7 @@ impl<'a> Scan<'a> {
     /// evaluation has no branch: whether a query matches is too random to predict.
     fn end_block(&mut self, base: u32) {
         let w = &mut self.w;
-        // PROBE: no BOOL evaluation.
-        if let Some(plan) = self.plan.filter(|_| false) {
+        if let Some(plan) = self.plan {
             // Two passes, so that the cold lines of an evaluation are fetched
             // well before it. The first keeps the entry ranges of the touched
             // slots that trigger any (about a third) and fetches their first
@@ -906,9 +905,6 @@ impl<'a> Scan<'a> {
     /// Evaluates the `always` queries on the superblock of 256 documents from
     /// `base`, like `end_block` but on four words at once, then clears it.
     fn end_super(&mut self, base: u32) {
-        if std::hint::black_box(true) {
-            return; // PROBE: no BOOL evaluation.
-        }
         let Some(plan) = self.plan else { return };
         let wide = self.wide.as_ptr() as *const __m256i;
         for e in &plan.always {
