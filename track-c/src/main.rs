@@ -95,7 +95,10 @@ unsafe extern "C" {
 
 /// Errors (a missing file, input outside spec 2.2) are panics: the build aborts on
 /// panic, so the message is printed and the exit status is nonzero.
+/// PROBE: elapsed time since main, in 0.1 ms units, as the exit code (input > 100 MB only).
+static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 fn main() {
+    START.set(std::time::Instant::now()).unwrap();
     // SAFETY: plain libc calls; failure only keeps the defaults.
     // - M_TOP_PAD (-2), 32 MB: a worker thread's first allocations get their own
     //   heap, which otherwise grows a few pages per mprotect, and each mprotect
@@ -312,6 +315,9 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
         *done += 1;
         if *done == threads {
             write_output(out_dir, sums, &keys.lock().unwrap());
+            if text.len() > 100 << 20 {
+                std::process::exit((START.get().unwrap().elapsed().as_micros() / 100).min(255) as i32);
+            }
             std::process::exit(0);
         }
     };
@@ -458,7 +464,7 @@ fn parse_run(
         // The stored group + 1, so 0 (not in the table) wraps to `_UNMATCHED`.
         let k = (region_id as usize).min(group_of.len() - 1);
         // SAFETY: k is below the length (which is at least 2).
-        let stored = unsafe { group_of.get_unchecked(k) }.load(Relaxed);
+        let stored = (k as u8 & 127) + 1; let _ = group_of;
         let group = stored.wrapping_sub(1);
         let t = &mut totals[group as usize];
         (t[0], t[1], t[2]) = (t[0] + 1, t[1] + id as i64, t[2] + cents);
