@@ -37,12 +37,17 @@ box, so no decision rests on one run.
 | 26 | 9a61acf | Fewer lines in setup and the result gather. M 44.09 is just over the 44 MB credit; a later run of the same code (387ebb3, ID not logged) gave 0.1420 s and 43.8 MB. The cause, found in step 28: step 23's formatter copied every thread's state into line order, about 4.5 MB | run-d00be2692c6c | 0.1389 | 44.09 | 844 | 74.93 |
 | 27 | 368aa64 | **Reverted** (387ebb3). PGO training on one thread (`taskset -c 0`), so that builds are repeatable: two local builds then differed by 5 KB instead of 1.1 MB. The board's builder may not use CPU 0, so the Docker build failed on every track and there is no scored run | | | | 844 | |
 | 28 | 841e809 | The block end in two passes (README, design 3): ranges gathered and prefetched first, then words and state fetched 4 ranges ahead of the evaluation (test server −4.5 to −5.7%); the formatter reads each thread's state through `answer_of` instead of a copy (M back to 39 MB). Rerun on 2515d02, run-65497002e714: 0.1381 s, 38.68 MB, 74.88 | run-3814466b62c2 | 0.1374 | 39.22 | 875 | 74.94 |
+| 29 | 7fc8af9 | Fewer lines with the hot loops unchanged (Rust 864 → 778 code lines, the token and LF masks from one load; test server −1.3%), and the PGO training run with LLVM's atomic profile counters (fb34663, all tracks) | run-59b2e0a8fdd5 | 0.1353 | | 789 | 75.44 |
+| 30 | 31cbd48 | Query parsing relies on the spec's query grammar (2.3) instead of re-checking it; malformed lines still abort on a slice bound. Neutral on the test server | run-ff1d9b72da23 | 0.1338 | 39.21 | 781 | 75.60 |
+| 31 | 776e1dc | A perfect hash of the query terms instead of the 4-way bucket table (README, design 2): two AES rounds as the hash, one 16-byte slot per term, a branch-free probe, built on 12 threads. Test server −8.4%, 12-thread cycles −11%; box −10.4%. Rerun run-6471e474f20a: 0.1231 s, 39.55 MB, 76.35 | run-4a28a650e9ac | 0.1199 | 39.62 | 818 | 76.64 |
+| 32 | (this) | Fewer lines in cold code only: the hot functions compile to the same instructions as step 31's. Test server: two PGO builds 84.96 and 85.28 ms (median of 31 runs, mean of 3 interleaved rounds) against step 31's three builds 85.98, 85.25 and 85.96 | RUN-ID-PENDING | | | 796 | |
 
-Step 28 is the current code. S is the harness's `static_axes.py` count, which matches the board for
+Step 32 is the current code. S is the harness's `static_axes.py` count, which matches the board for
 every run where the board's S was logged. M is blank where it was not logged. Points marked * are
 computed from T and S with the board's formula: every M logged since step 6 is under the 44 MB cap
 (26.8 to 41.7 MB) except step 26's 44.09 MB, which costs 0.01 points, and the formula reproduces every
-logged point value to within 0.01. Steps 24 and 27 are the round's reverted experiments; step 23 was
+logged point value to within 0.01. M is blank for step 29 because runs.log did not record it.
+Steps 24 and 27 are the round's reverted experiments; step 23 was
 kept because its server gain was clear and the box did not show it slower than step 22 once
 step 24 ran without the disturbance.
 
@@ -114,6 +119,26 @@ step 24 ran without the disturbance.
   0.1381 s against step 26's 0.1389 and 0.1420, and M fell back to 39 MB, for 31 more lines. What the
   box rewarded in this whole round was more parallel setup (steps 15–16) and fewer stalls on random
   loads (steps 20, 28), not cuts of instructions (steps 18–19) or of L2 misses (steps 23–24).
+- **Step 29: atomic profile counters.** With non-atomic counters the twelve-thread training run lost
+  updates, so every build had a different profile. LLVM's `-instrprof-atomic-counter-update-all`
+  fixed that without step 27's CPU pinning, and the board's builder accepted it.
+- **Step 31: the lookup was still a stall, so one probe beat four compares.** The bucket table
+  compared a token with four keys of a 64-byte bucket, and a full bucket continued into the next. A
+  perfect hash gives every term one 16-byte slot, so the probe is one load, one XOR, one `vptest`
+  and one `cmov`, and a token no query uses is turned away by the same single probe. The hash costs
+  three instructions (two `aesenc` and a move) where the CRC cost one, and it still won: test
+  server −8.4%, box 0.1338 → 0.1199 s (−10.4%), the largest single gain since step 20. The build
+  runs on twelve threads because pilots of 1 mod 64 give each hash group its own region of the
+  table, so setup stays parallel (steps 15–16).
+- **Step 32: a speed check of a line cut has to look at the code, not only the clock.** The cut
+  changes only setup, parsing and formatting; the scan, block end, superblock and answer functions
+  are instruction for instruction the same as step 31's, in both the PGO and the plain build. The
+  clock alone could not show that: two PGO builds of one source (a partial cut) ran 84.9 and 88.3 ms
+  on the test server, with the same hot instructions at the same addresses and the same instruction
+  count (5.239G), only 1.6% more cycles; they differed in where cold code, data and thread-local
+  storage landed. A plain build of the final cut ran 3.4% slower than a plain build of step 31, also
+  with identical hot instructions, while its PGO builds tied. The cut was taken on the identical hot
+  code and the PGO tie, and the board run is the check.
 - **A measurement bug**: some test-server A/B comparisons after step 11 compared a stale binary,
   because copied source files kept older modification times and cargo did not rebuild. It was found
   and fixed; every keep-or-revert decision above rests on board runs, not on those comparisons.
@@ -136,7 +161,9 @@ Board-measured reverts are in the table above (steps 11, 12, 14, 24 and 27). The
 | Prefetching the entries' `w` words at the block end | cycles 2.45G → 2.55G |
 | Branching around a zero evaluation result | cycles 2.76G → 2.82G |
 | Profile-guided build trained on the full scale instead of the sample | neutral on the test server, not pushed |
-| Single-thread PGO training (step 27) pinned to the first allowed CPU instead of CPU 0, or LLVM's atomic profile counters | not yet tried: either should make builds repeatable without breaking the board's builder |
+| Single-thread PGO training (step 27) pinned to the first allowed CPU instead of CPU 0 | not tried: the atomic profile counters of step 29 made the profiles repeatable instead |
+| An intermediate version of step 32 (S 802, hot code identical too) | test server +1.1% against step 31 in one session (two builds each, 3 rounds of 21 runs) and +0.35% in the next; its PGO builds also moved `end_block` 16 bytes off step 31's 64-byte alignment. The final set (S 796) moves it too and ties, so the alignment is not the cause; the spread is the build-to-build variance of step 32's note |
+| Bucket count from the distinct terms instead of the term occurrences | not built: at full scale the two give the same 16,384 buckets; it would only spare the tiny inputs their re-seeds (README, design 2) |
 | Document frequencies sampled into 2^16 hashed u16 counters, to overlap the sample with query parsing | simulated on seed 1: hash collisions move queries to the superblock path (5,882 → about 8,530), +138M instructions in total; not built |
 
 ## Correctness checks run before every push
@@ -146,4 +173,10 @@ generated `tiny` seeds against `reference/b_index.py` at 1, 3 and 8 CPUs; advers
 lengths 1, 12, 13, 16, 17, 32, 33 and 70, mixed case, separators, empty and token-less documents,
 repeated and absent terms, a corpus whose size is an exact multiple of 4096); the same output at 1,
 2, 3, 7, 12 and 16 threads; `objdump | grep -c vpinsrb` = 0 on the server build. For steps 8 and 9,
-also a full-scale seed 99 against the official reference.
+also a full-scale seed 99 against the official reference. From step 31 on, the perfect hash's
+failure paths are tested by forcing them: four builds that fail seed 0 outright, fail seeds 0 to 2
+(so seed 3 doubles the table), mask seed 0's hash to 20 bits (two different keys with one hash) and
+offer seed 0's buckets a single pilot (no free pilot); each must give the reference output on the
+full, sample, holdout, tiny and adversarial inputs at 1 and 8 CPUs, and each did. Seed 0 succeeds on the full and sample inputs; the tiny
+inputs re-seed, usually up to seed 3 (README, design 2), so every gate run also exercises the
+re-seed and doubling path.

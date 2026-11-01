@@ -27,8 +27,10 @@ use std::cmp::Reverse;
 use std::mem::{replace, transmute};
 use std::sync::atomic::{AtomicU16, AtomicU32, Ordering::Relaxed};
 
-#[cfg(not(all(target_feature = "avx2", target_feature = "bmi2", target_feature = "aes")))]
-compile_error!("track-b needs AVX2, BMI2 and AES-NI: build with RUSTFLAGS=\"-C target-cpu=native\"");
+#[cfg(not(all(target_feature = "avx2", target_feature = "bmi2")))]
+compile_error!("track-b needs AVX2 and BMI2: build with RUSTFLAGS=\"-C target-cpu=native\"");
+#[cfg(not(target_feature = "aes"))]
+compile_error!("track-b needs AES-NI: build with RUSTFLAGS=\"-C target-cpu=native\"");
 
 /// A token's info word: its term id, plus ANCHOR if a phrase is anchored on it.
 /// A token that no query uses gets MISS.
@@ -108,26 +110,22 @@ fn main() {
     let parts = slices.len().max(1);
     let chunks = par(parts, &|p| {
         let lines = part(plan.answer_of.len(), p, parts);
-        let (mut out, mut fields) = (Vec::with_capacity(lines.len() * 32), Vec::new());
+        let (mut out, mut row) = (Vec::with_capacity(lines.len() * 32), Vec::new());
         let first = |log: &Vec<u64>| log.partition_point(|&e| e >> 32 < lines.start as u64);
         let mut cursors: Vec<usize> = results.iter().map(|r| first(&r.1)).collect();
         for line in lines {
-            let s: u64 = results
-                .iter()
-                .map(|r| r.0[plan.answer_of[line] as usize])
-                .sum();
-            fields.clear();
-            fields.extend([s >> SUM_BITS, s & ((1 << SUM_BITS) - 1)]);
+            let answer = plan.answer_of[line] as usize;
+            let s: u64 = results.iter().map(|r| r.0[answer]).sum();
+            // The output row: count, sum, then the threads' first ids (12 fields at most).
+            row.clear();
+            row.extend([s >> SUM_BITS, s & ((1 << SUM_BITS) - 1)]);
             for ((_, log), cursor) in results.iter().zip(&mut cursors) {
                 while let Some(&entry) = log.get(*cursor).filter(|&&e| e >> 32 == line as u64) {
-                    fields.push(entry & u32::MAX as u64);
+                    row.push(entry & u32::MAX as u64);
                     *cursor += 1;
                 }
             }
-            for &value in fields.iter().take(12) {
-                push_decimal(&mut out, value);
-                out.push(b' ');
-            }
+            row.iter().take(12).for_each(|&v| push_decimal(&mut out, v));
             *out.last_mut().unwrap() = b'\n';
         }
         out
@@ -165,12 +163,14 @@ type Queries = (Vec<(u32, u32, bool)>, Vec<u32>);
 /// and the long terms. (The long terms' zero key then gets an id that no term
 /// uses: harmless.)
 fn split_lines(chunk: &'static [u8], padded: &'static [u8], seed: u64) -> Split {
-    let (mut lines, mut terms, mut short, mut long) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut lines, mut terms, mut short, mut long) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     // Every line is a query of the spec's grammar (2.3) and ends with LF.
     for line in chunk.split_inclusive(|&b| b == b'\n') {
         let (start, phrase) = (terms.len(), line[0] == b'P');
         // The words after `BOOL ` or `PHRASE "`, before LF or `"` and LF.
-        let words = if phrase { &line[8..line.len() - 2] } else { &line[5..line.len() - 1] };
+        let (from, to) = if phrase { (8, 2) } else { (5, 1) };
+        let words = &line[from..line.len() - to];
         let mut op = if phrase { 0 } else { OR };
         for (i, word) in words.split(|&b| b == b' ').enumerate() {
             if phrase || i % 2 == 0 {
@@ -180,8 +180,7 @@ fn split_lines(chunk: &'static [u8], padded: &'static [u8], seed: u64) -> Split 
                 terms.push((word, key, op << 30));
                 long.extend((word.len() > KEY).then_some(word));
                 // SAFETY: __m128i and u128 have the same size, and any bits are valid.
-                let bits = unsafe { transmute::<__m128i, u128>(key) };
-                short.push((hash(key, seed), bits));
+                short.push((hash(key, seed), unsafe { transmute::<__m128i, u128>(key) }));
             } else {
                 op = match word[0] {
                     b'A' => AND,
@@ -202,13 +201,12 @@ type Term = (&'static [u8], __m128i, u32);
 /// A key's hash and its bytes.
 type Key = (u64, u128);
 
-
-
 /// Splits the lines in parallel, then gives the terms ids: their slots in the
 /// perfect hash. `padded` is the file and mmap::PAD zero bytes.
 fn parse_queries(padded: &'static [u8], threads: usize) -> (Queries, Vocab) {
     let text = &padded[..padded.len() - mmap::PAD];
-    let cut = |p: usize| cut(text, p, threads);
+    // The start of the p-th of `threads` ranges of whole lines.
+    let cut = |p: usize| line_after(text, text.len() * p / threads);
     let chunk = |p| &text[cut(p)..cut(p + 1)];
     let split = |seed| par(threads, &|p| split_lines(chunk(p), padded, seed));
     let (vocab, ids, splits) = (0..).find_map(|s| Vocab::new(split(s), s)).unwrap();
@@ -264,7 +262,8 @@ fn key_at(bytes: &[u8], at: usize, len: usize) -> __m128i {
 fn hash(key: __m128i, seed: u64) -> u64 {
     let first = 0x243f6a8885a308d3_13198a2e03707344 ^ seed as u128;
     // SAFETY: u128 and __m128i have the same size, and any bits are valid.
-    let [a, b]: [__m128i; 2] = unsafe { transmute([first, 0x24093822299f31d0_082efa98ec4e6c89u128]) };
+    let [a, b]: [__m128i; 2] =
+        unsafe { transmute([first, 0x24093822299f31d0_082efa98ec4e6c89u128]) };
     // SAFETY: AES-NI and SSE2 are enabled for the whole build (checked above).
     unsafe { _mm_cvtsi128_si64(_mm_aesenc_si128(_mm_aesenc_si128(key, a), b)) as u64 }
 }
@@ -408,7 +407,12 @@ impl Vocab {
             let id = |&(t, key, op): &Term| op | long.get(t).copied().unwrap_or_else(|| info(key));
             placed.then(|| splits[q].1.iter().map(id).collect())
         });
-        let vocab = Vocab { phf, table, long, count: count as u32 };
+        let vocab = Vocab {
+            phf,
+            table,
+            long,
+            count: count as u32,
+        };
         Some((vocab, ids.into_iter().collect::<Option<_>>()?, splits))
     }
 
@@ -416,8 +420,7 @@ impl Vocab {
     fn finish(&mut self, plan: &Plan) {
         // Empty slots have info 0 too: harmless, their key matches no token.
         // The last slot keeps MISS.
-        let n = self.table.len() - 1;
-        for s in &mut self.table[..n] {
+        for s in self.table.split_last_mut().unwrap().1 {
             *s = *s & ((1 << 96) - 1) | (plan.info[(*s >> 96) as usize] as u128) << 96;
         }
     }
@@ -733,10 +736,7 @@ impl<'a> Scan<'a> {
                 let p = at + b as usize;
                 let id = parse_id(&docs[p..p + len]);
                 let ok = docs[p + len] == b'\t' && id == self.doc.wrapping_add(1);
-                assert!(
-                    ok,
-                    "docs.txt: ids must be 0, 1, 2, ... in order, each before a TAB"
-                );
+                assert!(ok, "docs.txt: ids must be 0, 1, 2, ..., each before a TAB");
                 // End the current document at the id token of the next one.
                 self.look_up(bit);
                 self.end_doc();
@@ -1088,7 +1088,8 @@ fn movemask(v: __m256i) -> u32 {
 /// Returns (start, end, first id) per slice.
 fn slices(text: &[u8], parts: usize) -> Vec<(usize, usize, u32)> {
     // The cuts from 0 to text.len(), without repeats: slices are never empty.
-    let mut cuts: Vec<usize> = (0..=parts).map(|p| cut(text, p, parts)).collect();
+    let cut = |p: usize| line_after(text, text.len() * p / parts);
+    let mut cuts: Vec<usize> = (0..=parts).map(cut).collect();
     cuts.dedup();
     let id = |at: usize| {
         let tab = text[at..].iter().position(|&b| b == b'\t');
@@ -1097,21 +1098,13 @@ fn slices(text: &[u8], parts: usize) -> Vec<(usize, usize, u32)> {
     cuts.windows(2).map(|c| (c[0], c[1], id(c[0]))).collect()
 }
 
-/// The start of the p-th of `parts` ranges of whole lines of `text`.
-fn cut(text: &[u8], p: usize, parts: usize) -> usize {
-    line_after(text, text.len() * p / parts)
-}
-
 /// The start of the line after the one that holds byte `at`, or the end of
 /// `text`; 0 for `at` = 0, so that splitting at these offsets keeps line 0.
 fn line_after(text: &[u8], at: usize) -> usize {
     let at = at.min(text.len());
     let next = text[at..].iter().position(|&b| b == b'\n');
-    if at == 0 {
-        0
-    } else {
-        next.map_or(text.len(), |i| at + i + 1)
-    }
+    let next = next.map_or(text.len(), |i| at + i + 1);
+    if at == 0 { 0 } else { next }
 }
 
 fn parse_id(digits: &[u8]) -> u32 {
@@ -1120,10 +1113,11 @@ fn parse_id(digits: &[u8]) -> u32 {
     digits.iter().fold(0, |n, &b| n * 10 + (b - b'0') as u32)
 }
 
+/// Appends `value` in decimal, then a space.
 fn push_decimal(out: &mut Vec<u8>, mut value: u64) {
     let digits = value.checked_ilog10().unwrap_or(0) as usize + 1;
-    out.resize(out.len() + digits, 0);
-    for digit in out.iter_mut().rev().take(digits) {
+    out.resize(out.len() + digits + 1, b' ');
+    for digit in out.iter_mut().rev().skip(1).take(digits) {
         *digit = b'0' + (value % 10) as u8;
         value /= 10;
     }
