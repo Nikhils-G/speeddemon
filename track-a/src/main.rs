@@ -58,6 +58,17 @@ const MAX_NAME: usize = 125;
 const LABEL: usize = 21;
 
 fn main() {
+    // The phases, in order:
+    // 1. map the log;
+    // 2. start one pool of threads, which runs both passes;
+    // 3. pass 1, in each thread: parse slices of the log into packed records;
+    // 4. the merge, on this thread meanwhile: the hours as soon as the last slice is
+    //    in, then the endpoints' byte order and the output mapping;
+    // 5. pass 2, in each thread: per hour, group the records by endpoint, compute
+    //    the statistics, and write each hour once the earlier ones have lengths;
+    // 6. teardown: each thread drops a share of the output's page-table entries,
+    //    then this thread cuts the file to its length and exits.
+    //
     // Transparent huge pages off: with THP set to "always", touching one byte of a
     // sparse, lazily zeroed table can fault in a whole 2 MB page, so the memory
     // peak would depend on how fragmented the host is that run.
@@ -76,6 +87,7 @@ fn main() {
     let len @ 1.. = input.metadata().expect("stat the log").len() as usize else {
         return; // the spec's empty input gives an empty summary
     };
+    // 1. Map the log.
     // The log followed by PAD zero bytes: the whole range is reserved as zero
     // pages, then the file is mapped over its start (the rest of the file's last
     // page reads as zero). The dataset is mounted read-only, so the bytes cannot
@@ -90,6 +102,7 @@ fn main() {
     // stay mapped until the parse is over; `log` is not used after that (see munmap).
     let log: &[u8] = unsafe { std::slice::from_raw_parts(base, len) };
 
+    // 2. The pool, and what pass 1 needs.
     // Pass 1, parallel: the threads parse slices of the log, cut at line ends, into
     // packed records, with one endpoint table shared by all threads. Cut p is just
     // after the last LF before byte len * p / slices (0 if there is none; the last
@@ -130,6 +143,7 @@ fn main() {
     thread::scope(|s| {
         for _ in 0..threads {
             s.spawn(|| {
+                // 3. Pass 1.
                 // This thread's records, each part taking the start of what is left.
                 // Room for every line of the log, allocated zeroed: only the pages
                 // written are ever backed by memory. One mapping per thread, not per
@@ -149,6 +163,7 @@ fn main() {
                     // loop above.)
                     let _ = (parts[p].set(a), parts[p + 1].set(b));
                 }
+                // 5. Pass 2, once the merge has handed over the hours.
                 let (hours, lens) = merged.wait();
                 let ids = table.count.load(Relaxed); // the endpoints' ids are 1..=ids
                 // Where an hour's output starts, once the lengths of all earlier hours are known.
@@ -262,6 +277,7 @@ fn main() {
                 let last = pending.iter().map(|p| p.0).max().unwrap_or(0);
                 lens[..last].iter().for_each(|n| _ = n.wait());
                 flush(&mut pending);
+                // 6. Teardown.
                 // Once every thread is here the output is written: each then drops the
                 // page-table entries of a share of its mapping (the pages stay in the
                 // file), which the exit would do for all of it on one core (0.6 ms on
@@ -278,6 +294,7 @@ fn main() {
             });
         }
 
+        // 4. The merge.
         // The merge, on this thread: the hours as soon as the last part is in (`merge`
         // waits for each), then, while pass 2 places the first hours' values, the
         // endpoints' order and the output mapping. Each is set once, here: it cannot fail.
