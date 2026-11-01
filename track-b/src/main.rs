@@ -161,6 +161,9 @@ fn format_part(plan: &Plan, results: &[(Vec<u64>, Vec<u64>)], p: usize, parts: u
     let first = |log: &Vec<u64>| log.partition_point(|&e| e >> 32 < lines.start as u64);
     let mut cursors: Vec<usize> = results.iter().map(|(_, log)| first(log)).collect();
     for line in lines {
+        // The threads' states of the line 8 ahead: they are random reads.
+        let ahead = plan.answer_of.get(line + 8).map_or(0, |&a| a as usize);
+        results.iter().for_each(|(state, _)| prefetch(state.as_ptr(), ahead));
         let answer = plan.answer_of[line] as usize;
         let s: u64 = results.iter().map(|(state, _)| state[answer]).sum();
         // The output row: count, sum, then the threads' first ids, 2 + FIRST_IDS
@@ -696,11 +699,18 @@ impl Plan {
         let by_anchor: Vec<_> = out.iter_mut().map(|o| take(&mut o.1)).collect();
         let mut always: Vec<_> = out.iter().flat_map(|o| o.2.iter().copied()).collect();
         let terms: Vec<_> = out.iter().flat_map(|o| o.3.iter().copied()).collect();
-        // By length and operators, so that `end_super` predicts its branches.
-        always.sort_unstable_by_key(|e| (e.earlier_or_len, e.terms.map(|word| word >> 30)));
         let mut plan = Plan::default();
-        (plan.group, plan.entries) = csr(&by_trigger, bool_terms + 1);
-        (plan.anchor, plan.anchored) = csr(&by_anchor, order.len());
+        // The anchors are grouped and the `always` entries sorted on a second
+        // thread, while this one groups the entries.
+        (plan.anchor, plan.anchored) = std::thread::scope(|s| {
+            let anchors = s.spawn(|| {
+                // By length and operators, so that `end_super` predicts its branches.
+                always.sort_unstable_by_key(|e| (e.earlier_or_len, e.terms.map(|word| word >> 30)));
+                csr(&by_anchor, order.len())
+            });
+            (plan.group, plan.entries) = csr(&by_trigger, bool_terms + 1);
+            anchors.join().unwrap()
+        });
         plan.number_answers(&mut always, lines);
         let flag = |id: usize| (plan.anchor[id] != plan.anchor[id + 1]) as u32 * ANCHOR;
         plan.info = rank.iter().map(|&id| id | flag(id as usize)).collect();
