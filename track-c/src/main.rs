@@ -25,8 +25,9 @@
 //! 4. Distinct names per country: a name's identity is its raw inner bytes (inside
 //!    quotes, `""` maps one to one to the unescaped value; an empty name is empty
 //!    whether quoted or not), reduced to a 56-bit hash, of which the name tables
-//!    tell apart 50 bits or more (see `add`); with the spec's 100,000 names the chance
-//!    that two share them is below 1e-7. Parsing only files a (hash,
+//!    tell apart 50 bits at 12 threads, 54 on one (see `add`); with the spec's
+//!    100,000 names the chance that two share them is about 4.4e-6 per dataset at
+//!    12 threads, 2.8e-7 on one. Parsing only files a (hash,
 //!    group) pair under one of 4 partitions per thread picked by the hash. After
 //!    each run it parses, a thread hands its buffers of pairs to their owners'
 //!    inboxes, and its own tables take what waits in its inbox: small tables of
@@ -49,9 +50,12 @@ use std::{sync::Mutex, thread};
 
 /// Each thread parses this many runs, on average: they are claimed as threads go,
 /// so a thread slowed down (another process on its core) parses fewer of them.
-const RUNS_PER_THREAD: usize = 32;
-/// Runs are dropped from the mapping in blocks of this many.
-const BLOCK: usize = 4;
+/// Pairs wait in buffers for about a run's time, so the buffers hold half as much
+/// as with 32 runs (memory peak -0.9 to -1.1 MB, +0.2 ms on the server).
+const RUNS_PER_THREAD: usize = 64;
+/// Runs are dropped from the mapping in blocks of this many, about 2 MB: every
+/// call is a round of TLB shootdowns (48 runs in blocks of 4: +0.35 ms).
+const BLOCK: usize = 8;
 /// Names are split by their top hash bits into this many partitions per thread;
 /// a thread's own partitions take their pairs, so their tables stay in its cache.
 const PARTITIONS_PER_THREAD: usize = 4;
@@ -157,10 +161,12 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
     let names = 101_000 / parts;
     let slots = ((names + 8 * names.isqrt()) * 8 / 5).next_power_of_two();
     let rows = slots / 8 * 5 * WORDS;
-    // Pairs per partition in one run, with room to spare (records are about 60
-    // bytes), so that a buffer never grows.
+    // Pairs per partition in one run (records are about 60 bytes), and 2 standard
+    // deviations more. A buffer that overflows grows, and is dropped once emptied.
+    // (Room for nearly every run, 3.4 deviations: 0.3 MB more.)
     let runs = threads * RUNS_PER_THREAD;
-    let capacity = text.len() / (runs * 60 * parts) * 5 / 4 + 16;
+    let mean = text.len() / (runs * 60 * parts);
+    let capacity = mean + 2 * mean.isqrt() + 4;
     let claim = |next: &AtomicUsize, n: usize| Some(next.fetch_add(1, Relaxed)).filter(|&k| k < n);
     // The join table, dense by region id: group + 1, or 0 for ids it does not
     // contain. SAFETY: zero is a valid AtomicU8. Zeroed by calloc, so the pages
@@ -197,14 +203,18 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
     };
     // Each thread's tables (its partitions, w * 4 .. w * 4 + 4), and its inbox:
     // buffers of pairs filed under them that they have not taken yet, 4 at a time
-    // (one per partition, in order), and empty ones to file more in. Buffers are
-    // handed over, not copied (copying them: +1.2 ms).
+    // (one per partition, in order). Buffers are handed over, not copied (copying
+    // them: +1.2 ms). Emptied buffers go to one pool that every filer draws from
+    // (with a pool per owner, buffers sat idle in one while a filer made new ones
+    // for another: 0.3 MB more, up to 2 MB when a thread fell behind).
     let tables: Vec<Mutex<Vec<Table>>> = many(threads);
-    let inboxes: Vec<Mutex<(Vec<Vec<u64>>, Vec<Vec<u64>>)>> = many(threads);
+    let inboxes: Vec<Mutex<Vec<Vec<u64>>>> = many(threads);
+    let empties = Mutex::new(Vec::new());
     // Per block of runs, how many are parsed.
     let parsed: Vec<AtomicUsize> = many(runs / BLOCK);
-    // Each thread's totals.
-    let finished = Mutex::new(Vec::new());
+    // The threads' totals, summed as each one finishes (kept one per thread, with
+    // the Vec's regrowth: 0.2 MB more), and how many have.
+    let finished = Mutex::new((0, [EMPTY; GROUPS]));
     let worker = &|w: usize| {
         let mut totals = [EMPTY; GROUPS];
         // This thread's tables and pair buffers: made here, so they are in its cache.
@@ -213,14 +223,17 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
         let mut pairs: Vec<_> = (0..parts).map(|_| Vec::with_capacity(capacity)).collect();
         // Thread t's tables take the pairs in its inbox, and give the buffers back
         // empty.
-        let mut taken = Vec::new();
+        let (mut taken, mut spare) = (Vec::new(), Vec::new());
         let mut take = |mine: &mut Vec<Table>, t: usize, totals: &mut _| {
-            std::mem::swap(&mut taken, &mut inboxes[t].lock().unwrap().0);
+            std::mem::swap(&mut taken, &mut inboxes[t].lock().unwrap());
             for (k, pairs) in taken.iter_mut().enumerate() {
                 add(&mut mine[k % PARTITIONS_PER_THREAD], pairs, totals);
                 pairs.clear();
             }
-            inboxes[t].lock().unwrap().1.append(&mut taken);
+            // A buffer that grew (the empty name's partition overflows) is dropped,
+            // so that the shared pool's buffers stay small.
+            taken.retain(|pairs| pairs.capacity() == capacity);
+            empties.lock().unwrap().append(&mut taken);
         };
         std::iter::from_fn(|| claim(&next_chunk, REGION_CHUNKS)).for_each(&fill);
         wait(&chunks_done, REGION_CHUNKS);
@@ -235,11 +248,15 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
             let cut = |run| run_start(text, body_start, run, runs);
             let span = (cut(run), cut(run + 1));
             parse_run(text, span, &group_of, &mut totals, &mut pairs);
+            // Empty buffers for the next run's pairs, all at once.
+            let mut pool = empties.lock().unwrap();
+            let n = pool.len().saturating_sub(parts);
+            spare.extend(pool.drain(n..));
+            drop(pool);
             for (t, pairs) in pairs.chunks_mut(PARTITIONS_PER_THREAD).enumerate() {
-                let mut inbox = inboxes[t].lock().unwrap();
-                let (full, empty) = &mut *inbox;
+                let mut full = inboxes[t].lock().unwrap();
                 for pairs in pairs {
-                    let fresh = empty.pop().unwrap_or_else(|| Vec::with_capacity(capacity));
+                    let fresh = spare.pop().unwrap_or_else(|| Vec::with_capacity(capacity));
                     full.push(std::mem::replace(pairs, fresh));
                 }
                 // A thread that falls behind (it lost its core) would let its inbox,
@@ -248,7 +265,7 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
                 // thread has not made them.) A thread's own tables take its inbox here,
                 // unless another thread holds them.
                 let behind = full.len() > 16 * threads;
-                drop(inbox);
+                drop(full);
                 if behind
                     && let Ok(mut theirs) = tables[t].try_lock()
                     && !theirs.is_empty()
@@ -287,9 +304,16 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
         // The last thread to finish writes the output and exits, without waiting
         // for the others to exit and without dropping anything.
         let mut finished = finished.lock().unwrap();
-        finished.push(totals);
-        if finished.len() == threads {
-            write_output(out_dir, &finished, &keys.lock().unwrap());
+        let (done, sums) = &mut *finished;
+        for (sum, t) in sums.iter_mut().zip(&totals) {
+            // The columns add up, except the min and the max.
+            let (min, max) = (sum[3].min(t[3]), sum[4].max(t[4]));
+            *sum = std::array::from_fn(|k| sum[k] + t[k]);
+            (sum[3], sum[4]) = (min, max);
+        }
+        *done += 1;
+        if *done == threads {
+            write_output(out_dir, sums, &keys.lock().unwrap());
             std::process::exit(0);
         }
     };
@@ -300,20 +324,15 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
     unreachable!("the last worker exits the process")
 }
 
-/// Writes each group's line, summing the threads' totals.
-fn write_output(dir: &str, parts: &[[Totals; GROUPS]], codes: &[Vec<u8>]) {
+/// Writes each group's line.
+fn write_output(dir: &str, totals: &[Totals; GROUPS], codes: &[Vec<u8>]) {
     // Keys sorted bytewise: the codes, then `_UNMATCHED` ("_" > "Z").
     let mut keys: Vec<_> = codes.iter().cloned().zip(0..).collect();
     keys.push((b"_UNMATCHED".to_vec(), GROUPS - 1));
     keys.sort();
     let mut out = String::new();
     for (key, group) in keys {
-        let [count, ids, sum, min, max, names, bytes] = parts.iter().fold(EMPTY, |t, p| {
-            // The columns add up, except the min and the max.
-            let mut sums: Totals = std::array::from_fn(|k| t[k] + p[group][k]);
-            (sums[3], sums[4]) = (t[3].min(p[group][3]), t[4].max(p[group][4]));
-            sums
-        });
+        let [count, ids, sum, min, max, names, bytes] = totals[group];
         let ([sum, min, max], key) = ([sum, min, max].map(money), String::from_utf8_lossy(&key));
         let (nb, tb) = (bytes >> 32, bytes & 0xFFFF_FFFF); // name and note bytes
         if count > 0 {
@@ -339,8 +358,10 @@ fn add(table: &mut Table, pairs: &[u64], totals: &mut [Totals; GROUPS]) {
     let (keys, seen) = table;
     let (buckets, full) = (keys.len() / 4, keys.len() / 8 * 5 * WORDS);
     // A key's bits 8..24 hold its row (a table holds at most 40,960, as the u16 ids
-    // before). Its 40 hash bits above them and the bucket's 10 or more tell names
-    // apart: with the generator's 100,000 names, two share both with odds below 1e-7.
+    // before). Its 40 hash bits above them and the bucket's bits (10 at 12 threads,
+    // 14 on one; the partition's bits are among the 40) tell names apart: with the
+    // generator's 100,000 names, two share all 50 with odds of about
+    // C(100000, 2) / 2^50 = 4.4e-6 per dataset at 12 threads, 2.8e-7 on one.
     for &pair in pairs {
         let (hash, group) = (pair & !0xFF_FFFF, (pair & 0xFF) as usize);
         // The top hash bits picked the partition; the bits above the group pick a
