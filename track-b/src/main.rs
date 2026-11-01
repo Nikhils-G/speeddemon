@@ -56,6 +56,7 @@ const SUPER: u32 = 256;
 const SUM_BITS: u32 = 40;
 
 fn main() {
+    let t0 = std::time::Instant::now();
     let mut args = std::env::args().skip(1);
     let data_dir = args.next().unwrap_or_else(|| "/data".into());
     let out_dir = args.next().unwrap_or_else(|| "/out".into());
@@ -99,6 +100,10 @@ fn main() {
         assert!(ok, "docs.txt: ids must be 0, 1, 2, ... below 2^20");
         (scan.answers.state, log)
     });
+    // PROBE: the scan's end time in ms as the exit status, on the full corpus only.
+    if docs.len() > 100 << 20 {
+        std::process::exit((t0.elapsed().as_micros() / 1000).min(255) as i32);
+    }
 
     // Format in parallel, one range of lines per thread. Per line: the threads'
     // counts and sums added up (from the state of its answer: no copy of the
@@ -834,7 +839,8 @@ impl<'a> Scan<'a> {
     /// evaluation has no branch: whether a query matches is too random to predict.
     fn end_block(&mut self, base: u32) {
         let w = &mut self.w;
-        if let Some(plan) = self.plan {
+        // PROBE: no BOOL evaluation.
+        if let Some(plan) = self.plan.filter(|_| false) {
             // Two passes, so that the cold lines of an evaluation are fetched
             // well before it. The first keeps the entry ranges of the touched
             // slots that trigger any (about a third) and fetches their first
@@ -900,6 +906,9 @@ impl<'a> Scan<'a> {
     /// Evaluates the `always` queries on the superblock of 256 documents from
     /// `base`, like `end_block` but on four words at once, then clears it.
     fn end_super(&mut self, base: u32) {
+        if std::hint::black_box(true) {
+            return; // PROBE: no BOOL evaluation.
+        }
         let Some(plan) = self.plan else { return };
         let wide = self.wide.as_ptr() as *const __m256i;
         for e in &plan.always {
