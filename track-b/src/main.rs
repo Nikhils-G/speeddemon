@@ -925,7 +925,6 @@ impl Plan {
                     by_anchor.push(phrase);
                     continue;
                 }
-                assert!(words.len() <= 6, "queries.txt: a BOOL of over 6 terms");
                 if always_lines[line] {
                     // end_super reads only the first len terms: the rest stay 0.
                     let mut terms = [0; MAX_BOOL_TERMS];
@@ -943,7 +942,13 @@ impl Plan {
         // Part p's (by_trigger, by_anchor, always) is out[p]. The entries are
         // grouped by their cover term, the phrases by their anchor.
         let mut out = par(parts, &lines_part);
-        let by_trigger: Vec<_> = out.iter_mut().map(|o| take(&mut o.0)).collect();
+        let mut by_trigger: Vec<_> = out.iter_mut().map(|o| take(&mut o.0)).collect();
+        // 8 entries after the last that never match (truth 0), in a group of their
+        // own: `trigger` writes up to 7 indices past a range, and pads its last 8
+        // with the last of them.
+        let mut padding = DocEntry::default();
+        padding.cover = bool_terms as u32;
+        by_trigger.push(vec![padding; 8]);
         let by_anchor: Vec<_> = out.iter_mut().map(|o| take(&mut o.1)).collect();
         let entry_pairs = || by_trigger.iter().flatten().map(|&e| (e.cover, e));
         let anchor = |p: &Phrase| (p.terms[p.offset as usize], *p);
@@ -968,9 +973,6 @@ impl Plan {
         (plan.anchor, plan.anchored) = anchors.into_inner().unwrap();
         let mut always = always.into_inner().unwrap();
         plan.number_answers(&mut always, lines);
-        // 8 entries after the last that never match (truth 0): `trigger` writes up
-        // to 7 indices past a range, and pads its last 8 with the last of them.
-        plan.entries.extend([DocEntry::default(); 8]);
         let trig = |id: usize| id < bool_terms && plan.group[id] != plan.group[id + 1];
         let flag = |id: usize| {
             (plan.anchor[id] != plan.anchor[id + 1]) as u32 * ANCHOR | trig(id) as u32 * TRIG
@@ -1041,6 +1043,7 @@ fn term_order(kind: &[u8], sample_df: &[u32]) -> (Vec<u32>, Vec<u32>) {
 /// only removes matches. Returns the set in an array, its size and its cost (the
 /// sum of its terms' costs, kept as the set changes).
 fn cover(terms: &[u32], cost: impl Fn(u32) -> f64) -> ([u32; MAX_BOOL_TERMS], usize, f64) {
+    assert!(terms.len() <= 6, "queries.txt: a BOOL of over 6 terms");
     let (mut cover, mut n, mut sum) = ([0; MAX_BOOL_TERMS], 0, 0.0);
     for &word in terms {
         let t = word & TERM;
