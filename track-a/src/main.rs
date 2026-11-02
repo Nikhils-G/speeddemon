@@ -552,8 +552,10 @@ unsafe fn parse(chunks: [&[u8]; 2], free: &mut &'static mut [u32]) -> [Part; 2] 
     // go back to the kernel at the end (the caller's contract): their endpoint names
     // were copied (see Interner::add).
     let mut step = |k: usize| unsafe {
-        let (line, end) = (&mut unparsed[k].start, unparsed[k].end);
-        let true = *line < end else { return false }; // slice k is done
+        let line = &mut unparsed[k].start;
+        if *line >= unparsed[k].end {
+            return false; // slice k is done
+        }
         // Lines from one shard arrive in time order, so most lines repeat the
         // previous line's hour. Its bytes "MM-DDTHH" (5..13) decide: every timestamp
         // lies in one 72-hour span (the spec), so lines that share them share the year.
@@ -602,8 +604,7 @@ unsafe fn parse(chunks: [&[u8]; 2], free: &mut &'static mut [u32]) -> [Part; 2] 
             parse_digits(to.add(5), count, &mut escapes[k])
         };
         // The status's first digit is right after the endpoint's space; '5' is 5xx.
-        let error = ((*to.add(1) == b'5') as u32) << ERROR_SHIFT;
-        *record[k] = endpoint | error | latency;
+        *record[k] = endpoint | ((*to.add(1) == b'5') as u32) << ERROR_SHIFT | latency;
         record[k] = record[k].add(1);
         *line = to.add(5 + count + 1);
         true
@@ -820,7 +821,6 @@ impl Interner {
     /// running out of ids (more endpoints than the spec allows) stops the program
     /// rather than writing a wrong record. The bytes are copied: they are compared and
     /// printed after the input's pages are released.
-    #[cold]
     fn add(&self, slot: &AtomicU32, key: &Key, name: &[u8]) -> usize {
         // An id that lost its slot stays this thread's, for its next insert: at most
         // one id per thread is ever unpublished.
