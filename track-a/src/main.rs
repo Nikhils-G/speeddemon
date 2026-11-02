@@ -33,11 +33,17 @@
 //!    all of it is written, the threads drop its page-table entries in parallel, so
 //!    the exit does not.
 
+// The C runtime calls `main` below directly: std's start-up (the main thread's stack
+// guard, found by reading /proc/self/maps, and signal handlers with an alternate signal
+// stack, which every spawned thread then maps too) is not needed, as nothing here
+// recurses deeply. Panics still print their message, then abort (panic = "abort").
+#![no_main]
+
 #[cfg(not(target_feature = "avx2"))]
 compile_error!("track-a needs AVX2: build with RUSTFLAGS=\"-C target-cpu=native\"");
 
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::*};
-use std::{arch::x86_64::*, cell::Cell, fs::File, io::Error, os::fd::AsRawFd, sync::OnceLock};
+use std::{arch::x86_64::*, cell::Cell, fs::File, io::Error, os::fd::AsRawFd, ptr, sync::OnceLock};
 
 /// A record is `endpoint id << 21 | error << 20 | latency`: 11 bits of endpoint id,
 /// bit 20 set for a 5xx status, and 20 bits of latency. A latency of 7 or more digits
@@ -59,7 +65,9 @@ const MAX_NAME: usize = 125;
 /// An output line starts with the hour label "YYYY-MM-DDTHH:00:00Z" and a space.
 const LABEL: usize = 21;
 
-fn main() {
+// SAFETY: the one symbol named `main`, with the C signature the C runtime calls it by.
+#[unsafe(no_mangle)]
+extern "C" fn main(_: i32, _: *const *const u8) -> i32 {
     // The phases, in order:
     // 1. map the log;
     // 2. start one pool of threads, this one included, which runs both passes;
@@ -97,7 +105,7 @@ fn main() {
     let output = options.open(dir(2, "/out") + "/summary.txt");
     let output = output.expect("create the summary");
     let len @ 1.. = input.metadata().expect("stat the log").len() as usize else {
-        return; // the spec's empty input gives an empty summary
+        return 0; // the spec's empty input gives an empty summary
     };
     // 1. Map the log.
     // The log followed by PAD zero bytes: the whole range is reserved as zero
@@ -625,8 +633,7 @@ unsafe fn parse(chunks: [&[u8]; 2], free: &mut &'static mut [u32]) -> [Part; 2] 
     while step(0) | step(1) {}
     // Both slices go back to the kernel in one call (they are adjacent, the caller's
     // contract): every call is a round of TLB shootdowns on the other threads' CPUs.
-    let pair =
-        std::ptr::slice_from_raw_parts(chunks[0].as_ptr(), chunks[0].len() + chunks[1].len());
+    let pair = ptr::slice_from_raw_parts(chunks[0].as_ptr(), chunks[0].len() + chunks[1].len());
     // SAFETY: the slices go back to the kernel (the caller's contract). Only a later
     // `cut` may read their last bytes again, and those fault back in unchanged (see
     // release).
