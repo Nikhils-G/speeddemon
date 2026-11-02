@@ -87,6 +87,9 @@ impl<'a> Scan<'a> {
         // the byte that ended the window before. A window is scanned up to its
         // last byte that is not a token byte (`cut`), so every token it scans
         // ends inside it, and a token's length is the distance to its last byte.
+        // The table and the hash are read once: read in the loop, LLVM loaded them
+        // again after every run of tokens and kept the table's address on the stack.
+        let (vocab, phf, table) = (self.vocab, self.vocab.phf, self.vocab.table.as_ptr());
         let mut at = start;
         let (mut mask, mut lf) = masks(docs, at, end);
         while at < end {
@@ -119,25 +122,26 @@ impl<'a> Scan<'a> {
                 starts ^= text;
                 let buf = self.pending.as_mut_ptr();
                 let mut out = buf.wrapping_add(self.pending.len());
-                let (vocab, phf, table) = (self.vocab, self.vocab.phf, self.vocab.table.as_ptr());
+                // Keys are loaded from the window's start plus b, with no token
+                // offset at + b to add per token.
+                let window = &docs[at..];
                 while text != 0 {
                     let b = text.trailing_zeros() as usize;
                     let e = ends.trailing_zeros() as usize;
                     (text, ends) = (text & (text - 1), ends & (ends - 1));
-                    let p = at + b;
                     // 1 - len, so that the key's KEEP window is a fixed offset from it.
                     let back = b as isize - e as isize;
                     if back > -(KEY as isize) {
-                        // SAFETY: p < end (masks clips the token bits at end), so
-                        // p + 16 <= docs.len() (see # Safety); 1 - back = len <= KEY.
-                        let key = unsafe { key_at(docs, p, (1 - back) as usize) };
+                        // SAFETY: at + b < end (masks clips the token bits at end), so
+                        // b + 16 <= window.len() (see # Safety); 1 - back = len <= KEY.
+                        let key = unsafe { key_at(window, b, (1 - back) as usize) };
                         let off = phf.slot(key) * size_of::<u128>();
                         prefetch(table.cast::<u8>(), off);
                         // SAFETY: `reserve(32)` above made room for this window's tokens.
                         unsafe { out.write((key, off as u64)) };
                     } else {
                         // SAFETY: as above.
-                        unsafe { out.write(vocab.get_long(&docs[p..=p + e - b])) };
+                        unsafe { out.write(vocab.get_long(&window[b..=e])) };
                     }
                     out = out.wrapping_add(1);
                 }
@@ -194,60 +198,84 @@ impl<'a> Scan<'a> {
     }
 
     /// Looks up the tokens of this document, whose bit is `bit`, then records
-    /// their presence. Each step runs over the whole document, so that the memory
-    /// accesses of one step overlap: the slots were fetched when the tokens were
-    /// found. (In the earlier block design, fetching the presence words too cost
-    /// more than it saved, and one loop for both steps was slower.)
+    /// their presence and lists its trigger occurrences and anchors. Each step runs
+    /// over the whole document, so that the memory accesses of one step overlap:
+    /// the slots were fetched when the tokens were found. (In the earlier block
+    /// design, fetching the presence words too cost more than it saved, and one
+    /// loop for the probes and the presence was slower; it still is, by 2.2 ms.)
     fn look_up(&mut self, bit: u64) {
         let (miss, table) = (self.vocab.count, self.vocab.table.as_ptr());
         let (doc, rows) = (self.doc, self.wide.len() / 4 - 1);
         // This document's block in the superblock: its word in each row.
         let block = (doc / 64 % (SUPER / 64)) as usize;
         let wide = self.wide.as_mut_ptr().wrapping_add(block * (rows + 1));
-        // 8 more: end_doc's phrase compares read 8 ids from any token.
-        self.toks.reserve(self.pending.len() + 8);
-        self.trig.reserve(self.pending.len());
-        let (toks, mut len) = (self.toks.as_mut_ptr(), self.toks.len());
-        let (trig, mut nt) = (self.trig.as_mut_ptr(), self.trig.len());
-        self.anchors.reserve(self.pending.len());
-        let (anchors, mut na) = (self.anchors.as_mut_ptr(), self.anchors.len());
+        // 8 more each: end_doc's phrase compares read 8 ids from any token, and the
+        // second step reads 8 ids and stores 8 lanes at a time.
+        let more = self.pending.len() + 8;
+        self.toks.reserve(more);
+        self.trig.reserve(more);
+        self.anchors.reserve(more);
+        let (toks, start) = (self.toks.as_mut_ptr(), self.toks.len());
+        let mut len = start;
         for &(key, off) in &self.pending {
             // SAFETY: off is the byte offset of a slot of the table: Phf::slot gives
             // one below 2^(64 - shift), and get_long a long term's or the last one.
             let info = unsafe { probe(table.byte_add(off as usize), key, miss) };
             // SAFETY: room for every pending token was reserved above.
-            unsafe {
-                // Branch-free: each position is written, and kept if its token is
-                // an anchor (which is too random to predict).
-                anchors.add(na).write(len as u32);
-                toks.add(len).write(info);
-                // Branch-free: every trigger occurrence is kept (end_doc takes
-                // each term once).
-                trig.add(nt).write(info);
-            }
-            nt += (info & TRIG != 0) as usize;
-            na += (info & ANCHOR != 0) as usize;
+            unsafe { toks.add(len).write(info) };
             len += 1;
         }
-        // SAFETY: the first len, nt and na entries are written.
-        unsafe { (self.toks.set_len(len), self.trig.set_len(nt)) };
-        // SAFETY: as above.
-        unsafe { self.anchors.set_len(na) };
-        // SAFETY: room for 8 more ids was reserved: `miss`, which no phrase term has.
+        // Then 8 ids `miss`, which no phrase term has, with no flag, no row and a
+        // stamp no evaluation reads (the token of no term).
+        // SAFETY: the first len ids are written.
+        unsafe { self.toks.set_len(len) };
+        // SAFETY: room for 8 more ids was reserved.
         unsafe { toks.add(len).cast::<[u32; 8]>().write([miss; 8]) };
         self.pending.clear();
-        // The sample only counts documents per term (end_doc).
-        let Some(_) = self.plan else { return };
+        // Then 8 ids at a time, those from `at`: their presence (with the plan: the
+        // sample only counts documents per term, in end_doc), and without a branch,
+        // as which tokens have them is too random to predict, the trigger
+        // occurrences (their info words; end_doc takes each term once) and the
+        // anchors' positions. The last 8 may take some of the `miss` ids after the
+        // tokens: their stamp and the row sink's bit are written, and no list keeps
+        // them.
+        let (trig, mut nt) = (self.trig.as_mut_ptr(), self.trig.len());
+        let (anchors, mut na) = (self.anchors.as_mut_ptr(), self.anchors.len());
         let (lastdoc, stamp) = (self.lastdoc.as_mut_ptr(), self.stamp);
-        for &info in &self.toks {
-            let id = (info & ID) as usize;
-            // SAFETY: id <= count < lastdoc.len(), and id.min(rows) < rows + 1, a
-            // word of this block's.
+        let sample = self.plan.is_none();
+        for at in (start..len).step_by(8) {
+            if !sample {
+                for k in 0..8 {
+                    // SAFETY: at + k < len + 8 (at < len): ids written above.
+                    let id = (unsafe { *toks.add(at + k) } & ID) as usize;
+                    // SAFETY: id <= count < lastdoc.len(), and id.min(rows) < rows + 1,
+                    // a word of this block's.
+                    unsafe {
+                        // A store that misses L1 holds up the stores after it, which
+                        // commit in order; fetched for writing first, the line arrives
+                        // out of order (replica: store-buffer stalls 161M -> 50M
+                        // cycles, -1.7 ms; ahead in the probe loop, +1.4 ms).
+                        _mm_prefetch::<_MM_HINT_ET0>(lastdoc.add(id).cast());
+                        *lastdoc.add(id) = stamp;
+                        *wide.add(id.min(rows)) |= bit;
+                    }
+                }
+            }
+            // SAFETY: AVX2 is enabled for the whole build. The 8 ids from at < len
+            // are written (above). nt and na grow by at most one per token before
+            // at, at most at - start <= len - 1 - start past their first values, so
+            // the 8 lanes stored from them end inside the room reserved for them,
+            // more = len - start + 8 past those first values.
             unsafe {
-                *lastdoc.add(id) = stamp;
-                *wide.add(id.min(rows)) |= bit;
+                let infos = _mm256_loadu_si256(toks.add(at).cast());
+                let positions = _mm256_add_epi32(_mm256_set1_epi32(at as i32), LANES);
+                // TRIG is bit 30, shifted to the sign bit; ANCHOR is the sign bit.
+                nt += left_pack(infos, _mm256_slli_epi32::<1>(infos), trig.add(nt));
+                na += left_pack(positions, infos, anchors.add(na));
             }
         }
+        // SAFETY: the first nt and na entries are written.
+        unsafe { (self.trig.set_len(nt), self.anchors.set_len(na)) };
     }
 
     /// Ends the current document: with the plan, counts the phrases anchored on
@@ -323,7 +351,6 @@ impl<'a> Scan<'a> {
         // range's length; 0 for a repeat) ends inside evals, which is as long as the
         // entries. AVX2 is enabled for the build.
         unsafe {
-            let lane = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
             for t in self.trig.iter().map(|&info| (info & ID) as usize) {
                 // Branch-free: a repeated trigger term is written again and not kept.
                 let fresh = *lastdoc.add(t) == stamp;
@@ -334,7 +361,7 @@ impl<'a> Scan<'a> {
                 // spare ones, and a range of over 8 (rare) goes on.
                 let store = |f: u32| {
                     let at = evals.add(n + (f - from) as usize).cast();
-                    _mm256_storeu_si256(at, _mm256_add_epi32(_mm256_set1_epi32(f as i32), lane));
+                    _mm256_storeu_si256(at, _mm256_add_epi32(_mm256_set1_epi32(f as i32), LANES));
                 };
                 store(from);
                 if fresh && to - from > 8 {
@@ -377,13 +404,8 @@ impl<'a> Scan<'a> {
                 // Bit 31 of a lane: bit `present` of its truth table, whether it matches.
                 let truth = _mm256_i32gather_epi32::<4>(words, word(5));
                 let hit = _mm256_slli_epi32::<31>(_mm256_srlv_epi32(truth, present));
-                let mask = _mm256_movemask_ps(_mm256_castsi256_ps(hit)) as u64;
-                // The matches' indices to the front: pext picks their lane numbers.
-                let bytes = _pdep_u64(mask, 0x0101_0101_0101_0101) * 0xFF;
-                let lanes = _mm_cvtsi64_si128(_pext_u64(0x0706_0504_0302_0100, bytes) as i64);
-                let packed = _mm256_permutevar8x32_epi32(idx, _mm256_cvtepu8_epi32(lanes));
-                _mm256_storeu_si256(hits.add(nh).cast(), packed);
-                nh += mask.count_ones() as usize;
+                // The matches' indices to the front.
+                nh += left_pack(idx, hit, hits.add(nh));
             }
         }
         for &e in &self.hits[..nh] {
@@ -570,6 +592,32 @@ fn masks(docs: &[u8], at: usize, end: usize) -> (u64, u64) {
     let token = unsafe { _bzhi_u64(token0 | token1 << 32, end.saturating_sub(at).min(64) as u32) };
     (token, lf0 | lf1 << 32)
 }
+
+/// Stores to `out` the lanes of `values` whose lane of `signs` is negative, in
+/// order, and returns how many. All 8 lanes are stored, the rest copies of lane
+/// 0: `pdep` widens the 8-bit mask to a byte per lane, and `pext` packs the lane
+/// numbers of those bytes.
+///
+/// # Safety
+///
+/// `out` is valid for an unaligned 32-byte store.
+#[inline(always)]
+unsafe fn left_pack(values: __m256i, signs: __m256i, out: *mut u32) -> usize {
+    // SAFETY: AVX2 and BMI2 are enabled for the whole build; the store is valid
+    // (the caller's contract).
+    unsafe {
+        let mask = _mm256_movemask_ps(_mm256_castsi256_ps(signs)) as u64;
+        let bytes = _pdep_u64(mask, 0x0101_0101_0101_0101) * 0xFF;
+        let lanes = _mm_cvtsi64_si128(_pext_u64(0x0706_0504_0302_0100, bytes) as i64);
+        let packed = _mm256_permutevar8x32_epi32(values, _mm256_cvtepu8_epi32(lanes));
+        _mm256_storeu_si256(out.cast(), packed);
+        mask.count_ones() as usize
+    }
+}
+
+/// Lane i holds i.
+// SAFETY: __m256i and [u32; 8] have the same size, and any bits are valid.
+const LANES: __m256i = unsafe { transmute([0u32, 1, 2, 3, 4, 5, 6, 7]) };
 
 /// Fetches the cache line of `base[i]` into L1.
 fn prefetch<T>(base: *const T, i: usize) {
