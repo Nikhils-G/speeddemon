@@ -230,12 +230,15 @@ fn touch(bytes: &[u8]) {
 /// name tables, for the last runs, and for every thread's totals) are short, and
 /// waking a dozen sleeping threads would take a good part of them (std's Barrier
 /// between rounds was about 1 ms slower per run). Yielding after the spin keeps a
-/// thread that lost its core from being starved by spinning siblings.
+/// thread that lost its core from being starved by spinning siblings. The spin is
+/// short, 2^12 checks: two threads can share a CPU (about 3% of runs on the
+/// replica), and a waiter that spun 2^14 checks held back the thread it waited for;
+/// at 2^12 the runs over the median + 10% fell from 3.6% to 1.7%.
 fn wait(count: &AtomicUsize, n: usize) {
     for spin in (0u32..).take_while(|_| count.load(Acquire) < n) {
         std::hint::spin_loop();
-        if spin >= 1 << 14 {
-            thread::yield_now(); // from the 2^14th spin on
+        if spin >= 1 << 12 {
+            thread::yield_now(); // from the 2^12th spin on
         }
     }
 }
