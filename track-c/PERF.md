@@ -672,6 +672,12 @@ C run at that point was still step 32's run-1ef2cedeac0a (0.02147 s, S 430, 81.6
   - *Board.* run-a3586e5340b9, 0.017192 s, 8.86 MB, 83.74 points; run-04d0edce5bc1, 0.01737 s,
     9.16 MB, 83.48; run-6fb2a1aac4ae, 0.017355 s, 8.73 MB, 83.70; against 9.76 to 10.69 MB and
     83.18 to 83.55 points in step 59's eight runs.
+  - *Review (commit 89c6f3d).* A review of the code changed in step 60 rewrote its comments: why
+    `[u64; 8]` holds glibc's 56-byte, 8-aligned `pthread_attr_t`; the `Entry` ABI; each stack's
+    bounds, and why 256 KB without a guard page is enough (about 20 KB used, no recursion); why
+    the two attribute calls cannot fail; what `populate` and `touch` touch; and four comments the
+    step had made stale (which thread makes a table, which waits exist). No code token changed
+    (155 comment lines); S stays 593.
 
 ## Box probes
 
