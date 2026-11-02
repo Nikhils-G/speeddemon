@@ -158,14 +158,19 @@ const STACK: usize = 256 << 10;
 const STACK_USED: usize = 24 << 10;
 /// The heap past its top as the workers start (`Shared::heap`), faulted in for the
 /// workers' allocations (nearly all of them pair buffers: 0.74 to 0.92 MB in all,
-/// measured on full seed 1 and holdout99). Past it, a worker faults its own pages: more
+/// measured on full seed 1 and holdout 99). Past it, a worker faults its own pages: more
 /// memory, the same output.
 const MARGIN: usize = 1024 << 10;
 /// How much more of the margin main faults in than each other faulter. A CPU's stock is
 /// charged 64 pages at a time (see `run`), so a faulter that charges one page past a
 /// multiple of 64 keeps 63 unused ones. With equal shares, workers 1 to 3 charge 334 to
-/// 340 pages each (perf, kmem:mm_page_alloc, seed 1 and holdout99), just past 5 batches
-/// (320); this takes 26 pages of each one's share to main: 309 to 314, 5 batches each.
+/// 340 pages each (perf, kmem:mm_page_alloc, seed 1 and holdout 99, 12 threads), just
+/// past 5 batches (320). The split (see `fault_in`) takes MAIN_EXTRA / FAULTERS, 26
+/// pages, from each one's share and gives the 78 to main: they charge 309 to 314, 5
+/// batches each. In a sweep, the peak's lowest mode sat two batches under equal shares'
+/// from 80 to 112 pages, and one under at 128, where main crosses one more (PERF.md,
+/// step 63): 104 is mid-way. At other thread counts the split is only less tuned; the
+/// output is the same.
 const MAIN_EXTRA: usize = 104 * PAGE;
 
 /// Maps a whole file read-only for the rest of the process. It is never unmapped:
@@ -292,8 +297,8 @@ struct Shared<'a> {
     next_run: AtomicUsize,
     flushed: AtomicUsize,
     merged: AtomicUsize,
-    /// The CPUs the threads found themselves on after regions.csv, a bit each (CPUs 0
-    /// to 63, see `move_off_shared_cpu`).
+    /// The CPUs the threads found themselves on after regions.csv, and the ones movers
+    /// claimed, a bit each (CPUs 0 to 63, see `move_off_shared_cpu`).
     on: AtomicU64,
     /// Each thread's table (its partition), and its inbox: buffers of pairs filed
     /// under it that it has not taken yet. Buffers are handed over, not copied
@@ -443,9 +448,11 @@ fn fault_in(s: &Shared, f: usize, faulters: usize) {
     // The f-th of `faulters` equal parts of 0..n.
     let part = |n: usize| n * f / faulters..n * (f + 1) / faulters;
     touch(&s.text[part(s.text.len())]);
-    // Where faulter f's share of the margin starts: main's (f = 0) is MAIN_EXTRA larger.
+    // Where faulter f's share of the margin starts, up to cut(faulters) = MARGIN: main's
+    // (f = 0) is MAIN_EXTRA and an equal part of the rest, each other one's an equal part.
     let cut = |f: usize| MAIN_EXTRA * f.min(1) + (MARGIN - MAIN_EXTRA) * f / faulters;
-    // A page more than the share, so that the divisions' rounding leaves no page out.
+    // A page more than the share, not needed but harmless: the shares meet at
+    // cut(f + 1), so it only overlaps the next one (the last one's lies past MARGIN).
     populate(s.heap + cut(f), cut(f + 1) - cut(f) + PAGE);
     s.faulted.fetch_add(1, Release);
     for table in &s.tables[part(s.threads)] {
@@ -526,8 +533,9 @@ extern "C" fn worker(w: usize) -> usize {
         // before it cost 2.6% (PERF.md, experiments).
         wait(&s.made, faulters);
         take(s, w, &mut taken, &mut totals);
-        // Empty buffers for the next run, drawn once this take has refilled the pool (drawn
-        // before the pushes, they were new ones while the last 12 waited: 0.3 MB more heap).
+        // Empty buffers for the next run, drawn once this take has refilled the pool.
+        // (Drawn before the hand-off, they were `threads` new ones at the first run's end,
+        // while the full ones waited in the inboxes: 0.3 MB more heap.)
         let mut pool = s.empties.lock().unwrap();
         for buffer in &mut pairs {
             *buffer = pool.pop().unwrap_or_else(|| Vec::with_capacity(capacity));
