@@ -256,10 +256,9 @@ extern "C" fn main(_: i32, _: *const *const u8) -> i32 {
                     // SAFETY: bytes at..at + len of the mapping are this hour's alone, and
                     // at + len <= total <= bound: a line is at most 213 bytes (see bound).
                     let out = unsafe { std::slice::from_raw_parts_mut((file + at) as _, len) };
-                    // The line head, the 21-byte label "YYYY-MM-DDTHH:00:00Z " (the hour key's
-                    // 13 bytes are the last 13 of its 16 big-endian bytes), and the name order
-                    // (already set: this hour's groups were built in it).
-                    let head = [&hours[hour][0].begin.key.to_be_bytes()[3..], b":00:00Z "].concat();
+                    // The hour key's 13 bytes, and the name order (already set: this
+                    // hour's groups were built in it).
+                    let head = (hours[hour][0].begin.key << 24).to_be_bytes();
                     let endpoints = order.wait();
                     // Last line first, each one ending where the next one starts.
                     let mut at = len;
@@ -473,7 +472,7 @@ fn line_len(name: &[u8], stat: &Stats) -> usize {
 /// copied. (Put together in a stack buffer and copied, the copy's wide loads would wait
 /// for the buffer's byte stores, a store-forwarding stall a line; the replica measured
 /// the same speed either way, and this one is 11 lines shorter: PERF.md, step 50.)
-fn write(head: &[u8], name: &[u8], stat: Stats, out: &mut [u8], end: usize) -> usize {
+fn write(head: &[u8; 16], name: &[u8], stat: Stats, out: &mut [u8], end: usize) -> usize {
     let mut at = end - 1;
     out[at] = b'\n';
     for mut value in stat.into_iter().rev() {
@@ -489,9 +488,11 @@ fn write(head: &[u8], name: &[u8], stat: Stats, out: &mut [u8], end: usize) -> u
         at -= 2 + (value >= 10) as usize;
         out[at] = b' ';
     }
-    // The head (the 20-byte label and its space: LABEL bytes), then the name.
+    // The 20-byte label (the hour key's 13 bytes "YYYY-MM-DDTHH", then ":00:00Z"), its
+    // space, then the name.
     at -= LABEL + name.len();
-    out[at..at + LABEL].copy_from_slice(head);
+    out[at..at + 13].copy_from_slice(&head[..13]);
+    out[at + 13..at + LABEL].copy_from_slice(b":00:00Z ");
     out[at + LABEL..at + LABEL + name.len()].copy_from_slice(name);
     at
 }
