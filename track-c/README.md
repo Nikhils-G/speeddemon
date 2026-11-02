@@ -20,19 +20,19 @@ names must be counted per country over all records.
 
 ## Where the time goes on the box
 
-The reference runs 14.44 s at 367 MB and S 108. The submitted code (PERF.md step 62, 58edfbd,
-S 581) is step 60 in 12 fewer lines (PERF.md steps 61 and 62), and step 60 is step 59 with every
-page its workers write faulted in by four threads only, so that only four CPUs keep the kernel's
-per-CPU charge stock, which counts in the memory peak ("Memory" below); the parse is unchanged. Its
-board run took 0.017297 s at 8.73 MB, 83.80 points (run-92dcddacc633), and step 61's two 0.01733
-and 0.017378 s at 8.82 and 8.69 MB (run-2383bfd9435e, run-fd433f40660f). Step 60's five board runs
-in our log took 0.017192 to 0.01737 s at 8.55 to 9.16 MB, 83.48 to 83.79 points (run-a3586e5340b9,
-run-04d0edce5bc1, run-6fb2a1aac4ae, run-3d775a9cee36, run-fa97d7ddfefc), where step 59's eight
-runs peaked at 9.76 to 10.69 MB. Its hot loops are those
+The reference runs 14.44 s at 367 MB and S 108. The submitted code (PERF.md step 63, d85e890,
+S 583) is step 62 with about 0.5 MB less memory peak on the replica: fewer buffers alive and a
+heap margin split so that each faulter charges whole batches of pages ("Memory" below). Step 62
+is step 60 in 12 fewer lines, and step 60 is step 59 with every page its workers write faulted in
+by four threads only, so that only four CPUs keep the kernel's per-CPU charge stock, which counts
+in the memory peak; the parse is unchanged. Step 63's two board runs came in dispatches where
+every track ran slow (run-37c6f4fc7adb, 0.019342 s, 10.67 MB; run-3647f4c11d20, 0.017982 s, 8.78
+MB). Steps 60 to 62 ran 15 times in our log at 0.017188 to 0.017841 s, and peaked at 8.55 to 9.33
+MB in 13 of them, where step 59's eight runs peaked at 9.76 to 10.69 MB. Its hot loops are those
 of steps 57 to 59: step 58 ran 0.0171 to 0.0174 s in 15 of its 19 board runs (fastest
 run-0be3ea3875d4, 0.017071 s, 10.58 MB, 83.69 points; best points run-00bcea1e0afe, 0.017356 s,
 9.66 MB, 83.90), and step 57 ran the fastest Track C time, 0.016978 s (run-c56b067ab64d). Details:
-PERF.md, steps 49-62.
+PERF.md, steps 49-63.
 
 Per record, step 46 executed about 193 instructions in all, parse and deduplication together
 (640.9M instructions for 3.32M records at 12 threads). The single largest stall is the join
@@ -167,8 +167,9 @@ Two names are confused only if they share every compared bit:
 - *Taking.* Its own table then takes what waits in its inbox. A table's row holds a bit per country
   for each name, and a thread's table stays in its cache. No two threads ever write the same table,
   so the hot path has no atomics.
-- *Buffers.* Emptied buffers go back to one shared pool, from which a filer takes the empties for
-  its next run (up to 12 at 12 threads) under one lock. A buffer holds a run's mean share of pairs
+- *Buffers.* Emptied buffers go back to one shared pool, from which a thread draws the empties for
+  its next run (12 at 12 threads, new ones if the pool runs dry) under one lock, once its own table
+  has taken its inbox and so refilled the pool. A buffer holds a run's mean share of pairs
   plus 2 standard deviations plus 4. One that overflowed grew, and is dropped once emptied, so the
   pool's buffers stay small. The empty name (1% of records) always hashes to the same partition,
   which is the one that overflows.
@@ -235,6 +236,13 @@ the end of the parse, the run held 9.56 to 10.10 MB (the replica, `memory.curren
 Step 60 has only four threads fault in memory (technique 8), so only four CPUs keep a stock. On
 the replica (mem.sh, four sets of 20 runs) the max was 8.54 to 8.69 MB and the median about 8.27
 MB, against a max of 10.61 and 10.63 MB for step 59 in the same session.
+
+Since a stock is charged 64 pages at a time, the peak moves in whole batches of 0.26 MB, and a cut
+pays only when a CPU's count crosses a multiple of 64. In step 62 each of workers 1 to 3 charged
+350 to 356 pages: six batches, with 28 to 34 pages of each stock unused. Step 63 (technique 8)
+keeps fewer buffers alive, so the heap margin is 1 MB instead of 1.25, and has the main thread
+fault 104 pages more of it than each of them: they charge 309 to 314 pages, five batches. On the
+replica (mem.sh, 100 runs of each build) the mean peak went from 8.39 to 7.86 MB on full seed 1.
 
 ## Techniques
 
@@ -438,12 +446,14 @@ exact. The distinct-name count rests on a hash; its odds are stated in technique
     cost far more time (6 threads: +26% for −1.5 MB; PERF.md, experiments).
   - *The main thread*, before it starts the workers: the join table (`populate`, which is
     `madvise(MADV_POPULATE_WRITE)`), the page tables of regions.csv (`touch`, a byte read per 2
-    MB), the first 80 KB of the heap past `run`'s own allocations, and the top 24 KB of each
+    MB), the first 64 KB of the heap past `run`'s own allocations, and the top 24 KB of each
     worker's stack (`STACK_USED`).
   - *The faulters*, a share each (`fault_in`; a quarter from 4 threads on): the page tables of the
-    input and the 1.25 MB heap margin (`MARGIN`, nearly all of it for pair buffers), which every
-    thread's parse waits for (`faulted`); then their share of the name tables (three each at 12
-    threads), rows populated and keys zeroed, which every thread's first take waits for (`made`).
+    input and the 1 MB heap margin (`MARGIN`, nearly all of it for pair buffers; the main thread's
+    share is 104 pages larger, `MAIN_EXTRA`, so that each of workers 1 to 3 charges five whole
+    batches of 64 pages), which every thread's parse waits for (`faulted`); then their share of
+    the name tables (three each at 12 threads), rows populated and keys zeroed, which every
+    thread's first take waits for (`made`).
   - *One heap.* Every thread allocates from the main thread's heap (`mallopt(M_ARENA_MAX, 1)`), so
     every allocation lands in faulted memory; `M_TOP_PAD` (32 MB) grows that heap 32 MB at a time,
     so the margin past its top is already mapped. That holds at 11 threads or more, as on the
@@ -461,13 +471,16 @@ exact. The distinct-name count rests on a hash; its odds are stated in technique
     that needs more grows, on its owner's CPU.
   - *Checked.* A perf trace of each thread's user page faults, over 40 runs, found no write fault
     in any of the other eight workers. Replica, max of 20 runs: 8.54 to 8.69 MB against 10.61 and
-    10.63 for step 59, for about 0.7% of time (PERF.md, step 60).
+    10.63 for step 59, for about 0.7% of time (PERF.md, step 60); step 63, mean of 100 runs 7.86
+    against 8.39 MB for step 62, and 0.35 to 0.53% faster (PERF.md, step 63).
   - *Release.* Once no thread files pairs any more, each thread drops its share of the input's
     first two thirds in one call, and the threads other than the writer drop the last third while
     it writes: 23 TLB-shootdown rounds in all. Dropping each 8 runs' pages as they were
     parsed took 96, and the box's probe read the single release 0.1 ms faster (PERF.md, step 44).
   - *Buffers.* Runs are small (64 per thread), so pairs wait less. Buffers are sized from the run
-    statistics and pooled, and 32-bit keys halve the tables.
+    statistics and pooled, and 32-bit keys halve the tables. A thread draws its next run's buffers
+    after its take, once the pool has refilled: about 210 to 230 buffers alive instead of 288,
+    and a heap use of 0.76 MB instead of 1.07 (medians, full seed 1).
   - *Exit.* Thread 0 writes the output and exits without dropping any pages. Meanwhile the others
     drop their own name table's pages (about 83 each at 12 threads), a share each of the 1 MB join
     table and of regions.csv's 532 pages, and the input's last third, which the exit would
@@ -484,7 +497,10 @@ exact. The distinct-name count rests on a hash; its odds are stated in technique
 - **If it fails.** On a kernel without `MADV_POPULATE_WRITE` (before Linux 5.14) the call fails
   and the pages fault in where they are first touched: about step 59's memory, the same output.
   Under contention a worker can still fault: with a busy loop on one CPU, the max of 15 runs was
-  10.75 to 10.80 MB against step 59's 10.79 to 11.30 (PERF.md, step 60).
+  10.75 to 10.80 MB against step 59's 10.79 to 11.30 (PERF.md, step 60). A worker that faults in
+  pages of its own, for instance buffers past the 1 MB margin, keeps a charge stock on its CPU
+  again, so a heavily contended run peaks higher: two board runs in disturbed dispatches peaked at
+  10.52 and 10.67 MB (PERF.md, steps 62 and 63). The output is the same.
 
 ### 9. Build
 
@@ -587,7 +603,7 @@ Evidence, on the binary the Dockerfile builds:
   rejects.
 - **Robustness runs on the replica** (Sun 1 Nov, about 17:00 UTC), on the exact Dockerfile build
   of step 52 (steps 53, 54 and 56 to 59 change no output path, step 55 only a last record without
-  a terminator, which the generator never writes; all passed the gate; steps 60 to 62 are
+  a terminator, which the generator never writes; all passed the gate; steps 60 to 63 are
   below), with data generated on the replica by the organisers' generator (Python 3.11, which
   reproduces the official sample seed 1 and its reference output byte for byte). Every run was
   byte-exact, with no crash, no nonzero exit and no output on stderr:
@@ -605,10 +621,12 @@ Evidence, on the binary the Dockerfile builds:
   three and four faulters), as root and as uid 65534: 180 of 180 runs exit 0 with the reference's
   output and nothing on stderr; and with a busy loop on CPU 1, 2 or 5, 15 runs each, every output
   exact.
-- **The submitted code, step 62**, and step 61 before it, are step 60 in 12 fewer lines, with the
-  output now written by `run` instead of `finish`. Both passed the gate on two builds each: the
-  seed-1 hash at 1, 3, 7 and 12 CPUs, and every mutant's exit code unchanged (PERF.md, steps 61
-  and 62).
+- **Steps 61 and 62** are step 60 in 12 fewer lines, with the output now written by `run` instead
+  of `finish`. Both passed the gate on two builds each: the seed-1 hash at 1, 3, 7 and 12 CPUs, and
+  every mutant's exit code unchanged (PERF.md, steps 61 and 62).
+- **The submitted code, step 63**, which changes when buffers are drawn and how the heap margin is
+  split, passed the same gate on two builds, and ran with a busy loop on CPU 1, 2 or 5 (15 runs
+  each) and on new full seeds 211 and 212, every output exact (PERF.md, step 63).
 - **Room for the names, measured.** The generator writes at most 100,529 distinct names (100,515
   to 100,524 measured). The fullest partition held at most 8,650 of its 10,240 rows (84.5%) at 12
   threads, 61.4% at one thread and 51.4% at 20. A table that filled up would stop the program,
