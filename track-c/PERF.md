@@ -132,7 +132,10 @@ their own, or their run is not in the log; their numbers are left out rather tha
 | 65 | f10f4b7 | cwf-s-1: the move off a shared CPU (steps 56-58) removed, 16 lines (replica median +0.12%, the final's estimator +0.14%, slow runs 1.9% → 4.4% of 1,206; by the formula S +0.09, T −0.015 points) | run-70ecd3636c46 | 0.017258 | 8.43 | 567 | 84.06 |
 | 66 | 60f559f (later runs from 4b997e4 and 798ff2d) | cwf-s-2: six `#[inline(always)]` and `#[cold]` attributes that the PGO+LTO build does not need (the same functions are inlined; `parse_run` calls nothing). Replica, with step 65, against step 64: median +0.06%, estimator +0.09%. The second run peaked at 10.77 MB with Track B at its usual time (0.067066 s; "What each step taught", step 63) | run-34b206426c97, run-999b7573a7f5, run-434f22246279 | 0.017192, 0.017202, 0.017069 | 8.42, 10.77, 8.23 | 561 | 84.14, 83.07, 84.32 |
 | 67 | 9ccf3cb | cwf-s-3: `wait` spins 2^12 checks before it yields, not 2^14. Replica against step 66: runs over the median + 10% 29 → 14 of 804; median +0.00% to +0.06% on seed 1 and −0.13% / −0.20% on holdout 99 | run-0c9eb554171b | 0.017362 | 8.16 | 561 | 84.17 |
-| 68 | 9514121 (later runs from 718f0af and 008c49b) | c-merge-1: step 67 with five constants of cwf-m-1 (made on step 64) that lower the memory peak by one charge batch, no line added or removed: the join table ends at id 1,000,000 (`REGION_IDS` 1,000,001 instead of 2^20: 245 pages, not 256), 20 KB of each stack's top faulted in for a measured 18.4 KB (`STACK_USED`, was 24), rows for 3 standard deviations instead of 4 (8,689 a table at 12 threads), an 896 KB heap margin for a median use of 733 KB (`MARGIN`, was 1 MB), and main's extra share 68 pages instead of 104 (`MAIN_EXTRA`), so that main charges 13 batches instead of 14 and workers 1 to 3 stay at five (replica, cwf-m-1 against step 64, two PGO builds a side: mem.sh modes 7.47/7.71 against 7.74/7.97 MB, expected max of 5 runs 7.90 and 7.83 against 8.11 and 7.98 MB, T −0.30% to −0.39% over four pairings; the merge, one build: mem.sh, 20 runs, max 7.87 MB against 8.25 for step 66 and 8.07 for step 64). The first run came in a dispatch our log marks DISTURBED (Track A 0.018259 s, Track B 0.147443 s). The board does not separate it from step 67 (see below). **The submitted code** | run-02a3e11c78a6, run-38f216bf39eb, run-137fddfd6960 | 0.017481, 0.016995, 0.01709 | 8.09, 8.17, 8.33 | 561 | 84.13, 84.40, 84.25 |
+| 68 | 9514121 (later runs from 718f0af, 008c49b, 1a5a6ba, f86d9cc, 631ec7f and 4eaa885) | c-merge-1: step 67 with five constants of cwf-m-1 (made on step 64) that lower the memory peak by one charge batch, no line added or removed: the join table ends at id 1,000,000 (`REGION_IDS` 1,000,001 instead of 2^20: 245 pages, not 256), 20 KB of each stack's top faulted in for a measured 18.4 KB (`STACK_USED`, was 24), rows for 3 standard deviations instead of 4 (8,689 a table at 12 threads), an 896 KB heap margin for a median use of 733 KB (`MARGIN`, was 1 MB), and main's extra share 68 pages instead of 104 (`MAIN_EXTRA`), so that main charges 13 batches instead of 14 and workers 1 to 3 stay at five (replica, cwf-m-1 against step 64, two PGO builds a side: mem.sh modes 7.47/7.71 against 7.74/7.97 MB, expected max of 5 runs 7.90 and 7.83 against 8.11 and 7.98 MB, T −0.30% to −0.39% over four pairings; the merge, one build: mem.sh, 20 runs, max 7.87 MB against 8.25 for step 66 and 8.07 for step 64). The first run came in a dispatch our log marks DISTURBED (Track A 0.018259 s, Track B 0.147443 s). The board does not separate it from step 67 (see below). A later commit fixed review comments and wrote three subtractions as `wrapping_sub` (4eaa885); a plain build's `.text` is byte-identical to step 68's, so the later runs are of the same machine code. The fifth run came in a dispatch where Track A and B ran slow too (0.020424 and 0.098793 s) | run-02a3e11c78a6, run-38f216bf39eb, run-137fddfd6960, run-1ccf760146d4, run-0d8969fcc7aa, run-95d412f8e619, run-1aeb0c93304f | 0.017481, 0.016995, 0.01709, 0.017287, 0.021217, 0.017176, 0.017198 | 8.09, 8.17, 8.33, 8.16, 10.49, 8.74, 8.1 | 561 | 84.13, 84.40, 84.25, 84.22, 80.90, 83.99, 84.30 |
+| 69 | 45920b7 | c-merge-2j: step 68 with an inbox taken over at 2 × threads buffers instead of 4 × (one constant in `worker`), so that a lagging owner's inbox holds at most 24 buffers at 12 threads, not 48 (replica, cwf-m-2 against cwf-m-1, both on step 64 with step 68's constants: heap use past the margin's start p98 863 → 774 KB, peaks over 1,861 pages 4 → 1 of 120, expected max of 5 runs 7.75 and 7.73 MB against 7.80 to 8.02, T −0.08% to +0.07% over four pairings; on step 67, c-merge-2 against step 68: max of 20 runs 7.78 against 7.72 MB, T +0.05%, 95 of 201). Its run peaked at 10.2 MB with Track B slow in the same dispatch (0.097053 s) | run-887c4d6042f4 | 0.017107 | 10.2 | 561 | 83.36 |
+| 70 | 4c101fb (later runs from 3c2e860 and 285539d) | c-merge-3: step 69 with ccompact-1's nine cuts, none in the hot loops: the faulters' first share counted with regions.csv's chunks (`ready`), one wait for both; the two end barriers on one counter (`done`), at threads and 2 × threads; a table's key slots from the capacity `run` reserved; the output written in one statement; the Dockerfile's RUN line in Track A's 3-line form (replica, ccompact-1 against step 68, two PGO builds a side, eight pairings of 201 pairs on full seed 1 and holdout 99: median −0.03%, the final's estimator −0.01%; mem.sh, 80 runs a side, medians 7.48-7.49 MB both; the merge: mem.sh, 20 runs, median 7.48 and max 8.01 MB). All three runs came in dispatches our log marks disturbed (Track A 0.020219, 0.02239 and 0.020461 s; Track B 0.119599 s in the third) | run-fa4d938c45de, run-e6e4ae7ad1df, run-e984f02ad1c8 | 0.017703, 0.017218, 0.018938 | 8.09, 8.08, 8.43 | 552 | 84.05, 84.36, 83.14 |
+| 71 | ab83410 | ccompact-3: step 70 in two fewer lines, both cold: `run`'s `runs` folded into `mean`, its only use; the worker's empty pair buffers made by one closure, `new`, and the pool draw as `pairs.fill_with(..)` instead of a 3-line loop, with the same pops and allocations in the same order (replica, against step 70, two PGO builds a side, eight pairings of 201 pairs: median +0.07%, the final's estimator +0.08%, inside the ±0.4% build-to-build spread of one pairing; mem.sh, 80 runs a side, medians 7.48-7.49 MB, unchanged). Its run is the fastest Track C time, 0.3% under step 68's best and inside the board's spread, and peaked at 10.91 MB in a dispatch where Track A and B ran slow (0.017747 and 0.079848 s). **The submitted code** | run-a0a62bc64ea7 | 0.016946 | 10.91 | 550 | 83.24 |
 
 Two more runs of step 32's code were in a DISTURBED and a SLOW BOX dispatch: run-87e294d71310
 (0.022429 s) and run-dc9ee4598ca3 (0.021796 s, 11.28 MB).
@@ -144,7 +147,31 @@ dispatch for A and B); run-84ffefa565f7 0.021882 s, 10.77 MB, 81.04, and run-f93
 fall in step 35's range (0.021639 to 0.022423 s), so the pass cost no speed; it cost points
 through S (429 → 469).
 
-**The submitted code is step 68 (c-merge-1, 9514121), S 561**: step 67 with five constants that
+**The submitted code is step 71 (ccompact-3, ab83410), S 550**: step 68 with the inbox takeover
+bound halved (step 69) and eleven lines fewer in cold code (steps 70 and 71), on top of a review
+of step 68's code with its machine code (4eaa885, step 68's row). The parse, the tables and the
+memory constants are step 68's ("What each step taught", steps 69 to 71). Replica, two PGO
+builds a side, eight pairings of 201 pairs on full seed 1 and holdout 99: step 70's cuts against
+step 68, median −0.03% and the final's estimator −0.01%; step 71 against step 70, median +0.07%
+and estimator +0.08%, inside the ±0.4% build-to-build spread of one pairing; mem.sh, 80 runs a
+side, medians 7.48-7.49 MB for every build. The bound of step 69, on step 64's code with step
+68's constants: heap use past the margin's start p98 863 → 774 KB and peaks over 1,861 pages
+4 → 1 of 120, at the same speed. The gate passed on two builds of step 71, on the merge of step
+70, and on two builds of step 70's cuts on step 68's code. Board:
+step 71's run-a0a62bc64ea7, 0.016946 s, the fastest Track C run, at 10.91 MB, 83.24 points, in a
+dispatch where Track A and B ran slow (0.017747 and 0.079848 s); step 70's three runs, 0.017218
+to 0.018938 s at 8.08 to 8.43 MB (run-e6e4ae7ad1df, 0.017218 s, 8.08 MB, 84.36 points), all in
+dispatches our log marks disturbed, with Track A at 0.020219 to 0.02239 s against its usual
+0.0155 to 0.0160 s; step 69's run-887c4d6042f4, 0.017107 s, 10.2 MB, 83.36 points, with Track B
+slow (0.097053 s). The board does not separate any of the three steps from step 68, or from one
+another: their five runs took 0.016946 to 0.018938 s, against 0.016995 to 0.017481 s in six of
+the seven runs of step 68's code (the seventh, 0.021217 s, came with Track A and B slow too). Two
+of the five peaked over 10 MB, as step 66's run-999b7573a7f5 did ("What each step taught", step
+63); on the replica the 80 runs a side of step 70's cuts and of step 71 peaked at 8.68 and 7.99
+MB. They rest on the eleven lines and on the replica's paired runs. By the board's formula,
+from the replica: S +0.065 points (561 → 550), T and M unchanged.
+
+**Step 68 (c-merge-1, 9514121), S 561**: step 67 with five constants that
 lower the memory peak by one charge batch of 64 pages; no line is added or removed ("What each
 step taught", step 68). The parse, the waits and the merge are step 67's, and the name tables
 differ only in the rows they reserve. The constants were made and measured on step 64 (cwf-m-1),
@@ -1022,7 +1049,73 @@ C run at that point was still step 32's run-1ef2cedeac0a (0.02147 s, S 430, 81.6
     0.017362 s at 8.16 MB. The board does not separate the two; the gain rests on the replica's
     paired runs.
   - *Not kept* (experiments table): the join table's cut alone, right-sized pair buffers, the 1 MB
-    and 960 KB margins, a takeover bound of 2 × threads, and `MAIN_EXTRA` 60.
+    and 960 KB margins, a takeover bound of 2 × threads (it went in as step 69), and `MAIN_EXTRA`
+    60.
+  - *Review (commit 4eaa885).* A review of step 68's code rewrote comments: a SAFETY line for
+    each page drop in `finish`, the prefetch's distance as about 10 records (640 bytes at 60.8
+    bytes a record), what the second window's arithmetic shift spreads, why four faulters (from
+    the experiments table), and the reading order in the crate doc. Three subtractions that wrap
+    on input outside the spec are written as `wrapping_sub`, as release builds already wrapped, so
+    a debug build no longer panics there. Plain builds of the two sources have byte-identical
+    `.text` (objcopy and cmp; objdump, 241,468 lines each, no diff); the files differ only in the
+    build id and in the line numbers of panic locations. The gate passed on its PGO build. S 561.
+- **Step 69: inboxes taken over sooner.** A filer takes over a lagging owner's table once its
+  inbox holds 2 × threads buffers instead of 4 × (one constant in `worker`). At 12 threads one
+  lagging owner's inbox held up to 48 buffers, about 157 KB, before a filer took it over: the heap
+  tail past step 68's 896 KB margin, where a worker then faults its own pages (step 68, *Risks*).
+  On step 64's code with step 68's constants (cwf-m-2 against cwf-m-1), a build with the bound as
+  a knob, 120 interleaved runs each on full seed 1: heap use past the margin's start median 734 →
+  731 KB, 98th percentile 863 → 774 KB, max 892 → 813 KB; peaks over 1,861 pages 4 → 1 of 120.
+  mem.sh, 100 runs of each build: expected max of 5 7.75 and 7.73 MB against 7.80 to 8.02 MB for
+  cwf-m-1's builds, with no run over 8.1 MB. T against cwf-m-1 −0.08% to +0.07% over four
+  pairings: the bound is on the cold filing path. On step 67's code (c-merge-2) against step 68,
+  a max of 20 runs read 7.78 against 7.72 MB and T +0.05% (95 of 201): no gain at that sample
+  size, so step 68 left it out. It costs no line, and went in on top of the review of step 68
+  (c-merge-2j). The gate passed on cwf-m-2's two builds and on c-merge-2's build, with 0 of 20
+  runs in a fresh cgroup failing, and step 69's source was gated again inside step 70's merge.
+  - *Board.* One run, run-887c4d6042f4, 0.017107 s at 10.2 MB, 83.36 points, with Track B slow in
+    the same dispatch (0.097053 s). One run cannot show a rarer tail; the case rests on the
+    replica's heap measurements.
+- **Steps 70 and 71: eleven lines fewer in cold code.** A line is worth about 0.052% of T by the
+  board's formula (steps 65 to 67). These cuts are in the setup, the waits and the end; `parse_run`,
+  `fast_record` and `add` are untouched. Step 70 (ccompact-1, merged onto step 69 as c-merge-3),
+  nine lines:
+  - the faulters count their first share in regions.csv's chunk counter, renamed `ready`, and the
+    parse waits once for both, `wait(&s.ready, REGION_CHUNKS + faulters)`, so `faulted` goes (−3).
+    Exact: each source adds a fixed amount, the 64 chunks and one per faulter, so the sum reaches
+    the total only when both are complete;
+  - the two end barriers share one counter, `done` (was `flushed`), which each thread counts twice
+    in `finish`: the first barrier waits for `threads`, the second for `2 * threads`, so `merged`
+    goes (−2). Exact: the counter only grows, so a thread already counted for the second barrier
+    still lets the first pass, and the second needs every thread's second count;
+  - `Shared::slots` goes: `fault_in` sizes a table's keys by `keys.resize(keys.capacity(), 0)`,
+    and `run` reserved them with `Vec::with_capacity(slots)`, which gives exactly that capacity
+    (−2);
+  - `run` writes the output in one statement (−1), and the Dockerfile's RUN line takes Track A's
+    3-line form, with the same commands (−1).
+
+  Step 71 (ccompact-3), two lines: `run`'s `runs` folded into `mean`, its only use there, and the
+  worker's empty pair buffers made by one closure, `new`, with the pool draw as
+  `pairs.fill_with(|| pool.pop().unwrap_or_else(new))` instead of a 3-line loop: the same pops and
+  allocations in the same order.
+  - *Replica.* Two PGO builds a side, eight pairings of 201 pairs on full seed 1 and holdout 99.
+    Step 70's cuts against step 68: −0.18% to +0.11%, median −0.03% and the final's estimator
+    −0.01% over the eight. Step 71 against step 70: −0.04% to +0.16%, median +0.07% and estimator
+    +0.08%; the same two cuts read 0.00% on step 68's code. mem.sh, 80 runs a side: medians
+    7.48-7.49 MB in every set; max 8.68 MB for step 70's cuts against 9.81 for step 68 and 7.99 MB
+    for step 71 against 7.88 for step 70, single rare spikes on both sides. The gate passed on two
+    builds of each, with the seed-1 hash at 1, 3, 7 and 12 CPUs; on a local build of each, five
+    fresh full seeds (7101, 7202, 7303, 7404 and 7505) were identical to the reference at 1 and 8
+    CPUs and every mutant's exit code was unchanged, and step 71's matched on 61 long-field fuzz
+    files. The merge of step 70 passed the
+    gate, with 0 of 10 runs in a fresh cgroup failing (mem.sh, 20 runs: median 7.48 MB, max 8.01).
+    S 561 → 552 → 550.
+  - *Board.* Step 70's three runs, 0.017218 to 0.018938 s, all in dispatches our log marks
+    disturbed; step 71's one run, 0.016946 s, the fastest Track C run, at 10.91 MB. The board does
+    not separate either step from step 68; the case is the eleven lines (S +0.065 points) at the
+    replica's same speed and memory.
+  - *Not kept* (experiments table): the walker folded into the window path (two designs), the min
+    and max by `.min()` and `.max()`, and five pairs of `let`s as tuple `let`s.
 
 ## Box probes
 
@@ -1103,9 +1196,16 @@ The last three run one copy of the code with different constants, so they carry 
 | `REGION_IDS` 1,000,001 alone (step 68 work, on step 64) | replica, mem.sh, two sets of 20 runs each | The same modes and max (7.98 to 8.02 MB): its 11 pages fall inside main's slack under its 14th batch |
 | Pair buffers sized from 54 or 50 bytes a record instead of 60 (step 68 work) | replica, heap use past the margin's start | +65 KB and +125 KB; smaller buffers (66 to 100 bytes a record) regrow more: +60 to +450 KB. 60 bytes gives the smallest heap |
 | A 1 MB or 960 KB margin with step 68's other cuts (step 68 work) | replica, memsampler, a sweep of `MAIN_EXTRA`, 4 runs each | One batch lower only for `MAIN_EXTRA` 64 to 72 at 1 MB and 56 to 80 at 960 KB, against 48 to 88 at 896 KB: too narrow |
-| A takeover bound of 2 × threads buffers with step 68's constants (cwf-m-2, on step 64; c-merge-2, on step 67) | replica | Heap use past the margin's start p98 863 → 774 KB, peaks over 1,861 pages 4 → 1 of 120; T against cwf-m-1 −0.08% to +0.07% over four pairings. On step 67 (c-merge-2) against step 68: max of 20 7.78 against 7.72 MB, T +0.05% (95 of 201): no gain, not pushed |
+| A takeover bound of 2 × threads buffers with step 68's constants (cwf-m-2, on step 64; c-merge-2, on step 67) | replica | Heap use past the margin's start p98 863 → 774 KB, peaks over 1,861 pages 4 → 1 of 120; T against cwf-m-1 −0.08% to +0.07% over four pairings. On step 67 (c-merge-2) against step 68: max of 20 7.78 against 7.72 MB, T +0.05% (95 of 201): no gain at that sample size, not pushed then; it went in as step 69, for the heap tail |
 | `MAIN_EXTRA` 60 pages instead of 68 (cwf-m-3), for more room on main's side of the batch window under the box's launch | replica, four pairings of 201 pairs against cwf-m-2 | +0.11%, +0.10%, +0.11% and +0.17% (A/A +0.06%), the same memory (modes 7.66/7.90 MB under `sd-timer` for both): not kept |
 | A knob that faulted extra pages on workers 1 to 3 (an `mmap` and a populate in `fault_in`), to find their batch boundary (step 68 work) | replica | `mmap` takes the mapping's write lock while the others fault, so the faulting order broke: peaks of 2,100 to 2,500 pages. The workers' margin was read from perf instead |
+| The walker folded into the window path, one record parser for every record: each file mapped with a page of zeros after it, so that loads near the end need no margin; separators found window by window, for any field length; the name hash over any length (steps 70 and 71 work, two designs) | replica, 201 pairs against step 68; perf stat | −27 and −35 lines, exact on 300 fuzz files with names and notes of 0 to 300 bytes and on five fresh full seeds, but T +6.34% (7 of 201) and +6.48% (5 of 201): 837.9M instructions against 747.8M at 12 threads, about +27 a record, from the any-length hash, the amount check that the fold's end-of-input handling needs and the general separator search, and 5 to 6 more stack spills in the two-record loop |
+| The same fold as a fast and a general instance (`parse_record<const ANY: bool>`): the fast one keeps the early exits to the walker, the general one, out of line, takes any length (steps 70 and 71 work) | replica, 201 pairs against step 68 | −15 lines, exact on 150 fuzz files and five fresh seeds, T +6.29% (4 of 201) and +6.05% (2 of 201): the cost is the separator search itself. Both folds also moved mutants' exit codes: with a check of the amount's first byte, 5 or 6 one-record mutants that step 68 answers now stop (the reference rejects them too); without it, two with merged records are answered where step 68 stops |
+| Only the page of zeros after each mapping, nothing else (steps 70 and 71 work) | replica, 201 pairs | +0.03% (94 of 201): free, so the fold's cost is in its parse, not in the padding |
+| The min and max in `count` as `.min()` and `.max()` instead of two `if`s, −5 lines (steps 70 and 71 work) | replica, two pairings of 201 pairs on full seed 1 | +2.55% (39 of 201) and +2.51% (46 of 201): a cmov and two stores every record, where the branches are almost never taken |
+| Five pairs of independent `let`s as tuple `let`s, −5 lines on top of step 71's two (ccompact-4) | replica, two PGO builds a side, eight pairings of 201 pairs; plain builds' `.text` | The same machine code (`.text` byte-identical), median +0.03%, S +0.042 points. Not pushed, as a review risk: a code review of this track had asked for tuple bindings to be split, and these put unrelated values in one line. The worker's `(totals, taken)` as one tuple `let` also put a second 14 KB copy of the totals on its stack |
+| The profile-guided build trained at full scale (`c_join.py --scale full` in the Dockerfile's training run) instead of on the sample | replica, three pairings of 201 pairs | T +0.16%, +0.28% and +0.27%: no gain (Track A had measured +0.23%) |
+| LLVM flags on the profile-guided build: `-x86-cmov-converter=false`, `-inline-threshold=500`, `-unroll-threshold=600` | replica | Each within the build-to-build spread of PGO builds: no gain |
 | Each thread's own inbox taken before its hand-off, so the buffer pool refills before fresh buffers are allocated (on step 58) | replica | Median 10.14-10.16 MB against 10.15-10.18, max 10.34 and 10.62 against 10.52 and 10.41: no change |
 | The input's page tables freed during the parse, by `munmap` of fully parsed whole 2 MB stretches | analysis, not built | At most −0.35 MB at the parse-end peak, for 15 to 20 lines, and `munmap` takes the mapping's write lock, stalling every thread's page faults; dropping pages progressively (96 calls) had already measured 0.1 ms slower than the drop at the end (step 44's probe, run-66612ee03263) |
 | Constants swept on step 58 (rows below): non-PGO screens with the Dockerfile's flags minus the profile, then two PGO builds a side for anything that might pass; every variant gave the reference output | replica | Kept as they are: 64 runs a thread, a takeover bound of 4 × threads, the prefetch 1 KB ahead (640 bytes since step 64), the buffer margin, 64 region chunks |

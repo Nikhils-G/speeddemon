@@ -194,7 +194,7 @@ Two names are confused only if they share every compared bit:
   from: waiters spinning on the CPU of the thread they waited for. It cut the spin before a wait
   yields from 2^14 to 2^12 checks (`wait`), and runs over the median + 10% went from 3.6% to 1.7%
   of 804 at the same median (PERF.md, steps 56, 65 and 67).
-- *Takeover.* If an inbox grows past 4 × threads buffers because its thread fell behind, whoever
+- *Takeover.* If an inbox grows past 2 × threads buffers because its thread fell behind, whoever
   files into it takes over its table and then yields its core: an owner that held its table had
   most likely lost its core to this filer, and gets it back. Together these keep memory bounded.
   Before the yield (step 54), about 2% of runs grew inboxes of 113 to 178 buffers and peaked at up
@@ -295,17 +295,17 @@ are exact; the distinct-name count rests on a hash (technique 6 below).
 34. Pair buffers handed to the owner's inbox, moved and not copied. Exact: every pair reaches its owner's table once (technique 7).
 35. One shared pool of empty buffers; a buffer that grew is dropped once emptied. Exact: memory policy only.
 36. Buffers sized at a run's mean share plus 2 standard deviations plus 4. Exact: a full buffer grows, so the size never drops a pair.
-37. An inbox past 4 × threads buffers is taken over by its filer, which then yields its core (`yield_now`): memory stays bounded. Exact: the takeover is under the table's lock, so a table still has one writer at a time.
+37. An inbox past 2 × threads buffers (4 × until step 69) is taken over by its filer, which then yields its core (`yield_now`): memory stays bounded. Exact: the takeover is under the table's lock, so a table still has one writer at a time.
 38. Runs claimed one at a time, 64 per thread: no barriers; a slow thread parses fewer. Exact: each run is claimed once from a counter.
 39. Claims round the file's stripes: concurrent runs rarely share a page-table page. Exact: the order of claims only.
-40. Spin, then yield, in the five waits (`wait`). Exact: the wait ends only when the counter is reached.
+40. Spin, then yield, in the four waits (`wait`). Exact: the wait ends only when the counter is reached.
 41. 32-bit keys in 8-slot buckets, compared by one AVX2 compare; free slots tested only after no key matched (`add`). Exact: slots fill in order and are never emptied, so a name is in the first bucket of its probe with a free slot or before it, and a matching slot whose row bits are 0 is empty and ends the bucket's names.
 42. The name's row + 1 inside its key: no second load after a hit. Exact: row + 1 is never 0, the empty-slot mark.
 43. 15 check bits of the hash in the row's unused group bits (groups 241..255), compared in place (`(word ^ check) >> 49`). Exact: those groups never exist (more than 240 countries aborts).
 44. A bit per group in each name's row: distinct names counted when a bit flips. Exact: a (name, country) pair flips its bit once.
 45. Tables sized from the generator's 100,000-name pool with 8 standard deviations of room, at most 5/8 full; more names stop the program. Exact: it stops; it never drops a name.
 46. Input pages dropped after the parse in two parts, one call per thread for each (`drop_pages`): the first two thirds before the last takes, the last third by the non-writers during the write; 23 TLB-shootdown rounds instead of one per block. Exact: `MADV_DONTNEED` on a private file mapping that is never written, so a later read faults the same bytes back in.
-47. Totals summed under one lock as each thread finishes, counted by `merged`; once all are in, worker 0 returns to `run`, which writes and exits without dropping pages, while the others drop their tables' pages and a share of the join table, of regions.csv and of the input's last third (`drop_pages`). Exact: sums are added, min and max taken; the output is complete before the exit.
+47. Totals summed under one lock as each thread finishes, counted by `done`, the counter of both end barriers (each thread counts twice); once all are in, worker 0 returns to `run`, which writes and exits without dropping pages, while the others drop their tables' pages and a share of the join table, of regions.csv and of the input's last third (`drop_pages`). Exact: sums are added, min and max taken; the output is complete before the exit.
 48. The main thread is worker 0, and starts the others with `pthread_create` on 256 KB stacks it allocated (`STACK`, technique 8). Exact: thread placement only.
 49. `#[inline(never)]` on `parse_run` and `add`: edits around them cannot change their register allocation. Exact: code placement only.
 50. Profile-guided build trained on generator seed 7, with atomic profile counters (Dockerfile). Items 50 and 51 change speed only: every check runs the Dockerfile's binary.
@@ -447,7 +447,7 @@ exact. The distinct-name count rests on a hash; its odds are stated in technique
 - **Bottleneck.** With a barrier after each round, one CPU shared with a busy loop made the run
   take twice as long: the board showed four runs of unchanged code at about 2x.
 - **Design.** Runs are claimed one at a time from a counter, in stripe order. A thread that falls
-  behind only lets its own inbox grow, and a filer that finds it past 4 × threads buffers takes its
+  behind only lets its own inbox grow, and a filer that finds it past 2 × threads buffers takes its
   table over. Once every thread has added its totals, thread 0 writes the output.
 - **Why exact.** Every run is claimed exactly once, every buffer is taken by exactly one table
   (under its lock), and every thread takes all inboxes once no thread files any more. The totals
@@ -469,7 +469,8 @@ exact. The distinct-name count rests on a hash; its odds are stated in technique
   - *The faulters*, a share each (`fault_in`; a quarter from 4 threads on): the page tables of the
     input and the 896 KB heap margin (`MARGIN`, nearly all of it for pair buffers; the main
     thread's share is 68 pages larger, `MAIN_EXTRA`, so that each of workers 1 to 3 charges five
-    whole batches of 64 pages and main 13), which every thread's parse waits for (`faulted`);
+    whole batches of 64 pages and main 13), which every thread's parse waits for (`ready`, which
+    also counts regions.csv's chunks);
     then their share of the name tables (three each at 12 threads), rows populated and keys
     zeroed, which every thread's first take waits for (`made`).
   - *One heap.* Every thread allocates from the main thread's heap (`mallopt(M_ARENA_MAX, 1)`), so
@@ -669,11 +670,19 @@ Evidence, on the binary the Dockerfile builds:
 - **Steps 65 to 67**, which remove the CPU move and six attributes and shorten the spin in
   `wait`, passed the same gate on two builds each, with the seed-1 hash at 1, 3, 7 and 12 CPUs
   (PERF.md, steps 65 to 67).
-- **Step 68, the submitted code**, which changes five memory constants, passed the same gate on
+- **Step 68**, which changes five memory constants, passed the same gate on
   two builds of step 64 with those constants and on its own build, with 0 of 20 runs in a fresh
   cgroup and 0 of 30 direct runs failing (PERF.md, step 68). Its one behaviour change is outside
   the spec: a listed region id from 1,000,000 to 1,048,574 now stops the program, where step 67
   accepted it; spec 2.3 lists ids below 1,000,000.
+- **Steps 69 to 71 (step 71 is the submitted code)**, which take an inbox over at 2 × threads
+  buffers and cut eleven cold lines, passed the same gate: on two builds of step 71, on step 70's
+  merge (0 of 10 runs in a fresh cgroup failing) and on two builds of step 70's cuts, with the
+  seed-1 hash at 1, 3, 7 and 12 CPUs; on a local build of each, every mutant's exit code was
+  unchanged and five fresh full seeds (7101, 7202, 7303, 7404 and 7505) were identical to the
+  reference at 1 and 8 CPUs. Step 68's
+  review (4eaa885) changed comments and wrote three subtractions as `wrapping_sub`, with
+  byte-identical `.text` (PERF.md, steps 68 to 71).
 - **Room for the names, measured.** The generator writes at most 100,529 distinct names (100,515
   to 100,524 measured). The fullest partition held at most 8,650 of its 10,240 rows (84.5%) at 12
   threads, 61.4% at one thread and 51.4% at 20. A table that filled up would stop the program,
@@ -765,7 +774,13 @@ Each line is a row of PERF.md's experiments table, with its setup there:
 - three cursors: −0.76% at step 46 (21 of 31 pairs, no faster at that sample size), +2.1% at step
   48;
 - pread instead of the mapping: no change on the box (run-4381f7c8201d);
-- `#![no_main]`, as in Track A: −0.07% for 2 more lines.
+- `#![no_main]`, as in Track A: −0.07% for 2 more lines;
+- the walker folded into the window path, one parser for every record: −27 to −35 lines for
+  +6.3% and +6.5%, about 27 more instructions a record;
+- the min and max by `.min()` and `.max()`, −5 lines: +2.5%;
+- the profile-guided build trained at full scale: +0.16% to +0.28%;
+- `-x86-cmov-converter=false`, `-inline-threshold=500` or `-unroll-threshold=600`: within the
+  noise of PGO builds.
 
 ## With another 24 hours
 
