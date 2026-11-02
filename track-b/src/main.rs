@@ -81,11 +81,13 @@ const FIRST_IDS: u64 = 10;
 const SAMPLE_BYTES: usize = 5 << 19;
 /// A query whose cover terms are expected in more 64-document blocks than this
 /// (as a share, summed over the terms) is evaluated in every superblock instead
-/// of per document. Set in step 53 and kept after a sweep on the replica with
-/// step 66's code (PERF.md, experiments): against 0.30, ALWAYS at 0.25 ran 1.20 ms
-/// slower (it won 2 of 31 pairs), 0.35 0.12 ms, 0.60 0.48 ms and 0.80 1.55 ms
-/// slower. (On the earlier block engine 0.25 beat 0.125, 0.30 and 0.5.)
-const ALWAYS: f64 = 0.30;
+/// of per document. Raised from 0.30 to 0.40 once `end_super` read one 32-byte
+/// row per term: on the replica (PERF.md, experiments), against 0.30, 0.40 ran
+/// 0.45-0.48 ms faster on seed 1 and 0.35-0.52 ms on seed 99 (PGO, 26 to 28 of 31
+/// pairs). Without PGO: 0.25 ran 0.75 ms slower, 0.35 0.35 ms faster, 0.40 0.75,
+/// 0.45 0.47 and 0.50 0.36 ms faster, 0.60 0.23 ms slower. (Set at 0.30 in step
+/// 53; on the earlier block engine 0.25 beat 0.125, 0.30 and 0.5.)
+const ALWAYS: f64 = 0.40;
 /// Documents per superblock: four blocks of 64, one AVX2 vector per row. 128 ran
 /// 12.4% slower on step 66's code (half-empty vectors, evaluated twice as often),
 /// and 512 (two vectors a row) read 6.5 ms slower in a box probe on step 50's

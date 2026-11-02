@@ -97,6 +97,8 @@ struct Key {
 /// file and mmap::PAD zero bytes.
 pub fn parse_queries(padded: &'static [u8], threads: usize) -> (Queries, Vocab) {
     let text = &padded[..padded.len() - mmap::PAD];
+    // Spec 2.3: one query per line, each ending with LF, so an empty file has none.
+    assert!(text.ends_with(b"\n"), "queries.txt: empty, or no last LF");
     // The start of the p-th of `threads` ranges of whole lines.
     let cut = |p: usize| line_after(text, text.len() * p / threads);
     let chunk = |p| &text[cut(p)..cut(p + 1)];
