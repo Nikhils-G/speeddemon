@@ -638,7 +638,11 @@ C run at that point was still step 32's run-1ef2cedeac0a (0.02147 s, S 430, 81.6
     seed 1), which every thread's parse waits for (`faulted`); then three name tables, rows
     populated and keys zeroed, which every thread's first take waits for (`made`);
   - one malloc arena for all threads (`M_ARENA_MAX`, 1), so that every allocation lands in that
-    faulted heap;
+    faulted heap. Its margin is mapped only at 11 threads or more (12 on the scoring box): there
+    the name tables' 64 KB key arrays, under malloc's 128 KB mmap threshold, grow the heap by
+    `M_TOP_PAD` before its top is taken. At 10 threads or fewer the large blocks are mapped on
+    their own, the populate stops at the heap's end, and the workers fault in their own buffers,
+    with the same output and step 59's memory (probe builds at 1 to 16 threads);
   - each table's rows reserved for its share of the names plus 4 standard deviations, 8,780 at 12
     threads, since all of them are now faulted in (the fullest table we measured held 8,650; one
     that needs more grows, correctly, on its owner's CPU).

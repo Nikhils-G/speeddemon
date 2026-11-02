@@ -441,7 +441,12 @@ exact. The distinct-name count rests on a hash; its odds are stated in technique
     threads), rows populated and keys zeroed, which every thread's first take waits for (`made`).
   - *One heap.* Every thread allocates from the main thread's heap (`mallopt(M_ARENA_MAX, 1)`), so
     every allocation lands in faulted memory; `M_TOP_PAD` (32 MB) grows that heap 32 MB at a time,
-    so the margin past its top is already mapped.
+    so the margin past its top is already mapped. That holds at 11 threads or more, as on the
+    scoring box's 12 CPUs: there the name tables' 64 KB key arrays are under malloc's 128 KB mmap
+    threshold, so they come from the heap and grow it before its top is taken. At 10 threads or
+    fewer every large block is mapped on its own, the heap stays short, the faulters' populate
+    stops at its end, and the workers fault in their own buffers: the output is the same, only the
+    memory gain is lost.
   - *Stacks.* The workers run on stacks the main thread allocated and faulted in: `pthread_create`
     with `pthread_attr_setstack`, since `std::thread` cannot take a stack. A stack is 256 KB
     (`STACK`), and a worker uses about 20 KB of it, with no recursion. Unlike the stacks pthread
