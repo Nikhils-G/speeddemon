@@ -577,7 +577,7 @@ fn finish(s: &Shared, w: usize, taken: &mut Vec<Vec<u64>>, totals: &mut [Totals;
     wait(&s.merged, threads);
     // Once every thread has added its totals, only the output is read again. This
     // thread 0, the main one, returns to `run`, which writes it and exits, without
-    // dropping anything. The others meanwhile drop their table's pages and their
+    // dropping any pages. The others meanwhile drop their table's pages and their
     // share of the join table's, of regions.csv's and of the input's last third,
     // which exit would otherwise free one by one on one core, and end. (About 1%
     // faster on the replica: PERF.md, steps 51 and 52.)
@@ -840,9 +840,8 @@ fn parse_run(
         // The region's group is read after the next record's parse: its fetch starts
         // now. Ids above the table read its last entry, which is 0 (see REGION_IDS).
         r.region_id = r.region_id.min(REGION_IDS as u64 - 1);
-        let entry = &group_of[r.region_id as usize];
         // SAFETY: a prefetch never faults.
-        unsafe { _mm_prefetch::<_MM_HINT_T0>((entry as *const AtomicU8).cast()) };
+        unsafe { _mm_prefetch::<_MM_HINT_T0>(group_of[r.region_id as usize].as_ptr().cast()) };
         r
     };
     let mut count = |r: &Record| {
