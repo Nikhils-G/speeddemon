@@ -130,13 +130,11 @@ impl Plan {
         let always_lines = par(parts, &|p| classify(&queries[p], cost, &kind)).concat();
         let lines = always_lines.len();
         let kind: Vec<u8> = kind.into_iter().map(AtomicU8::into_inner).collect();
-        let (order, rank) = term_order(&kind, sample_df);
+        let rank = term_order(&kind, sample_df);
         let bool_terms = kind.iter().filter(|&&k| k > 0).count();
         let rows = kind.iter().filter(|&&k| k == 3).count();
-        // The costs by new id, so `cover` finds the sets `classify` found.
-        let cost = |t: u32| cost(order[t as usize]);
-        // The sampled document frequency of a new id: phrases anchor on their rarest term.
-        let df = |t: u32| sample_df[order[t as usize] as usize];
+        // The sampled document frequency of an old id: phrases anchor on their rarest term.
+        let df = |t: u32| sample_df[t as usize];
         // The number of lines before part p's.
         let first = |p: usize| queries[..p].iter().map(|q| q.0.len()).sum();
         let records = |p| records(&queries[p], first(p), &rank, &df, &cost, &always_lines);
@@ -152,21 +150,28 @@ impl Plan {
         let anchor_pairs = || out.iter().flat_map(|o| &o.phrases).map(anchor);
         let always: Vec<_> = out.iter().flat_map(|o| o.always.iter().copied()).collect();
         let mut plan = Plan::default();
-        // The anchors are grouped and the `always` entries sorted on a second
-        // thread, while this one groups the entries.
+        // This thread groups the entries and numbers their lines, the first answers
+        // (see below), while two more group the anchors and sort the `always` entries
+        // (on one thread, the anchors and the sort took 1.27 ms, and the numbering
+        // ran after them).
         let (always, entries, anchors) = (Mutex::new(always), OnceLock::new(), OnceLock::new());
-        par(2, &|i| match i {
-            0 => _ = entries.set(csr(entry_pairs, bool_terms + 1)),
-            _ => {
-                // By length and operators, so that `end_super` predicts its branches.
-                always.lock().unwrap().sort_unstable_by_key(|e| {
-                    let ops = e.terms.iter().fold(e.len, |key, &w| key << 2 | w >> 30);
-                    (ops, e.terms[0] & TERM)
-                });
-                _ = anchors.set(csr(anchor_pairs, order.len()));
+        par(3, &|i| match i {
+            0 => {
+                let mut numbers = (vec![u32::MAX; lines], Vec::with_capacity(lines));
+                let (group, mut entries_of) = csr(entry_pairs, bool_terms + 1);
+                for e in &mut entries_of {
+                    e.answer = number(&mut numbers, e.answer as u32) as u16;
+                }
+                _ = entries.set((group, entries_of, numbers));
             }
+            1 => _ = anchors.set(csr(anchor_pairs, rank.len())),
+            // By length and operators, so that `end_super` predicts its branches.
+            _ => always.lock().unwrap().sort_unstable_by_key(|e| {
+                let ops = e.terms.iter().fold(e.len, |key, &w| key << 2 | w >> 30);
+                (ops, e.terms[0] & TERM)
+            }),
         });
-        let (group, entries) = entries.into_inner().unwrap();
+        let (group, entries, mut numbers) = entries.into_inner().unwrap();
         // With `force` there are only the padding entries, with terms 0.
         let fits = bool_terms <= 1 << 16 && lines <= 1 << 16 && entries.len() < 1 << 16;
         if !fits && !force {
@@ -176,40 +181,40 @@ impl Plan {
         (plan.group, plan.entries) = (group.iter().map(|&g| g as u16).collect(), entries);
         (plan.anchor, plan.anchored) = anchors.into_inner().unwrap();
         (plan.always, plan.rows) = (always.into_inner().unwrap(), rows);
-        plan.number_answers(lines);
+        // The answers are numbered in the order the scan visits them: those of the
+        // entries' lines in the entries' order (above), then the `always` ones, so
+        // that each superblock reads and writes their state as one stream (47 KB
+        // instead of 4,000 scattered lines), then the phrases. Every line gets a
+        // number: it has an entry (a cover has at least one term), is an `always`
+        // one or is a phrase.
+        let mut next = |line: &mut u32| *line = number(&mut numbers, *line);
+        plan.always.iter_mut().for_each(|e| next(&mut e.answer));
+        plan.anchored.iter_mut().for_each(|a| next(&mut a.answer));
+        (plan.answer_of, plan.line_of) = numbers;
         let trig = |id: usize| id < bool_terms && plan.group[id] != plan.group[id + 1];
         let anchoring = |id: usize| plan.anchor[id] != plan.anchor[id + 1];
         let flag = |id| anchoring(id) as u32 * ANCHOR | trig(id) as u32 * TRIG;
-        // In parallel, a range of old ids per part.
-        let word = |&id: &u32| id | flag(id as usize);
-        let ids = |p| &rank[part(rank.len(), p, parts)];
-        let info = par(parts, &|p| ids(p).iter().map(word).collect::<Vec<_>>());
-        plan.info = info.concat();
+        // In parallel, a range of old ids per part, each new id made its word in
+        // place (no copy of the parts into one array).
+        let (size, mut info) = (rank.len() / parts + 1, rank);
+        let ranges: Vec<_> = info.chunks_mut(size).map(Mutex::new).collect();
+        let word = |id: &mut u32| *id |= flag(*id as usize);
+        let range = |p: usize| ranges[p].lock().unwrap().iter_mut().for_each(word);
+        par(ranges.len(), &range);
+        drop(ranges);
+        plan.info = info;
         Some(plan)
     }
+}
 
-    /// Numbers the answers in the order the scan visits them: the `always` ones
-    /// first, so that each superblock reads and writes their state as one stream
-    /// (47 KB instead of 4,000 scattered lines), then those of the entries in
-    /// their order, then the phrases. Every line gets a number: it has an entry
-    /// (a cover has at least one term), is an `always` one or is a phrase.
-    fn number_answers(&mut self, lines: usize) {
-        (self.answer_of, self.line_of) = (vec![u32::MAX; lines], Vec::with_capacity(lines));
-        let mut number = |line: &mut u32| {
-            if self.answer_of[*line as usize] == u32::MAX {
-                self.answer_of[*line as usize] = self.line_of.len() as u32;
-                self.line_of.push(*line);
-            }
-            *line = self.answer_of[*line as usize];
-        };
-        self.always.iter_mut().for_each(|e| number(&mut e.answer));
-        for e in &mut self.entries {
-            let mut answer = e.answer as u32;
-            number(&mut answer);
-            e.answer = answer as u16;
-        }
-        self.anchored.iter_mut().for_each(|a| number(&mut a.answer));
+/// The answer number of `line` in (answer_of, line_of), the next one if it has
+/// none yet (answer_of u32::MAX).
+fn number((answer_of, line_of): &mut (Vec<u32>, Vec<u32>), line: u32) -> u32 {
+    if answer_of[line as usize] == u32::MAX {
+        answer_of[line as usize] = line_of.len() as u32;
+        line_of.push(line);
     }
+    answer_of[line as usize]
 }
 
 /// A part of the queries, as in `Queries`: its lines' spans and their terms.
@@ -225,9 +230,10 @@ struct Records {
 }
 
 /// The records of a part of the queries (`spans`, `terms`), whose lines are numbered
-/// from `first`, their terms renumbered by `rank`. By new id, `df` is a term's
-/// sampled document frequency and `cost` its cost (see `cover`); `always_lines`
-/// marks the lines evaluated in every superblock.
+/// from `first`, their terms renumbered by `rank`. By old id (the choices are
+/// made on the old ids, as in `classify`), `df` is a term's sampled document
+/// frequency and `cost` its cost (see `cover`); `always_lines` marks the lines
+/// evaluated in every superblock.
 fn records(
     (spans, terms): &Part,
     first: usize,
@@ -241,11 +247,12 @@ fn records(
     let renumber = |&word: &u32| rank[(word & TERM) as usize] | word & !TERM;
     let renumbered: Vec<u32> = terms.iter().map(renumber).collect();
     for (line, &(start, len, phrase)) in (first..).zip(spans) {
+        let old = &terms[start as usize..(start + len) as usize];
         let words = &renumbered[start as usize..(start + len) as usize];
-        let answer = line as u32; // until number_answers
+        let answer = line as u32; // until it is numbered
         if phrase {
             // The first of the rarest terms (a phrase has at least one).
-            let offset = (0..words.len()).min_by_key(|&k| df(words[k])).unwrap();
+            let offset = (0..words.len()).min_by_key(|&k| df(old[k])).unwrap();
             assert!(words.len() <= 8, "queries.txt: a phrase of over 8 terms");
             phrases.push(Phrase {
                 terms: std::array::from_fn(|k| *words.get(k).unwrap_or(&0)),
@@ -261,7 +268,9 @@ fn records(
             always.push(Entry { terms, answer, len });
             continue;
         }
-        let (cover, n, _) = cover(words, &cost);
+        // The cover by new id (its unused slots, 0, become rank[0], never read).
+        let (cover, n, _) = cover(old, &cost);
+        let cover = cover.map(|t| rank[t as usize]);
         for (i, &c) in cover[..n].iter().enumerate() {
             triggered.push((c, doc_entry(words, c, &cover[..i], answer)));
         }
@@ -290,26 +299,29 @@ fn classify((spans, terms): &Part, cost: impl Fn(u32) -> f64, kind: &[AtomicU8])
     spans.iter().map(line).collect()
 }
 
-/// The new order of the terms (old ids by new id), and each old id's new id.
-/// BOOL terms first, those of the `always` lines first among them, each part by
-/// sampled frequency, most frequent first, so the stamps, rows and entries the
-/// scan uses most share cache lines; then the phrase-only terms in id order. A
-/// counting sort by kind: 3, then 1, then 0.
-fn term_order(kind: &[u8], sample_df: &[u32]) -> (Vec<u32>, Vec<u32>) {
+/// Each old id's new id. BOOL terms first, those of the `always` lines first among
+/// them, each part by sampled frequency, most frequent first, so the stamps, rows
+/// and entries the scan uses most share cache lines; then the phrase-only terms in
+/// id order. A counting sort by kind: 3, then 1, then 0.
+fn term_order(kind: &[u8], sample_df: &[u32]) -> Vec<u32> {
     let most = sample_df.iter().copied().max().unwrap_or(0) + 1;
     // Kind 2 never occurs: bit 1 is only set together with bit 0.
     let key = |t: usize| match kind[t] {
         0 => 2 * most,
         k => (3 - k as u32) / 2 * most + most - 1 - sample_df[t],
     };
-    let keys: Vec<u32> = (0..sample_df.len()).map(key).collect();
-    let keyed = || keys.iter().enumerate().map(|(t, &k)| (k, t as u32));
-    let (_, order) = csr(keyed, 2 * most as usize + 1);
-    // Freed first, so that `rank` reuses its pages instead of faulting in fresh ones.
-    drop(keys);
-    let mut rank = vec![0; order.len()];
-    (0..order.len()).for_each(|id| rank[order[id] as usize] = id as u32);
-    (order, rank)
+    let mut keys: Vec<u32> = (0..sample_df.len()).map(key).collect();
+    // The start of each key's run of new ids, then each term, in id order, takes
+    // the next id of its key's run in place of its key: no scatter over the terms
+    // (sorting the old ids with `csr` and inverting that order took two, 0.29 ms).
+    let mut start = vec![0; 2 * most as usize + 2];
+    keys.iter().for_each(|&k| start[k as usize + 1] += 1);
+    (1..start.len()).for_each(|k| start[k] += start[k - 1]);
+    for k in &mut keys {
+        let s = &mut start[*k as usize];
+        (*k, *s) = (*s, *s + 1);
+    }
+    keys
 }
 
 /// A set of terms of which every match contains at least one, built left to
