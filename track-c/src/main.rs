@@ -846,10 +846,10 @@ fn parse_run(
     // fast_record reads the 8 bytes before a record: the header comes first.
     assert!(start >= 8, "records.csv: no header line");
     let record = |i: usize| {
-        // A non-temporal prefetch ~16 records ahead: the stream then takes less of
+        // A non-temporal prefetch ~12 records ahead: the stream then takes less of
         // L2, so more of the 1 MB region table stays there.
         // SAFETY: a prefetch never faults, and wrapping_add keeps the address defined.
-        unsafe { _mm_prefetch::<_MM_HINT_NTA>(text.as_ptr().wrapping_add(i + 1024).cast()) };
+        unsafe { _mm_prefetch::<_MM_HINT_NTA>(text.as_ptr().wrapping_add(i + 640).cast()) };
         // SAFETY: fast_end is at most text.len() - FAST_MARGIN, or 0, and i >= 8
         // (above).
         let mut r =
