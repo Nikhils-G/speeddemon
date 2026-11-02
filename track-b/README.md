@@ -50,8 +50,10 @@ Where the submitted code's time goes, on the replica of the scoring box (PERF.md
 measured": the same CPU, the board's own timer). These are step 86's phase marks, from a build
 that prints the time at each phase boundary (seed 1, medians of 9; PERF.md step 86, "What is
 left"). Steps 87 to 89 change only the start-up and the line count, step 90 takes 0.92 ms off
-the plan, step 91 keeps `csr`'s running sums in registers and cuts 18 lines, and step 92 changes
-comments and names only, with step 91's machine code (PERF.md, steps 90 to 92).
+the plan, step 91 keeps `csr`'s running sums in registers and cuts 18 lines, step 92 changes
+comments and names only, with step 91's machine code, step 93 builds with PGO trained at full
+scale (replica −0.41 and −0.38 ms), and step 94 splits the queries in one AVX2 pass (the parse
+−0.42 ms) (PERF.md, steps 90 to 94).
 
 | Phase | Ends at (ms) | What |
 |---|---|---|
@@ -331,7 +333,7 @@ names the cost it attacks, what the code does, and why the output stays the same
 | Phrases on their rarest term | Checking 19,000 phrases per document | Each phrase is anchored on its rarest sampled term, as a 64-byte record checked by one masked 32-byte compare against the document's token ids while they are in L1 | A phrase match contains its anchor, so every match is checked; a document is counted once |
 | Setup without page faults | Once setup ran in parallel, its threads mostly waited on page faults of fresh, growing vectors (on the test server the setup spent more CPU time in the kernel than in the program, 34.6 of 58 ms) | Compact pre-sized records, grouping by counting sort, a stable counting sort for the term order from 4-byte keys; freed memory kept in the heaps | Records reload each key from the same file bytes; counting sorts are permutations, which change the order terms are numbered in, never what a term is |
 | Measured on the box | Where the box spends its time cannot be profiled there | Exit-code probes, in-process A/B probes and, from Sun 13:20 UTC, a replica of the box (PERF.md, "How we measured") | Measurement only; never pushed as a scored version |
-| Build | With PGO, builds of one source ran 2.5 to 6% apart (steps 27, 32), and on step 81's code the PGO build ran 0.55 to 0.67 ms slower than a plain one | One plain release build since step 81, the same binary every time: fat LTO, `crt-static`, `target-cpu=native`; `cmov` in `probe` and `vpmovmskb` as inline asm where LLVM would branch or rebuild masks bit by bit. No loop or function alignment flags (PERF.md, steps 38 and 52's experiments) | Flags and instruction choice only |
+| Build | With PGO, builds of one source ran 2.5 to 6% apart (steps 27, 32), and on step 81's code the PGO build, trained at the sample scale, ran 0.55 to 0.67 ms slower than a plain one | A profile-guided build trained on a full-scale corpus since step 93 (one plain release build in steps 81 to 92): fat LTO, `crt-static`, `target-cpu=native`; `cmov` in `probe` and `vpmovmskb` as inline asm where LLVM would branch or rebuild masks bit by bit. No loop or function alignment flags (PERF.md, steps 38 and 52's experiments) | Flags, the profile and instruction choice only |
 
 What each technique measured, at the steps that brought it (PERF.md has every A/B):
 
@@ -351,7 +353,7 @@ What each technique measured, at the steps that brought it (PERF.md has every A/
 | Locality by numbering | 23 | test server −3.4%, L2 misses −10%; its one board run was disturbed |
 | Phrases on their rarest term | 59 | one masked compare per phrase: replica −1.049 ms (30 of 31) |
 | Setup without page faults | 15-16, 33, 55, 67-70 | 0.1713 → 0.1619 s (run-058dad4dcdce → run-3682cf4f995c); compact records (step 33): test server setup 16.8 → 11.6 ms; the pool −2.23%; steps 67-70 replica about −3.6 ms |
-| Build | 81 | plain against PGO: replica 0.86 to 1.00 ms faster; run-88a51030508d 0.072172 s |
+| Build | 81, 93 | plain against sample-trained PGO: replica 0.86 to 1.00 ms faster; run-88a51030508d 0.072172 s; PGO trained at full scale against plain (step 93): replica −0.414 ms (seed 1), −0.383 ms (holdout 99) |
 
 ### Designs replaced
 
@@ -363,7 +365,9 @@ What each technique measured, at the steps that brought it (PERF.md has every A/
 | LLVM's branch in the probe | an inline-asm `cmov` (step 9) | test server 132 → 120 ms |
 | The 64-document block engine (steps 6-48) | per-document truth tables (step 49) | 0.108491 → 0.097889 s |
 | One thread per P-core (step 14) | two per core | step 14 lost 7%, reverted |
-| PGO (steps 5-80) | one plain build (step 81) | replica 0.86 to 1.00 ms faster |
+| PGO trained at the sample scale (steps 5-80) | one plain build (step 81) | replica 0.86 to 1.00 ms faster |
+| One plain build (steps 81-92) | PGO trained at full scale (step 93) | replica −0.414 ms (seed 1), −0.383 ms (holdout 99) |
+| A byte loop for the query lines and another for their words | one AVX2 pass over spaces and LFs (step 94) | the parse −0.42 ms; replica −0.316 ms over 10 inputs |
 | simdjson-style branch-free extraction | the branchy loop | replica +1.45 to +1.73 ms, won 1 to 3 of 31 |
 | Two scans interleaved per thread | one | replica +10.535 ms (+12.32%) |
 | A 64 KB one-word filter (step 24) | none | box 0.1443 against 0.1459 s, reverted |
@@ -382,7 +386,7 @@ and the perfect hash: `split_lines`, `Vocab`, `Phf`, `Phf::fill`, `hash`, `probe
 2. Memory-mapped files with a 256-byte zero pad (`mmap::map`): full-width loads at any offset. Exact: zero is a separator, never a token byte.
 3. Transparent huge pages off, malloc's mmap threshold fixed at 1 MB, and its trim threshold at 1 GB, so freed memory stays in the heaps (`mmap::set_up_memory`): a stable memory peak, and no trim flushes the TLB of every CPU the threads ran on. Exact: no effect on the bytes. Measured: with THP left on, step 49's code ran 74.40 → 73.60 ms on the test server, but `memory.peak` rose from 35.30-38.41 to 45.20-47.24 MB, past the 44 MB credit; THP for the setup tables only was neutral on the block engine (80.72 against 80.35 ms) (PERF.md, experiments).
 4. Slices of whole lines, one per thread (`slices`, `line_after`). Exact: every cut follows an LF, so each document is in one slice, and each slice's last id must meet the next slice's first.
-5. Query lines split in parallel into pre-sized 8- and 16-byte records (`split_lines`). Exact: each key is reloaded from its own bytes.
+5. Query lines split in parallel into pre-sized 8- and 16-byte records (`split_lines`), the spaces and LFs of 32 bytes found by two AVX2 compares, each set bit ending a word (step 94). Exact: each key is reloaded from its own bytes, and every word ends at its own space or LF.
 6. Operator from the low two bits of its first byte (the bytes `A`, `N` and `O` end in binary 01, 10 and 11; `split_lines`). Exact: the grammar has only these three words.
 7. Stable counting sort `csr` for every grouping (keys by group, entries, anchors), its run ends from a fold whose sum stays in a register, written from each run's end into a vector's spare capacity, last value first. Exact: a permutation, and every slot is written once (the counts add up to the length).
 8. PTHash-style perfect hash with per-bucket pilots (`Vocab`, `place`): one slot per term. Exact: the hash says where to look; the probe decides (16).
@@ -433,7 +437,7 @@ and the perfect hash: `split_lines`, `Vocab`, `Phf`, `Phf::fill`, `hash`, `probe
 53. Output formatted in parallel, states read in place through `answer_of` (`format_part`; no 4.5 MB copy). Exact: each line reads its own states.
 54. Exit right after writing, no frees. Exact: results.txt is complete before the exit.
 55. Slice edges need no special case. Exact: a document outside a thread's slice has no stamps and no row bits there.
-56. One plain release build since step 81 (Dockerfile): on its code the profile-guided build of steps 5 to 80, trained on a sample-scale run of generator seed 7, ran 0.55 to 0.67 ms slower, and a plain build is the same binary every time. Items 56 and 57 change speed only: every check runs the Dockerfile's binary.
+56. A profile-guided build trained at full scale since step 93 (Dockerfile): an instrumented build runs once on a full-scale corpus of generator seed 7 (`b_index.py`), then the profile-use build: −0.414 and −0.383 ms against step 92's plain release build. Steps 81 to 92 built without a profile: on step 81's code the build of steps 5 to 80, trained on a sample-scale run, ran 0.55 to 0.67 ms slower. Items 56 and 57 change speed only: every check runs the Dockerfile's binary.
 57. No alignment flags (the replica: `-align-loops=64` +0.24%, `-align-all-functions=6` 0.00%); fat LTO, one codegen unit, `panic = "abort"`, `crt-static`, `target-cpu=native`, `compile_error!` without AVX2, BMI2 or AES.
 58. Exit-code and in-process timing probes on the box (PERF.md, "Box probes since step 47"). Measurement only, never a scored version.
 59. No dependencies: libc calls declared by hand.
@@ -624,6 +628,8 @@ Errors are panics with a message, and the build aborts on panic, so the exit sta
   checked at the start of `parse_queries` (step 79). Before, an empty file stopped on an index out
   of bounds in `number_answers`, and a last line without LF lost its last byte with no error: a
   BOOL query the last letter of its last term, a phrase a letter and its closing quote;
+- a queries.txt line without terms (an empty line, or `BOOL` and LF), checked in `split_lines`
+  (step 94; before, it stopped on a slice index out of bounds);
 - a docs.txt line without a TAB, or an id that is not all digits or is over 9 digits;
 - document ids that are not 0, 1, 2, ... below 2^20, each before a TAB;
 - a slice whose last id does not meet the next slice's first;
@@ -648,14 +654,14 @@ None: the Rust standard library only, with `mmap`, `madvise`, `prctl` and `mallo
 hand (`dependency_count = 0`).
 - *CPU.* The build needs AVX2, BMI2 and AES-NI (`-C target-cpu=native`; the board builds this
   track on the scoring box).
-- *No PGO.* Since step 81 the Dockerfile is one plain release build. Steps 5 to 80 used a
-  profile-guided build, trained on data from a byte-identical copy of the organisers' generator
-  (`b_index.py`, which stays in the folder for local test data and is not counted as code), with
-  LLVM's atomic profile counters. On step 81's code that build ran 0.55 to 0.67 ms slower than a
-  plain one (two PGO builds against one plain build, seed 1 and holdout 99, 26 to 30 of 31 pairs
-  on the replica), likely because its sample-scale training run no longer matches the hand-tuned
-  scan. A plain build is also deterministic: every build gives the same binary, so the board's
-  build cannot differ by layout.
+- *PGO, trained at full scale.* Since step 93 the Dockerfile builds with profile-guided
+  optimisation: an instrumented build with LLVM's atomic profile counters, one training run on a
+  full-scale corpus made by a byte-identical copy of the organisers' generator (`b_index.py`,
+  which stays in the folder and is not counted as code), and the profile-use build. On the
+  replica it ran 0.414 and 0.383 ms faster than the plain build (seed 1 and holdout 99, 25 and
+  26 of 31 pairs). Steps 5 to 80 trained on the sample scale; on step 81's code that build ran
+  0.55 to 0.67 ms slower than a plain one, so steps 81 to 92 built without a profile. PGO builds
+  of one source are not the same binary: two ran 0.419 ms apart (PERF.md, steps 93 and 94).
 - *No alignment flags.* B builds without loop or function alignment flags: on the replica they
   were 0 to 0.4% slower.
 
