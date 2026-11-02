@@ -187,6 +187,13 @@ fn main() {
             ids[ends[line] as usize] = first + (e.wrapping_sub(first) & 0xFFFF);
             ends[line] += 1;
         }
+        // The log is a block over 1 MB, an mmap of its own: dropped, the 12 threads'
+        // unmaps, which take mmap_lock for writing, ran one after the other (0.5 ms,
+        // the replica). Its pages go back now (madvise takes the lock for reading),
+        // and the mapping is left to the exit.
+        // SAFETY: the log is not read again.
+        unsafe { mmap::release(&log) };
+        std::mem::forget(log);
         Results { state, ids, ends }
     });
 
