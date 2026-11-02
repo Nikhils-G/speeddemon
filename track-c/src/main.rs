@@ -205,8 +205,9 @@ fn touch(bytes: &[u8]) {
 }
 
 /// Spins for a while, then yields the core between checks, until `count` reaches
-/// `n`. The waits (for regions.csv, for the last runs, and for every thread's
-/// totals) are short, and waking a dozen sleeping threads would take a good part
+/// `n`. The waits (for regions.csv, for the faulters' first share and for their
+/// name tables, for the last runs, and for every thread's totals) are short, and
+/// waking a dozen sleeping threads would take a good part
 /// of them (std's Barrier between rounds was about 1 ms slower per run). Yielding
 /// after the spin keeps a thread that lost its core from being starved by spinning
 /// siblings.
@@ -224,10 +225,12 @@ fn wait(count: &AtomicUsize, n: usize) {
 /// the exit status is nonzero. (For the same reason no lock is ever poisoned:
 /// `lock().unwrap()` cannot fail.)
 fn main() {
-    // M_TOP_PAD, 32 MB: a worker thread's first allocations get their own heap, which
-    // otherwise grows a few pages per mprotect, and each mprotect stalls every other
-    // thread's page faults (800 of them per run: -2.8 ms). Reserved but untouched
-    // pages cost no memory.
+    // M_TOP_PAD, 32 MB: the heap, one for all threads (M_ARENA_MAX below), grows 32 MB
+    // past each request, so the margin that the faulters fault in past `run`'s own
+    // allocations is already mapped (see `run`), and the heap seldom grows during the
+    // run. Reserved but untouched pages cost no memory. (With a heap per thread, before
+    // step 60, it spared their growth by mprotect, a few pages at a time, each of which
+    // stalled every other thread's page faults: 800 of them per run, -2.8 ms.)
     // SAFETY: a libc call that touches no memory of ours; a failure keeps the default.
     unsafe { mallopt(M_TOP_PAD, 32 << 20) };
     // PR_SET_THP_DISABLE: with transparent huge pages, touching one byte of a sparse

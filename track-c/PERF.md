@@ -1,19 +1,23 @@
 # Track C: performance log
 
-**Result.** The reference runs 14.44 s at 367 MB and S 108. The submitted code (step 59, 1eb28f0,
-S 536) is step 58 with its worker split into named functions around one documented `Shared`
-struct, the hot loops' code unchanged; its first board run took 0.017307 s (run-635fea87b55d, 10.69
-MB, 83.18 points). Step 58 ran 0.0171 to 0.0174 s in 15 of its 19 board runs: fastest
-run-0be3ea3875d4 (0.017071 s, 10.58 MB, 83.69 points), best points run-00bcea1e0afe (0.017356 s,
-9.66 MB, 83.90). Step 57, the
-same hot code, ran the fastest Track C time, 0.016978 s (run-c56b067ab64d). Three ideas carry it:
+**Result.** The reference runs 14.44 s at 367 MB and S 108. The submitted code (step 60, 779a8bf,
+S 593) is step 59 with every page its workers write faulted in by four threads only, so that only
+four CPUs keep the memory cgroup's per-CPU charge stock, which counts in the memory peak; its first
+three board runs took 0.017192 to 0.01737 s at 8.73 to 9.16 MB, 83.48 to 83.74 points
+(run-a3586e5340b9, run-04d0edce5bc1, run-6fb2a1aac4ae), where step 59's eight runs peaked at 9.76
+to 10.69 MB (83.18 to 83.55 points). Its hot loops are those of steps 57 to 59: step
+58 ran 0.0171 to 0.0174 s in 15 of its 19 board runs (fastest run-0be3ea3875d4, 0.017071 s, 10.58
+MB, 83.69 points; best points run-00bcea1e0afe, 0.017356 s, 9.66 MB, 83.90), and step 57 ran the
+fastest Track C time, 0.016978 s (run-c56b067ab64d). Three ideas carry the time:
 a simdjson-style parse that never reads a field's bytes twice (steps 6-15), cuts and a record path
 that trust spec 2.2 behind tripwires (step 25), and a join and a distinct-name count with no
-shared state, whose one random load is prefetched a whole record ahead (steps 46-49). The last
-ten steps traded 85 lines (0.56 points of S) for review fixes, a parallel teardown, two fixes of the
+shared state, whose one random load is prefetched a whole record ahead (steps 46-49). Steps 50 to
+59 traded 85 lines (0.56 points of S) for review fixes, a parallel teardown, two fixes of the
 box's rare slow and memory-heavy runs, and the worker in named functions; that last step alone,
-+49 lines, costs 0.31 points of S for the structure the review asked for. Every run ID below is in the board's history for
-team SALAAR; "probe" marks a timing build that reports through its exit code ("Box probes").
++49 lines, costs 0.31 points of S for the structure the review asked for. Step 60 spends 57 more
+lines (0.33 points of S) on about 1.8 MB of the memory peak (0.82 points of M). Every run ID below
+is in the board's history for team SALAAR; "probe" marks a timing build that reports through its
+exit code ("Box probes").
 
 | What moved the score most | Step | Board, before → after |
 |---|---|---|
@@ -24,6 +28,7 @@ team SALAAR; "probe" marks a timing build that reports through its exit code ("B
 | Pairs that wait less: memory | 31 | 12.68 → 10.63 MB, +0.62 points |
 | Instruction cuts in the record path | 37-42 | medians 0.02081 s (step 37) → 0.019321 s (step 39) |
 | One table per thread, deferred counts, the next start from the LF | 46-49 | replica −8.9% in all (step 46 −2.13%, then steps 47-49 −6.9%); best-points run 0.017362 s |
+| Only four threads fault memory, so only four CPUs keep a charge stock | 60 | 9.76-10.69 MB (step 59, eight runs) → 8.86 MB, +0.19 to +0.56 points |
 
 Every step from the reference to the current version, with the live-board run that measured it.
 Points are the board's 50·log10(K). Reruns of one commit spread about 3%, with outliers of up to
@@ -105,7 +110,8 @@ their own, or their run is not in the log; their numbers are left out rather tha
 | 56 | ffb2e77 | c-21: after the region wait, a thread that finds another of ours on its CPU moves to the lowest free CPU of its affinity mask (replica −0.39%, 115 of 201; runs over 19.5 ms 9 → 2 and 12 → 6 in two sets of 300 pairs) | run-2fae75090a37 | 0.017003 | 10.38 | 483 | 83.84 |
 | 57 | aa1fe77 (later runs from 5216711, outside the queue, and 97b4897) | c-22: a failed CPU lookup, mask read or move leaves the thread where it is, with nothing asserted (replica +0.16%, 87 of 201: the same speed) | run-9ac7e3c0222d, run-fbcbe364dd0f, run-c56b067ab64d | 0.017339, 0.017057, 0.016978 | 10.31, 10.49, 10.74 | 483 | 83.66, 83.76, 83.71 |
 | 58 | b8b733a (later runs from 3bd65f7, fabe12e, c36861d, 8a293ff, 1e8c3f0, 83a938d, 15388b9, 2b59127, 695cd44, fc30062, 5719822, 883c315, a09d036, 79fb02b, 14aa7c9, f37f273, 9b2ee21 and 41e6cfe) | c-23: the CPU move as a named function (`move_off_shared_cpu`), `mmap` errors that name their cause, `fill` indexing the codes by `(a * 26 + b) * 26 + c`, review comments; the hot code compiles as step 57's (replica −0.11%, 106 of 201; mem.sh, two sets of 20 runs, max 10.50 and 10.69 MB) | run-819427baa4d8, run-42f5d2e69825, run-a9d75c6b2bc1, run-605bf7359da0, run-8f3d7064f29b, run-c4b25673c64c, run-bdf126f964ad, run-d7bde7d8656d, run-3d113c993f70, run-dcba3fca36e7, run-b0e267d13ac4, run-f21da2b280f6, run-86571ea432fe, run-aa635b7c5107, run-00bcea1e0afe, run-978986226ae1, run-2549978efa4d, run-0be3ea3875d4, run-e38571ed449f | 0.017376, 0.020187, 0.018676, 0.017134, 0.01729, 0.017168, 0.020852, 0.017429, 0.017209, 0.028048, 0.017415, 0.017247, 0.017289, 0.017108, 0.017356, 0.017421, 0.017285, 0.017071, 0.017442 | 10.17, 10.92, 10.57, 10.16, 10.29, 10.24, 10.21, 10.89, 10.54, 10.73, 10.25, 10.67, 10.29, 10.68, 9.66, 10.45, 10.4, 10.58, 10.08 | 487 | 83.67, 81.73, 82.72, 83.82, 83.67, 83.77, 81.67, 83.34, 83.61, 78.23, 83.61, 83.54, 83.67, 83.62, 83.90, 83.52, 83.63, 83.69, 83.67 |
-| 59 | 1eb28f0 | c-25: the worker split into named functions, `worker`, `take` and `finish`, around one `Shared` struct whose fields carry the comments of the old `let`s (c-24), and the round-5 review comments; the same tokens as c-24, and the hot loops' code identical (replica −0.10% against step 58, 110 of 201; mem.sh, 20 runs, max 10.49 MB). **The submitted code** | run-635fea87b55d | 0.017307 | 10.69 | 536 | 83.18 |
+| 59 | 1eb28f0 (later runs from 12e48b1, bbce7e9, 3305ff6, 9f2993f, abc7b44, 51f656f and 03fe293) | c-25: the worker split into named functions, `worker`, `take` and `finish`, around one `Shared` struct whose fields carry the comments of the old `let`s (c-24), and the round-5 review comments; the same tokens as c-24, and the hot loops' code identical (replica −0.10% against step 58, 110 of 201; mem.sh, 20 runs, max 10.49 MB) | run-635fea87b55d, run-2bb8b45bb940, run-31a40fc39103, run-6bbc4d954b7b, run-b3818a0a731d, run-2d2cf69bdf6d, run-7435088e4032, run-c506d7aa651d | 0.017307, 0.017239, 0.017055, 0.017184, 0.017163, 0.017685, 0.017202, 0.017222 | 10.69, 10.53, 10.19, 10.21, 10.4, 9.76, 10.29, 10.15 | 536 | 83.18, 83.29, 83.55, 83.46, 83.39, 83.34, 83.41, 83.46 |
+| 60 | 779a8bf | cm5-1: every page the workers write faulted in by four threads, the main thread and workers 1-3, so that only their CPUs keep a memory-cgroup charge stock, which counts in the peak: the join table, the input's page tables, a heap margin, the name tables and the workers' stacks (`pthread_create` with a stack), and one malloc arena (replica T about +0.7%, four pairings of two builds a side; mem.sh, four sets of 20 runs, max 8.54-8.69 MB against 10.61 and 10.63 for step 59). **The submitted code** (two of its comments, on the waits and the heap pad, were brought up to date in a later commit with no token changed) | run-a3586e5340b9, run-04d0edce5bc1, run-6fb2a1aac4ae | 0.017192, 0.01737, 0.017355 | 8.86, 9.16, 8.73 | 593 | 83.74, 83.48, 83.70 |
 
 Two more runs of step 32's code were in a DISTURBED and a SLOW BOX dispatch: run-87e294d71310
 (0.022429 s) and run-dc9ee4598ca3 (0.021796 s, 11.28 MB).
@@ -117,7 +123,20 @@ dispatch for A and B); run-84ffefa565f7 0.021882 s, 10.77 MB, 81.04, and run-f93
 fall in step 35's range (0.021639 to 0.022423 s), so the pass cost no speed; it cost points
 through S (429 → 469).
 
-**The submitted code is step 59 (c-25, 1eb28f0), S 536**: step 58 with the worker split into named
+**The submitted code is step 60 (cm5-1, 779a8bf), S 593**: step 59 with every page the workers
+write faulted in by four threads, so that only four CPUs keep the memory cgroup's charge stock,
+which counts in the memory peak ("What each step taught", step 60). The parse, the tables and the
+merge are step 59's. Replica: T about +0.7% (two PGO builds a side, four pairings of 201 pairs:
++0.63% to +0.82%, against an A/A of −0.05%); mem.sh, four sets of 20 runs, max 8.54 to 8.69 MB,
+against 10.61 and 10.63 MB for step 59 in the same session. The gate passed on both builds, and
+fresh full seeds 101-130 at 1, 3 and 8 CPUs, as root and as uid 65534, gave the reference's output
+(180 of 180 runs). Board: run-a3586e5340b9, 0.017192 s, 8.86 MB, 83.74 points; run-04d0edce5bc1,
+0.01737 s, 9.16 MB, 83.48; run-6fb2a1aac4ae, 0.017355 s, 8.73 MB, 83.70; against 9.76 to 10.69 MB
+and 83.18 to 83.55 points in step 59's eight runs. Two comments (the waits in `wait`'s doc, and what
+`M_TOP_PAD` does with one heap) were brought up to date in a later commit; no token changed. By the board's formula, against step
+59's documented max of 10.49 MB: M +0.82 points, T −0.08, S −0.33 (536 → 593), net about +0.41.
+
+**Step 59 (c-25, 1eb28f0), S 536**: step 58 with the worker split into named
 functions, which the review asked for, and the round-5 review comments. `run` keeps the files, the
 sizes and the spawns (62 lines, against 177); `worker` has a thread's table and pair buffers, its
 share of regions.csv, the CPU move and the run loop with the hand-off and the takeover; `take` is
@@ -126,7 +145,8 @@ and the write or the teardown. What the threads share is one `Shared` struct, ea
 comment that sat above its `let` before. The hot loops compile as before; replica −0.10% against
 step 58 (110 of 201 pairs), equal; memory, 20 runs, 9.76 to 10.49 MB. The gate passed, and fresh
 full seeds 101-110 at 1 and 8 CPUs, as root and as uid 65534, gave the reference's output (40 of
-40). Board: run-635fea87b55d, 0.017307 s, 10.69 MB, 83.18 points. The cost is honest to state:
+40). Board: run-635fea87b55d, 0.017307 s, 10.69 MB, 83.18 points, and seven runs from later pushes,
+0.017055 to 0.017685 s at 9.76 to 10.53 MB (83.29 to 83.55 points). The cost is honest to state:
 rustfmt puts each of the struct's 23 fields on its own line in both the definition and the literal,
 so the split costs 49 lines, about 0.31 points of S, for structure rather than speed.
 
@@ -590,6 +610,64 @@ C run at that point was still step 32's run-1ef2cedeac0a (0.02147 s, S 430, 81.6
   same phases in the same order, the same locks, counters and memory, and the hot loops' code as
   before (replica −0.10%, equal). It costs 49 lines, about 0.31 points of S: rustfmt puts each of
   the 23 shared values on its own line in the struct and in its literal. S 487 → 536.
+- **Step 60: memory that only four CPUs fault.** We had counted the kernel's per-CPU charge
+  batches in every peak as outside the program's control (step 31, "How we measured"). Measured
+  at step 59's peak, the flush barrier at the end of the parse (the replica, kernel 6.12,
+  `memory.current` against `memory.stat` and smaps, 4 runs), the run held 9.56 to 10.10 MB:
+  - anonymous memory, 6.80 to 6.96 MB: the rows 3.22 (12 × 268 KB), the join table 0.98, the
+    keys 0.77, the pair buffers 0.89 (272 alive at the flush: 66 in inboxes, about 62 pooled, 144
+    held for a next run), the stacks 0.30, binary data 0.06, malloc's free chunks 10 to 40 KB per
+    arena;
+  - kernel memory, 0.72 to 0.83 MB: page tables 0.42 to 0.52, kernel stacks 0.18, slab 0.07;
+  - a gap of 1.9 to 2.6 MB: the memory cgroup's per-CPU charge stock. A fault that its CPU's stock
+    cannot cover charges a batch of 64 pages and leaves the rest, up to 63 pages (252 KB), in that
+    CPU's stock for its next faults, and `memory.peak` counts it. All 12 threads faulted, so all 12
+    CPUs held one. A memory sampler with phase marks showed 0.38 MB at `main`, 4.2 to 4.8 MB after
+    the regions phase (12 fresh stocks), and a plateau of 9.5 to 9.95 MB from about 8 ms.
+
+  Fewer threads keep fewer stocks, but cost far more time than the memory is worth (6 threads: T
+  +25.98% for −1.48 MB, "Experiments"). So the 12 threads stay, and only four of them fault, the
+  main thread and workers 1 to 3 (`FAULTERS`); `run`'s doc comment lists what each faults in:
+  - the main thread, before it starts the workers: the join table (`populate`, which is
+    `madvise(MADV_POPULATE_WRITE)`), regions.csv's page tables (`touch`, a byte read per 2 MB), the
+    first 80 KB of the heap past its own allocations, and the top 24 KB of each worker's stack. The
+    workers run on those stacks, started by `pthread_create` with `pthread_attr_setstack`:
+    `std::thread` cannot take a stack;
+  - each faulter, a quarter each (`fault_in`): the input's page tables and the 1.25 MB heap margin
+    (`MARGIN`: the workers' allocations, nearly all pair buffers, came to 1.03 to 1.17 MB on full
+    seed 1), which every thread's parse waits for (`faulted`); then three name tables, rows
+    populated and keys zeroed, which every thread's first take waits for (`made`);
+  - one malloc arena for all threads (`M_ARENA_MAX`, 1), so that every allocation lands in that
+    faulted heap;
+  - each table's rows reserved for its share of the names plus 4 standard deviations, 8,780 at 12
+    threads, since all of them are now faulted in (the fullest table we measured held 8,650; one
+    that needs more grows, correctly, on its owner's CPU).
+
+  A perf trace of each thread's user page faults (`exceptions:page_fault_user`), over 40 runs of
+  the final source, found no write fault in any of the other 8 workers in any run.
+  - *Why the output is the same.* No data changes: `MADV_POPULATE_WRITE` writes no byte, and
+    `touch` only reads. The new waits only order the work. The same tables take the same pairs,
+    and the merge and the write are step 59's.
+  - *Measured* (replica, two PGO builds a side). T: +0.82%, +0.64%, +0.63% and +0.68% over the
+    four pairings, 201 pairs each (the new code won 45 to 54 of them), against an A/A of −0.05%
+    between step 59's two builds: about +0.7%. mem.sh, four sets of 20 runs: max 8.63, 8.69, 8.54
+    and 8.61 MB, medians about 8.27, against 10.61 and 10.63 MB for step 59 in the same session
+    (10.31 to 10.53 in earlier sets). S 536 → 593. By the board's formula against step 59's
+    documented max of 20, 10.49 MB: M +0.82 points, T −0.08, S −0.33, net about +0.41.
+  - *The gate* passed on both builds, with the extra runs in "How the final number was verified".
+  - *Risks.* A failed `MADV_POPULATE_WRITE` (Linux before 5.14 does not have it) leaves the pages
+    to fault in where first touched, as in step 59: the memory comes back to about step 59's, the
+    output does not change. Under contention a worker can still fault: with a busy loop on CPU 1,
+    2 or 5, 15 runs each, the median peak was 8.43 to 8.44 MB against step 59's 9.92 to 10.24,
+    and the max 10.75 to 10.80 MB against 10.79 to 11.30, so about step 59's level, not above it.
+    Every thread now starts its parse only once the four faulters have done their first share, so
+    a faulter that loses its core delays the others' start; in the same contention runs the median
+    times were equal (32.5 to 33.4 ms against 32.7 to 33.6). The worker stacks are 256 KB, against
+    about 20 KB used, with no recursion; unlike the stacks pthread makes itself, they have no guard
+    page, so an overflow would write into the stack below instead of stopping the program.
+  - *Board.* run-a3586e5340b9, 0.017192 s, 8.86 MB, 83.74 points; run-04d0edce5bc1, 0.01737 s,
+    9.16 MB, 83.48; run-6fb2a1aac4ae, 0.017355 s, 8.73 MB, 83.70; against 9.76 to 10.69 MB and
+    83.18 to 83.55 points in step 59's eight runs.
 
 ## Box probes
 
@@ -643,6 +721,16 @@ The last three run one copy of the code with different constants, so they carry 
 | The main thread pins itself to CPU w before spawning thread w, so that the child starts there; and the same with every thread released after the region wait (step 56 work) | replica, 300 pairs against step 55 | 1 slow run against 5 and 0 against 2, but medians +1.2% (17.45 against 17.24 and 17.43 against 17.23 ms): the main thread's 11 migrations make the spawn loop 0.53 ms longer |
 | Each child started on {the main thread's CPU, its own} (step 56 work) | replica, 300 pairs against step 55 | 166 slow runs against 0, median 20.26 ms |
 | Fewer malloc arenas (`M_ARENA_MAX`) | replica, 40 runs each in 4 interleaved rounds, the expected max of 5 by bootstrap | Step 58: median 10.11 MB, expected max of 5 10.37 MB. 3 arenas 9.91 / 10.19 MB (−0.18), T +0.79% (61 of 201); 6 arenas 9.87 / 10.19 MB (−0.18), T +0.24% (89 of 201); 2 arenas T +0.97% (41 of 201), and on step 57 median −0.5 MB, T +1.07%; 4 arenas −0.15 MB, +0.39%. Two 10-run screens had suggested −0.6 to −0.7 MB on the max; 40 runs shrank it to −0.18 MB |
+| 10, 8 or 6 threads instead of 12, so that fewer CPUs keep a charge stock (step 60 work) | replica, ab.sh 201 pairs against step 59; mem.sh, max of 20 | 10: T +11.35%, 10.58 MB (the tables double to 32,768 slots); 8: T +18.53%, 9.68 MB (−0.64); 6: T +25.98%, 8.84 MB (−1.48). Step 59: 10.31 to 10.63 MB in five sets |
+| The main thread faults in everything before it starts the workers: a 7 MB heap block, the join table, the input's page tables and the stacks (nc2, step 60 work) | replica | The charge-stock gap 2 → 0.07 MB and max of 20 9.19 MB, but T +10.2%: 1.8 ms of faulting on one thread |
+| One or two faulter threads (fb, fc, step 60 work) | replica | The name tables came last: takes were skipped, inboxes piled up and workers allocated fresh pages, and an early version aborted some runs on an empty buffer pool; a first `touch` never read its byte (`black_box` of a reference). T +1.56 to +1.82%, max 9.33 to 10.97 MB |
+| The faulters also fault in the join table, 2, 3, 4 or 6 of them (fd, fe, step 60 work) | replica | T +4.83%, +1.81%, +1.50% and +0.40%; max of 20 8.31, 9.04, 8.82 and 9.30 MB; S 653 (117 more lines after rustfmt): about −0.1 points net |
+| One malloc arena (`M_ARENA_MAX` 1) alone, on step 59; and fe's structure without its pre-faulting | replica | T +2.74%, and +3.36%: every thread's faults land in one heap's mapping |
+| Each owner warms its table with `prefetchw` before its first take (step 60 work) | replica | +1.84% against +1.74% for the same variant without it: no gain |
+| Pair buffers sized for the empty name's partition, so that none regrows (step 60 work) | replica | +1.44% against +1.50% without, max 9.02 MB: no gain |
+| The main thread faults in the join table and four other threads the rest, so five threads fault (fg, step 60 work) | replica | T −0.03%, max 9.06 MB: on M and T, about 0.1 points under step 60 by the formula. With two such faulters the tables came late: T +1.12%, 10.36 MB; with three, T +0.16%, 8.95 MB |
+| Every parse waits until all name tables are made, not only the page tables and the heap margin (step 60 work) | replica | T +2.64% |
+| One counter for both of a faulter's stages, with the main thread as faulter 0 (fm, step 60 work) | replica, perf trace | A fast faulter's second count let the parse start before the main thread's share of the margin was in: 59 stray faults in `sysmalloc`. Two counters, `faulted` and `made`, fixed it in step 60 |
 | Each thread's own inbox taken before its hand-off, so the buffer pool refills before fresh buffers are allocated (on step 58) | replica | Median 10.14-10.16 MB against 10.15-10.18, max 10.34 and 10.62 against 10.52 and 10.41: no change |
 | The input's page tables freed during the parse, by `munmap` of fully parsed whole 2 MB stretches | analysis, not built | At most −0.35 MB at the parse-end peak, for 15 to 20 lines, and `munmap` takes the mapping's write lock, stalling every thread's page faults; dropping pages progressively (96 calls) had already measured slower than the drop at the end |
 | Constants swept on step 58 (rows below): non-PGO screens with the Dockerfile's flags minus the profile, then two PGO builds a side for anything that might pass; every variant gave the reference output | replica | Kept as they are: 64 runs a thread, a takeover bound of 4 × threads, the prefetch 1 KB ahead, the buffer margin, 64 region chunks |
@@ -726,8 +814,10 @@ The last three run one copy of the code with different constants, so they carry 
 - **Design for the slow CPU.** Four 2x runs of unchanged code (steps 21–24) came from one CPU
   shared with another process. Removing the barriers made the program degrade by about 15% in that
   case (22.4 → 25.8 ms on the server) instead of 2x.
-- **Memory is mostly what the data needs.** After step 33 the tables and rows are what 100,000
-  names need; the rest followed one design choice, how long pairs wait.
+- **Memory is mostly what the data needs, and the rest is worth measuring.** After step 33 the
+  tables and rows are what 100,000 names need, and the pair buffers followed one design choice,
+  how long pairs wait. The part we had filed as the kernel's was 1.9 to 2.6 MB of charge stock,
+  one per CPU that faults, and which threads fault is a design choice too (step 60).
 - **Name every collision odd.** Each change to the name keys came with the recomputed odds (steps
   29, 33 and 46), not a claim of exactness.
 - **Tune on the scoring CPU.** The 4 partitions per thread of step 18 had been the fastest on the
@@ -765,6 +855,12 @@ The box is the board's scoring machine; the test server is a 16-vCPU AMD VM. On 
   parser, ran 0.0539 s against 0.0461 (run-edc1e75d5cee, reverted); dense name ids from a shared
   table took the server from 45 to 67 ms. Per-thread partitions with buffers handed over (steps 18
   and 22) are what stayed.
+- **The memory peak counts a charge stock per CPU that faults.** The run's memory cgroup charges
+  page faults through a per-CPU stock: a CPU with no stock left charges 64 pages at once and keeps
+  the unused rest, up to 63 pages (252 KB), for its next faults, and `memory.peak` counts those
+  pages. With every one of the 12 threads faulting, that was 1.9 to 2.6 MB of step 59's 9.56 to
+  10.10 MB peak on the replica. Only four threads fault in step 60: max of 20 runs 8.54 to 8.69 MB
+  on the replica, and 8.86 MB in its first board run, against 9.76 to 10.69 MB in step 59's eight.
 - **The board's noise is bursty.** Step 46's two slow runs came in dispatches where one other track
   was slow and another fast (step 46's notes), so marking a dispatch "slow" from the other tracks
   is only a weak filter. The replica is quiet: see "How we measured".
@@ -804,7 +900,8 @@ Four tools, from the coarsest to the finest.
      the final scoring takes the largest of five peaks. Every peak includes the kernel's per-CPU
      charge batches: up to 63 pages per CPU, 0 to 3 MB at 12 CPUs, different every run (measured
      on the replica; Track A's PERF.md, "What we learned about the box"). So one binary's M varies
-     by about a megabyte from run to run.
+     by about a megabyte from run to run. In step 60 only four CPUs fault, so in a normal run that
+     part is at most about 1 MB (4 × 252 KB).
 
    Calibration against the board, on the binaries of 13:05 UTC, 21 runs each:
 
@@ -841,8 +938,15 @@ codes:
 Steps 50 to 54 passed the same gate on the replica's builds (sha256 7f533d8d563d…,
 e434a819c579…, 74d0d0bca777…, 9103dd575699… and 0dd0a9a14529…), step 55 (576fa2eac40b…) with
 the two intended changes above, steps 56 and 57 (dd1989cba606… and 6478f47c380b…), step 58
-(2f0c9e28d3c7…) and step 59 (9274986d04e0…), each against the step before: the seed-1 hash d8088b1cd42b… at
+(2f0c9e28d3c7…), step 59 (9274986d04e0…) and step 60 (two builds, e82492625b2f… and
+b801ed5a3963…), each against the step before: the seed-1 hash d8088b1cd42b… at
 1, 3, 7 and 12 CPUs, sample seed 1 and holdout 99 equal, and every mutant's exit code unchanged.
+Step 60 changes how the threads start and wait, and how many fault (`FAULTERS.min(threads)`), so
+both of its builds also ran full seed 1 at 1, 2, 3, 4, 5, 7 and 12 CPUs, and as uid 65534 at 12;
+sample seed 1 (9035fed36823…), samples 2-4 and holdout 99 (at 1 and 12 CPUs) equal to the
+references; and one build ran fresh full seeds 101-130 at 1, 3 and 8 CPUs (E-cores 12, 12-14 and
+12-19), as root and as uid 65534: 180 of 180 runs exit 0 with the reference's output and nothing
+on stderr.
 
 **Robustness runs** (replica, Sun 1 Nov about 17:00 UTC), on the exact Dockerfile build, with data
 generated on the replica by the organisers' generator (it reproduces the official sample seed 1
@@ -894,7 +998,8 @@ Step 39 also checked `objdump | grep -c vpinsrb` = 0.
 - **The replica first** (from step 42): paired runs against the code a step replaces (steps 42,
   46, 47, 48, 49, 50, 51, 52, 53 and 54: −0.90%, −2.13%, −3.54%, −2.15%, −1.36%, +0.11%, −0.45%,
   −0.68%, +0.14% and −0.28%; step 55 +0.33% and −0.10% in two builds; steps 56, 57 and 58 −0.39%,
-  +0.16% and −0.11%).
+  +0.16% and −0.11%; step 59 −0.10%; step 60 +0.63% to +0.82% over four pairings of two builds a
+  side).
 - **Probes** (see "Box probes"): before the replica, in-process A/B probes on the box. A pass is
   run once as a warm-up, then 8 times, ABBA ABBA between the shipped code and the variant, and the
   probe exits with the difference in 0.1 ms units. Both modes see the same box state, so a 0.4 ms
@@ -907,8 +1012,8 @@ Step 39 also checked `objdump | grep -c vpinsrb` = 0.
   in six clean runs, step 51 0.017095 to 0.017418 s in four, step 52 0.017135 to 0.017364 s in three clean runs, step 54 0.017101 to
   0.019528 s in three clean runs, step 55 0.020511 and 0.020647 s, with C alone slow both
   times, step 57 0.016978 to 0.017339 s (step 56: 0.017003 s), step 58 0.017071 to 0.017442
-  s in fifteen runs, and 0.018676, 0.020187, 0.020852 and 0.028048 s, and the submitted step 59
-  0.017307 s. Step 49's
+  s in fifteen runs, and 0.018676, 0.020187, 0.020852 and 0.028048 s, step 59 0.017055 to
+  0.017685 s in eight runs, and the submitted step 60 0.017192 s. Step 49's
   run-46d6bf16c5bd (84.30 points) is the best-points Track C run, and step 57's run-c56b067ab64d
   (0.016978 s) the fastest.
 - **Points** are the board's; M counts on this track, so no point value is computed here.

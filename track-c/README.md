@@ -20,13 +20,16 @@ names must be counted per country over all records.
 
 ## Where the time goes on the box
 
-The reference runs 14.44 s at 367 MB and S 108. The submitted code (PERF.md step 59, 1eb28f0,
-S 536) is step 58 with its worker in named functions, the hot loops' code unchanged; its first
-board run took 0.017307 s (run-635fea87b55d, 10.69 MB, 83.18 points). Step 58 ran 0.0171 to 0.0174
-s in 15 of its 19 board runs: fastest run-0be3ea3875d4 (0.017071 s, 10.58 MB, 83.69 points), best
-points run-00bcea1e0afe (0.017356 s, 9.66 MB, 83.90). Step 57, the
-same hot code, ran the fastest Track C time, 0.016978 s (run-c56b067ab64d). Details: PERF.md,
-steps 49-59.
+The reference runs 14.44 s at 367 MB and S 108. The submitted code (PERF.md step 60, 779a8bf,
+S 593) is step 59 with every page its workers write faulted in by four threads only, so that only
+four CPUs keep the kernel's per-CPU charge stock, which counts in the memory peak ("Memory" below);
+the parse is unchanged. Its first three board runs took 0.017192 to 0.01737 s at 8.73 to 9.16 MB,
+83.48 to 83.74 points (run-a3586e5340b9, run-04d0edce5bc1, run-6fb2a1aac4ae), where step 59's eight
+runs peaked at 9.76 to 10.69 MB. Its hot loops are those
+of steps 57 to 59: step 58 ran 0.0171 to 0.0174 s in 15 of its 19 board runs (fastest
+run-0be3ea3875d4, 0.017071 s, 10.58 MB, 83.69 points; best points run-00bcea1e0afe, 0.017356 s,
+9.66 MB, 83.90), and step 57 ran the fastest Track C time, 0.016978 s (run-c56b067ab64d). Details:
+PERF.md, steps 49-60.
 
 Per record, step 46 executed about 193 instructions in all, parse and deduplication together
 (640.9M instructions for 3.32M records at 12 threads). The single largest stall is the join
@@ -47,6 +50,7 @@ the replica than counting at once: step 48's hot path against step 46's, 198 of 
 | Distinct names in one table per thread, buffers handed over | Atomics and cache-line traffic of one shared name table |
 | Runs claimed one at a time, no barriers | One slow CPU holding up every thread |
 | Input released in two calls per thread, small pooled buffers, tables dropped in parallel, exit without frees | Memory peak and the exit's serial unmap |
+| Memory faulted in by four threads only, on one heap and pre-faulted stacks | The per-CPU charge stock that every faulting CPU adds to the memory peak |
 
 **What the parser relies on.** Spec section 2.2 lists what the generator writes, for every seed
 and scale, the holdout included, and says that a solution may rely on it. This one does:
@@ -168,8 +172,9 @@ Two names are confused only if they share every compared bit:
 
 **No waiting for a slow thread.**
 - *Claims.* The file is cut into 64 runs per thread, which threads claim one at a time. A thread
-  that loses its core to another process parses fewer runs, and its pairs wait in its inbox. No
-  thread waits for another one until the very end.
+  that loses its core to another process parses fewer runs, and its pairs wait in its inbox. Past
+  the waits at the start (for regions.csv, and for the faulters' shares of the memory, technique
+  8), no thread waits for another one until the very end.
 - *Why.* An earlier version had a barrier after each of 8 rounds, and one CPU shared with a busy
   loop made it take twice as long (42 ms instead of 22 on the test server); now it takes 25.
 - *Two threads on one CPU.* About one C run in four on the board was 20% slow: two of our threads
@@ -197,26 +202,34 @@ Two names are confused only if they share every compared bit:
   their own table's pages and a share each of the join table, of regions.csv and of the input's
   last third, which the exit would otherwise free one by one on one core.
 
-**The code's layout.** `run` maps the files, derives the sizes and spawns the threads. Each thread
-runs `worker` (its table and pair buffers, its share of regions.csv, `move_off_shared_cpu`, the run
-loop with the hand-off and the takeover), which ends in `finish` (the flush barrier, the input
-drop, the takes through `take`, the merge, then the write or the teardown). What the threads share
-is one `Shared` struct, each field with its comment.
+**The code's layout.** `run` maps the files, derives the sizes, allocates the tables, faults in the
+main thread's share of the memory and starts the workers with `pthread_create`; its doc comment
+says who faults in what. Each thread runs `worker` (for workers 0 to 3, first their share of the
+faulting, `fault_in`; then its share of regions.csv, its pair buffers, `move_off_shared_cpu`, and
+the run loop with the hand-off and the takeover), which ends in `finish` (the flush barrier, the
+input drop, the takes through `take`, the merge, then the write or the teardown). What the threads
+share is one `Shared` struct, each field with its comment, which `run` sets once in `SHARED`
+before any worker starts.
 
 **Memory.** At 12 threads the program's own data is:
 - the region table (1 MB);
 - the name tables' keys (0.79 MB: 12 tables of 16,384 4-byte slots);
 - the seen rows (3.26 MB: 100,000 names of 4 words each, a bit per possible group).
 
-The pair buffers wait for about one run, so their size follows the run size. About 3.3 MB is
-outside the program's control (measured before step 46): about 1 MB already charged when the
-program starts, about 0.7 MB of kernel page tables and stacks, and 1-2 MB of the kernel's per-CPU
-charge batching. On the replica (mem.sh): step 58, two sets of 20 runs, max 10.50 and 10.69 MB;
-step 57, 20 runs, 9.30 to 10.43 MB; step 56, the same logic, 200 runs, median 10.11 MB, max
-10.99 MB. At the parse-end peak (smaps, step 58, three runs)
-anonymous memory is 7.3 to 8.1 MB: the join table's 0.98 MB, 12 malloc arenas of 0.38 to 0.78 MB
-each (one run had a 1.4 MB arena, the pair-buffer pool at its peak) and 12 thread stacks of 20 KB;
-on top come 0.5 MB of page tables and 1.5 to 2.4 MB of the kernel's per-CPU charge stock.
+The pair buffers wait for about one run, so their size follows the run size. At step 59's peak,
+the end of the parse, the run held 9.56 to 10.10 MB (the replica, `memory.current` against
+`memory.stat` and smaps, 4 runs):
+- 6.80 to 6.96 MB of anonymous memory: the rows 3.22, the join table 0.98, the keys 0.77, the pair
+  buffers 0.89 and the stacks 0.30;
+- 0.72 to 0.83 MB of kernel memory: page tables, kernel stacks and slab;
+- 1.9 to 2.6 MB of the memory cgroup's per-CPU charge stock. A page fault is charged through its
+  CPU's stock. A CPU whose stock cannot cover a fault charges a batch of 64 pages and keeps the
+  unused rest, up to 63 pages (252 KB), for its next faults, and `memory.peak` counts those
+  pages. All 12 threads faulted, so all 12 CPUs kept one.
+
+Step 60 has only four threads fault in memory (technique 8), so only four CPUs keep a stock. On
+the replica (mem.sh, four sets of 20 runs) the max was 8.54 to 8.69 MB and the median about 8.27
+MB, against a max of 10.61 and 10.63 MB for step 59 in the same session.
 
 ## Techniques
 
@@ -227,7 +240,7 @@ are exact; the distinct-name count rests on a hash (technique 6 below).
 
 1. Both files memory-mapped (`map`): pre-warmed pages are charged to the host. Exact: the dataset is read-only.
 2. Transparent huge pages off (`prctl`): a stable memory peak. Exact: no effect on the bytes.
-3. `mallopt(M_TOP_PAD, 32 MB)`: worker heaps do not grow by `mprotect`, which stalled other threads' page faults. Exact: allocation policy only.
+3. Every page the workers write faulted in by four threads only, the main thread and workers 1 to 3 (`FAULTERS`, `fault_in`; `populate`, which is `MADV_POPULATE_WRITE`, and `touch`, a byte read per 2 MB), on one malloc heap for all threads (`mallopt(M_ARENA_MAX, 1)`, grown 32 MB at a time by `M_TOP_PAD`) and on stacks the main thread has faulted in (`pthread_create` with `pthread_attr_setstack`): only four CPUs keep a cgroup charge stock, which the memory peak counts (technique 8). Exact: `MADV_POPULATE_WRITE` writes no byte, `touch` only reads, and the waits for the faulters (`faulted`, `made`) only order the work.
 4. Cuts after the first LF followed by a digit or a BOM byte (`run_start`). Exact: by spec 2.2 such an LF ends a record.
 5. Each thread finds its own cuts: no serial pass. Exact: the cut search is monotonic, so the runs cover the file once.
 6. Tripwires: every half-run must end exactly at its cut (`assert_eq!` in `parse_run`). Exact on 2.2 input; input that moves a record boundary almost always stops here, and other breaks of 2.2 are answered as parsed ("Error handling").
@@ -264,7 +277,7 @@ are exact; the distinct-name count rests on a hash (technique 6 below).
 37. An inbox past 4 × threads buffers is taken over by its filer, which yields its core if the owner holds the table (`yield_now`): memory stays bounded. Exact: the takeover is under the table's lock, so a table still has one writer at a time.
 38. Runs claimed one at a time, 64 per thread: no barriers; a slow thread parses fewer. Exact: each run is claimed once from a counter.
 39. Claims round the file's stripes: concurrent runs rarely share a page-table page. Exact: the order of claims only.
-40. Spin, then yield, in the three waits (`wait`). Exact: the wait ends only when the counter is reached.
+40. Spin, then yield, in the five waits (`wait`). Exact: the wait ends only when the counter is reached.
 41. 32-bit keys in 8-slot buckets, compared by one AVX2 compare; free slots tested only after no key matched (`add`). Exact: slots fill in order and are never emptied, so a name is in the first bucket of its probe with a free slot or before it, and a matching slot whose row bits are 0 is empty and ends the bucket's names.
 42. The name's row + 1 inside its key: no second load after a hit. Exact: row + 1 is never 0, the empty-slot mark.
 43. 15 check bits of the hash in the row's unused group bits (groups 241..255), compared in place (`(word ^ check) >> 49`). Exact: those groups never exist (more than 240 countries aborts).
@@ -272,7 +285,7 @@ are exact; the distinct-name count rests on a hash (technique 6 below).
 45. Tables sized from the generator's 100,000-name pool with 8 standard deviations of room, at most 5/8 full; more names stop the program. Exact: it stops; it never drops a name.
 46. Input pages dropped after the parse in two parts, one call per thread for each (`drop_pages`): the first two thirds before the last takes, the last third by the non-writers during the write; 23 TLB-shootdown rounds instead of one per block. Exact: `MADV_DONTNEED` on a private file mapping that is never written, so a later read faults the same bytes back in.
 47. Totals summed under one lock as each thread finishes, counted by `merged`; once all are in, thread 0 writes and exits without frees, while the others drop their tables' pages and a share of the join table, of regions.csv and of the input's last third (`drop_pages`). Exact: sums are added, min and max taken; the output is complete before the exit.
-48. The main thread is worker 0; a thread that finds another of ours on its CPU after the region wait moves to a free CPU of its affinity mask (`move_off_shared_cpu`, `sched_setaffinity`), and a failed call leaves it where it is. Exact: thread placement only.
+48. The main thread is worker 0, and starts the others with `pthread_create` on 256 KB stacks it allocated (`STACK`, technique 8); a thread that finds another of ours on its CPU after the region wait moves to a free CPU of its affinity mask (`move_off_shared_cpu`, `sched_setaffinity`), and a failed call leaves it where it is. Exact: thread placement only.
 49. `#[inline(never)]` on `parse_run` and `add`: edits around them cannot change their register allocation. Exact: code placement only.
 50. Profile-guided build trained on generator seed 7, with atomic profile counters (Dockerfile). Items 50 and 51 change speed only: every check runs the Dockerfile's binary.
 51. Hot loops aligned to 64 bytes; fat LTO, one codegen unit, `panic = "abort"`, `crt-static`, `target-cpu=native`; `compile_error!` without AVX2, PCLMULQDQ or AES.
@@ -411,9 +424,34 @@ exact. The distinct-name count rests on a hash; its odds are stated in technique
 
 ### 8. Memory and exit
 
-- **Bottleneck.** The pair buffers, the name tables, and the exit's unmap of the 202 MB input
-  (about 6 ms on the box, measured by a probe).
+- **Bottleneck.** The memory peak: the pair buffers, the name tables, and the charge stock that
+  every CPU that faults keeps (1.9 to 2.6 MB of step 59's peak, "Memory" above); and the exit's
+  unmap of the 202 MB input (about 6 ms on the box, measured by a probe).
 - **Design.**
+  - *Who faults.* Only four threads fault in the memory the workers write: the main thread and
+    workers 1 to 3 (`FAULTERS`), never the other eight. Fewer threads would keep fewer stocks but
+    cost far more time (6 threads: +26% for −1.5 MB; PERF.md, experiments).
+  - *The main thread*, before it starts the workers: the join table (`populate`, which is
+    `madvise(MADV_POPULATE_WRITE)`), the page tables of regions.csv (`touch`, a byte read per 2
+    MB), the first 80 KB of the heap past `run`'s own allocations, and the top 24 KB of each
+    worker's stack (`STACK_USED`).
+  - *The faulters*, a share each (`fault_in`; a quarter from 4 threads on): the page tables of the
+    input and the 1.25 MB heap margin (`MARGIN`, nearly all of it for pair buffers), which every
+    thread's parse waits for (`faulted`); then their share of the name tables (three each at 12
+    threads), rows populated and keys zeroed, which every thread's first take waits for (`made`).
+  - *One heap.* Every thread allocates from the main thread's heap (`mallopt(M_ARENA_MAX, 1)`), so
+    every allocation lands in faulted memory; `M_TOP_PAD` (32 MB) grows that heap 32 MB at a time,
+    so the margin past its top is already mapped.
+  - *Stacks.* The workers run on stacks the main thread allocated and faulted in: `pthread_create`
+    with `pthread_attr_setstack`, since `std::thread` cannot take a stack. A stack is 256 KB
+    (`STACK`), and a worker uses about 20 KB of it, with no recursion. Unlike the stacks pthread
+    makes itself, these have no guard page.
+  - *Rows.* Each table reserves rows for its share of the names plus 4 standard deviations (8,780
+    at 12 threads; the fullest we measured held 8,650), all faulted in by its faulter; a table
+    that needs more grows, on its owner's CPU.
+  - *Checked.* A perf trace of each thread's user page faults, over 40 runs, found no write fault
+    in any of the other eight workers. Replica, max of 20 runs: 8.54 to 8.69 MB against 10.61 and
+    10.63 for step 59, for about 0.7% of time (PERF.md, step 60).
   - *Release.* Once no thread files pairs any more, each thread drops its share of the input's
     first two thirds in one call, and the threads other than the writer drop the last third while
     it writes: 23 TLB-shootdown rounds in all. Dropping each 8 runs' pages as they were
@@ -425,12 +463,18 @@ exact. The distinct-name count rests on a hash; its odds are stated in technique
     table and of regions.csv's 532 pages, and the input's last third, which the exit would
     otherwise free one by one on one core: about 1% faster on the replica over steps 51 and 52
     (PERF.md).
-  - *Allocator.* Transparent huge pages are off, and `M_TOP_PAD` stops each thread's heap from
-    growing a few pages per `mprotect`.
-- **Why exact.** Dropped input pages are never written, so a later read faults them back in from
-  the page cache. That is why it is `MADV_DONTNEED` and not `munmap`. The tables and the join
-  table would read back as zeros, so they are dropped only after every thread has added its
-  totals: from then on only the sums and the country names (copies) are read.
+  - *Huge pages* are off (`prctl`), so that touching a byte cannot fault in a whole 2 MB page.
+- **Why exact.** Faulting changes no data: `MADV_POPULATE_WRITE` writes no byte (a new page reads
+  as zeros, as it would at its first touch), `touch` only reads, and the waits for the faulters
+  only order the work; the same tables take the same pairs. Dropped input pages are never written,
+  so a later read faults them back in from the page cache. That is why it is `MADV_DONTNEED` and
+  not `munmap`. The tables and the join table would read back as zeros, so they are dropped only
+  after every thread has added its totals: from then on only the sums and the country names
+  (copies) are read.
+- **If it fails.** On a kernel without `MADV_POPULATE_WRITE` (before Linux 5.14) the call fails
+  and the pages fault in where they are first touched: about step 59's memory, the same output.
+  Under contention a worker can still fault: with a busy loop on one CPU, the max of 15 runs was
+  10.75 to 10.80 MB against step 59's 10.79 to 11.30 (PERF.md, step 60).
 
 ### 9. Build
 
@@ -475,6 +519,8 @@ have. The arguments, gathered from the techniques above:
   the order in which records are counted, and every record is counted once (technique 4). Every run
   is claimed once and every buffer taken by one table under its lock; thread 0 writes the output
   only after every thread has added its totals (technique 7).
+- **Faulted memory.** Faulting pages in ahead writes no byte, and the waits for the faulters only
+  order the work (technique 8).
 - **Released memory.** Dropped input pages fault back in with the same bytes; the tables are
   dropped only after every total is in (technique 8).
 - **Evidence.** The seed-1 hash at 1, 3, 7 and 12 CPUs, sample seeds 2-4 and holdout seed 99 at
@@ -530,8 +576,9 @@ Evidence, on the binary the Dockerfile builds:
   one cut after a one-decimal amount, answered like any one-decimal amount, which the reference
   rejects.
 - **Robustness runs on the replica** (Sun 1 Nov, about 17:00 UTC), on the exact Dockerfile build
-  of step 52 (steps 53, 54 and 56 to 58 change no output path, step 55 only a last record without
-  a terminator, which the generator never writes; all passed the gate), with data generated on the replica by the organisers' generator (Python 3.11, which
+  of step 52 (steps 53, 54 and 56 to 59 change no output path, step 55 only a last record without
+  a terminator, which the generator never writes; all passed the gate; step 60's own runs are
+  below), with data generated on the replica by the organisers' generator (Python 3.11, which
   reproduces the official sample seed 1 and its reference output byte for byte). Every run was
   byte-exact, with no crash, no nonzero exit and no output on stderr:
   - 30 fresh full-scale seeds (101-130) at 12 threads, seeds 101-102 also at 1 and 3 CPUs and
@@ -543,10 +590,16 @@ Evidence, on the binary the Dockerfile builds:
     20 CPUs for both users: 840 of 840;
   - copies of seed 101 whose every file is an exact multiple of 4096 bytes, so that a read past
     the end of a file would fault, at 1, 3, 7, 12 and 20 CPUs: 5 of 5.
+- **The submitted code, step 60** (Mon 2 Nov, the replica's build of the Dockerfile), which
+  changes how the threads start, wait and fault: fresh full seeds 101-130 at 1, 3 and 8 CPUs (one,
+  three and four faulters), as root and as uid 65534: 180 of 180 runs exit 0 with the reference's
+  output and nothing on stderr; and with a busy loop on CPU 1, 2 or 5, 15 runs each, every output
+  exact.
 - **Room for the names, measured.** The generator writes at most 100,529 distinct names (100,515
   to 100,524 measured). The fullest partition held at most 8,650 of its 10,240 rows (84.5%) at 12
   threads, 61.4% at one thread and 51.4% at 20. A table that filled up would stop the program,
-  never drop a name.
+  never drop a name. Step 60 faults in 8,780 rows a table at 12 threads; a table that needs more
+  grows, with the same output and a little more memory.
 - **Time and memory on other seeds.** On the 30 fresh seeds step 52 ran 17.61 to 18.09 ms (medians
   of 7 runs). Seed 1, at 17.19 ms, is about 4% faster than a typical fresh seed. The memory peak
   on seeds 101-110 was 10.23 to 11.19 MB (max of 5 runs; seed 1: 10.51 MB). About one run in 50
@@ -608,7 +661,8 @@ removed (PERF.md, step 25).
 ## Dependencies
 
 None: the Rust standard library only, with `mmap`, `madvise`, `mallopt`, `prctl`, `sched_getcpu`,
-`sched_getaffinity` and `sched_setaffinity` declared by hand. The build needs AVX2, PCLMULQDQ and AES (the Dockerfile builds with `target-cpu=native`);
+`sched_getaffinity`, `sched_setaffinity`, `pthread_attr_init`, `pthread_attr_setstack` and
+`pthread_create` declared by hand. The build needs AVX2, PCLMULQDQ and AES (the Dockerfile builds with `target-cpu=native`);
 without them a `compile_error!` stops it.
 
 ## With another 24 hours
