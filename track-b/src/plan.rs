@@ -295,8 +295,11 @@ fn term_order(kind: &[u8], sample_df: &[u32]) -> (Vec<u32>, Vec<u32>) {
         0 => 2 * most,
         k => (3 - k as u32) / 2 * most + most - 1 - sample_df[t],
     };
-    let keyed: Vec<_> = (0..sample_df.len()).map(|t| (key(t), t as u32)).collect();
-    let (_, order) = csr(|| keyed.iter().copied(), 2 * most as usize + 1);
+    let keys: Vec<u32> = (0..sample_df.len()).map(key).collect();
+    let keyed = || keys.iter().enumerate().map(|(t, &k)| (k, t as u32));
+    let (_, order) = csr(keyed, 2 * most as usize + 1);
+    // Freed first, so that `rank` reuses its pages instead of faulting in fresh ones.
+    drop(keys);
     let mut rank = vec![0; order.len()];
     (0..order.len()).for_each(|id| rank[order[id] as usize] = id as u32);
     (order, rank)

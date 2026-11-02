@@ -10,6 +10,7 @@ const MAP_PRIVATE: i32 = 0x02;
 const MAP_FIXED: i32 = 0x10;
 const MAP_ANONYMOUS: i32 = 0x20;
 const MADV_DONTNEED: i32 = 4;
+const M_TRIM_THRESHOLD: i32 = -1;
 const M_MMAP_THRESHOLD: i32 = -3;
 /// x86-64's base page size.
 const PAGE: usize = 4096;
@@ -33,11 +34,16 @@ unsafe extern "C" {
 ///   own mapping (with this setup: -1.1 ms). Larger blocks, such as the scan's
 ///   first-id logs, stay mmaps, whose pages cost nothing until written: from a
 ///   heap, calloc would clear them (8 MB more at 32 MB).
+/// - Freed memory stays in the heaps: a trim (an sbrk shrink) flushes the TLB of
+///   every CPU the threads ran on, and each step frees tables that the next ones
+///   reuse (Plan::new's drops took 0.25 ms with trims).
 pub fn set_up_memory() {
     // SAFETY: a plain syscall wrapper; failure only means THP stays on.
     unsafe { prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0) };
     // SAFETY: a libc call that touches no memory of ours; failure keeps the default.
     unsafe { mallopt(M_MMAP_THRESHOLD, 1 << 20) };
+    // SAFETY: as above.
+    unsafe { mallopt(M_TRIM_THRESHOLD, 1 << 30) };
 }
 
 /// Zero bytes mapped after the end of every file: fixed-size loads (64-byte
