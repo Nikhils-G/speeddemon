@@ -56,15 +56,21 @@ PERF.md, "Where the scan's time goes"):
 
 37% of the tokens are of no row term and go to one sink row, whose word every such token ORs.
 
-The reference runs 56.35 s at 2,200 MB and S 91. The submitted code (PERF.md step 76, 433d16b,
-S 1142) is step 75 with review comments, the same code token for token; its one board run,
-0.094031 s, came with B alone slow. Step 75 is step 73 split into modules, with the scan's machine code unchanged (step 74), and with
+The reference runs 56.35 s at 2,200 MB and S 91. The submitted code (PERF.md step 77, bt9-1,
+3305ff6, S 1155) is step 76 with a cheaper token path (design 2, *Presence and lists*): each
+stamp's cache line fetched for writing just before its store, the trigger and anchor lists
+left-packed 8 lanes per store, keys loaded from the window's start, and the term table read once
+per scan. Its board run, run-afcb0c2c9346, took 0.074272 s at 31.38 MB for 80.72 points, the
+fastest Track B time and the best Track B points; the best before it was step 70's
+run-aecc0a5f3a09 (0.078573 s, 32.06 MB, S 1099, 80.27 points). Step 76 is step 75 with review
+comments, the same code token for token (its one board run, 0.094031 s, came with B alone slow).
+Step 75 is step 73 split into modules, with the scan's machine code unchanged (step 74), and with
 the query parts kept as the threads split them (step 75). Its board run, run-54d2972c3d09, took
 0.078867 s at 31.53 MB for 80.10 points; step 74's, run-9c2169af7f30, took 0.078856 s at 32.26 MB.
-Step 70's run-aecc0a5f3a09 (0.078573 s, 32.06 MB, S 1099, 80.27 points) is the fastest Track B
-time and the best Track B points. On the replica step 66 runs in about 81.0 ms, steps 67 to 70
-about 3.6 ms less and steps 72, 73 and 75 about 1.3 ms less again, against 83.7 ms for step 65,
-90.6 ms for step 53 and 97.2 ms for step 49 (details: PERF.md, steps 52-76).
+On the replica step 66 runs in about 81.0 ms, steps 67 to 70 about 3.6 ms less, steps 72, 73 and
+75 about 1.3 ms less again and step 77 about 2.8 ms less again (2.1 to 2.5 ms on holdout 99),
+against 83.7 ms for step 65, 90.6 ms for step 53 and 97.2 ms for step 49 (details: PERF.md, steps
+52-77).
 
 ## The design
 
@@ -72,8 +78,9 @@ There is no index. The queries are read first, the corpus is scanned once in par
 whole lines, and every query is answered during that scan, so nothing grows with the corpus. The
 board measured 37.52 to 40.32 MB for steps 52 to 55, 30.93 to 31.57 MB for step 58 and 30.11 and
 30.25 MB for step 59, 29.97 to 30.63 MB for steps 61 and 62, 29.96 to 30.45 MB for steps 63 and
-64, 30.21 to 30.28 MB for step 65, 32.17 to 34.16 MB for step 66, and 31.67 to 32.72 MB for
-steps 67 to 69; the replica's max of 10 runs of step 69 was 32.73 MB, under the 44 MB credit.
+64, 30.21 to 30.28 MB for step 65, 32.17 to 34.16 MB for step 66, 31.67 to 32.72 MB for steps 67
+to 69, and 31.38 MB for the submitted step 77; the replica's max of 10 runs of step 69 was
+32.73 MB, and of 20 runs of step 77 31.26 MB, under the 44 MB credit.
 malloc's mmap threshold is fixed at 1 MB, with transparent huge pages off (`mmap::set_up_memory`):
 at 32 MB the scan's first-id logs came from cleared heap and the peak reached 40 MB.
 
@@ -156,6 +163,15 @@ at 32 MB the scan's first-id logs came from cleared heap and the peak reached 40
        same whichever seed succeeds.
    - *Long terms.* Terms of 13 to 32 bytes (0.2% of the tokens) go to a cold hash map. Their slots
      sit after the hash's, so the scan treats both alike.
+   - *Presence and lists.* `look_up` probes a document's tokens in one loop that stores only their
+     info words, then passes over them 8 at a time. For each token it writes the stamp (design 3)
+     and the row bit (design 4), and fetches the stamp's line for writing (`prefetchw`) just
+     before the stamp store: stores commit in order, so a stamp store that missed L1 held up every
+     store after it, while the prefetch fetches the line out of order. For the 8 tokens together
+     it left-packs the trigger occurrences and the anchors' positions, 8 lanes per store
+     (`vmovmskps`, `pdep`/`pext`, `vpermd`, as in design 3's evaluation), instead of two scalar
+     stores per token. Against step 76: replica −2.1 to −2.8 ms, and store-buffer stalls 161M →
+     50M cycles for the prefetch alone (PERF.md, step 77).
 3. **BOOL queries, per document, from truth tables.**
    - *Covers.* A query is evaluated only in documents that contain one of its *cover* terms: a set
      of terms of which every match contains at least one, chosen to be rare in the sample.
@@ -210,9 +226,9 @@ at 32 MB the scan's first-id logs came from cleared heap and the peak reached 40
 7. **Phrases.**
    - *Anchors.* Each phrase is anchored on its rarest sampled term. Its 64-byte record holds its
      first 8 term ids, its answer, the anchor's position and its length.
-   - *Fetching.* When a token's info word has the ANCHOR flag, the anchor's range of records is
-     prefetched; at the document's end, each anchor's first record is fetched before the BOOL
-     evaluation and read after it.
+   - *Fetching.* `look_up` lists the positions of the document's tokens whose info word has the
+     ANCHOR flag (design 2); at the document's end, each anchor's first record is prefetched before
+     the BOOL evaluation and read after it.
    - *Check.* Every phrase is checked by one masked 32-byte compare against the document's token
      ids, which are still in L1. `look_up` writes 8 ids of `miss` after each document's tokens, so
      the 8 ids from any phrase start exist, and none equals a phrase term (`miss` is the id of every
@@ -251,6 +267,7 @@ names the cost it attacks, what the code does, and why the output stays the same
 | SIMD tokenizer, prefetched lookups | 36.3M tokens to find and look up | AVX2 classifies 64 bytes into token and LF bitmaps; windows end at a non-token byte, so starts and lengths are bit operations; each slot is prefetched when its token is found, and a document's tokens are all found before any is probed | A token is exactly a maximal run of `[A-Za-z0-9]`; the key is its bytes OR 0x20, masked to its length |
 | Truth tables per document | A BOOL query's left-to-right formula over up to 6 terms, in 5.51M evaluations on seed 1 | The plan folds each (query, cover term) into a 32-bit table over the other terms' presence; an evaluation is 5 stamp compares and one bit of the table, 8 entries at a time | Bit a of the table is the spec's left-to-right evaluation with exactly those terms present; the earlier-cover rule makes one entry count each document |
 | One-byte stamps | A per-thread record of each term's last document, written for every token | The stamp is the document's id mod 127, reset every 127 documents: 75 KB per thread instead of 303 KB of u32 | An equal stamp can only be this document's: within a window each stamp belongs to one document, and the reset value matches none |
+| Presence stores and lists, 8 at a time | Stores commit in order, so a stamp store that misses L1 holds up the stores after it (store buffer full in 168M of 1,620M cycles, about 119M of them from that store); two scalar list stores per token | A second pass over the document's ids fetches each stamp's line for writing (`prefetchw`) just before its store, and left-packs the trigger and anchor lists 8 lanes per store (`vmovmskps`, `pdep`/`pext`, `vpermd`) | The same stores and the same lists in the same order; a prefetch changes no data, and the 8 `miss` ids after the tokens have no flag and go to the sinks |
 | Cover triggers from a sample | 121M evaluations if every query ran on every 64-document block | From a 2.5 MB sample, each query gets a cover, a set of terms every match contains; it is evaluated only in documents with a cover term; queries with common covers run per 256 documents with AVX2 | A document without a cover term holds no match. The sample only decides where a query is evaluated, never its result |
 | Eight entries at a time | Per entry, five scalar stamp loads and a write of the answer state whether it matched or not; a loop per range that mispredicted | Each fresh trigger term's entry indices go 8 per store into one list; each 8 are evaluated with 11 AVX2 gathers (terms, stamps, truth tables); the matches are left-packed (`pdep`, `pext`, `vpermd`) and only they update their answers | Each lane is the scalar evaluation; the last batch's spare lanes hold a padding entry whose table is 0; prefetches read nothing the program uses |
 | Popcount sums and first ids | Count, id sum and ten smallest ids without a loop over documents | Per matching entry, `state += 1 << 40 \| doc`; per superblock, count = popcount and sum = `base * popcount(w) + sum_k 2^k * popcount(w & M_k)`, AVX2 nibble tables for 256 documents; first ids by trailing-zero counts while fewer than ten | Integer identities; per-thread sums below 2^39 (checked) |
@@ -293,9 +310,9 @@ and the perfect hash: `split_lines`, `Vocab`, `Phf`, `place_regions`, `hash`, `p
 21. Windows that end at their last non-token byte, so no token crosses one: token starts `mask & !(mask << 1)` clipped there with `bzhi`, no carry (`Scan::run`); tokens of 63 bytes or more on a cold path (`long_run`). Exact: every token is scanned whole, in one window.
 22. Token length from the start and last-byte masks, one `tzcnt` each. Exact: the distance from a token's first byte to its last.
 23. Slot's byte offset computed and prefetched when the token is found; a document's tokens all found before any is probed (`pending`, `look_up`): the misses overlap. Exact: a prefetch reads nothing the program uses.
-24. Writes into reserved capacity through raw pointers, no capacity checks (`pending`, `toks`, `trig`; `trigger`'s `evals` and `hits`, as long as the entries). Exact: each loop reserves room for the most it can write (for example `reserve(32)` per 64-byte window), and `trigger` writes each real entry at most once plus 8 lanes, as their SAFETY comments argue.
-25. One-byte stamp of each term's last document, written for every token (`lastdoc`, `STAMPS`). Exact: an equal stamp is always this document's (design 3).
-26. Every trigger occurrence written branch-free, each term taken once per document by its DONE mark (`look_up`, `trigger`). Exact: the first occurrence keeps its range; later ones are written over.
+24. Writes into reserved capacity through raw pointers, no capacity checks (`pending`, `toks`, `trig`, `anchors`; `trigger`'s `evals` and `hits`, as long as the entries). Exact: each loop reserves room for the most it can write (for example `reserve(32)` per 64-byte window, and the document's tokens plus 8 for `look_up`'s lists, whose stores write 8 lanes), and `trigger` writes each real entry at most once plus 8 lanes, as their SAFETY comments argue.
+25. One-byte stamp of each term's last document, written for every token, its line fetched for writing (`prefetchw`) just before the store, so that a miss does not hold up the stores after it (`lastdoc`, `STAMPS`, `look_up`). Exact: an equal stamp is always this document's (design 3); a prefetch changes no data.
+26. Every trigger occurrence and anchor position kept without a branch, left-packed 8 lanes per store (`look_up`, `left_pack`), and each trigger term taken once per document by its DONE mark (`trigger`). Exact: `left_pack` keeps exactly the lanes whose flag is set, in order, and the 8 `miss` ids after the tokens have no flag; the first occurrence keeps its range, and later ones are written over.
 27. Non-row tokens all land on one sink row: the row index is `id.min(rows)`, which LLVM compiles to `cmovb` (checked in the PGO binary), so there is no branch on the kind. Exact: the sink is no query's row.
 28. Cover sets: a set of terms every match contains, cheapest by sampled frequency (`cover`). Exact: a document without a cover term holds no match.
 29. Cost model `1 - (1 - df / n)^64`: the share of 64-document blocks that contain a term (`Plan::new`). Exact: it only chooses the path a query takes.
@@ -316,7 +333,7 @@ and the perfect hash: `split_lines`, `Vocab`, `Phf`, `place_regions`, `hash`, `p
 44. First ids written branch-free, 4 bytes each, and kept only while fewer than ten (`add`, `add_doc`). Exact: documents are scanned in order and bits come out in increasing order, so the first ten logged are the ten smallest of the slice; an id is rebuilt from its low 16 bits and its slice's first id, exact while a slice holds at most 2^16 documents: at least 8 slices (`MIN_SLICES`), and `slices` cuts a range of more than 2^16 documents every 2^16 lines; an assert checks it.
 45. Count and id sum packed in one `u64` (`SUM_BITS`), so threads' states add as plain integers. Exact: sums below 2^39, checked by an assert.
 46. Phrases anchored on their rarest sampled term, as 64-byte records (`Phrase`), checked at document end while the ids are in L1 (`end_doc`). Exact: every match contains its anchor.
-47. The anchor's records prefetched when its token is looked up, and its first record fetched before the BOOL evaluation (`look_up`, `end_doc`). Exact: prefetches read nothing the program uses; the phrases update other answers than the BOOL entries, so the order does not matter.
+47. The anchors' positions listed by `look_up`, and each anchor's first record prefetched before the BOOL evaluation and read after it (`look_up`, `end_doc`). Exact: prefetches read nothing the program uses; the phrases update other answers than the BOOL entries, so the order does not matter.
 48. One masked 32-byte compare per phrase, 8 ids from its start (`end_doc`). Exact: `bzhi` keeps exactly the phrase's terms in the compare mask, and the 8 `miss` ids that `look_up` writes after the document's tokens match no term, so a phrase never matches past the document's end.
 49. Per-phrase last-document marker, so a document counts once. Exact: a second match in the same document is not counted.
 50. Answer state written at allocation (`written_zeros`, `black_box`): a lazily zeroed page read first would fault twice. Exact: it writes the zeros the state starts with.
@@ -369,6 +386,13 @@ and the perfect hash: `split_lines`, `Vocab`, `Phf`, `place_regions`, `hash`, `p
   documents (the slice's first window starts reset). Within a window each stamp value belongs to
   one document, so a term's stamp equals this document's only if the term occurred in it. 0xFF,
   with the DONE bit masked off, is 127, which no stamp equals.
+- **Presence and lists, 8 at a time.** `look_up`'s second pass makes the stores the per-token loop
+  made, each token's stamp and row bit, and a prefetch changes no data. `left_pack` keeps exactly
+  the lanes whose flag bit is set, in order, so the trigger and anchor lists hold what the scalar
+  code kept; spare lanes are overwritten by the next store or lie past the list's end, inside the
+  8 extra entries each list reserves. The last 8 ids may include some of the 8 `miss` ids written
+  after the tokens: `miss` has no flag, so no list keeps one, and its stamp and row bit go to
+  `miss`'s own stamp and the sink row, which no evaluation reads.
 - **Covers.** A document without any cover term of a query holds no match of it, so skipping it is
   exact.
 - **Superblocks.** Bit i of a row word is "document base + i contains the term", so the word
@@ -455,7 +479,8 @@ Evidence, on the binary the Dockerfile builds:
   fresh-seed, repeat, tiny/sample and edge suites again, 1,426 runs each, all exact; steps 67 to 75
   change the setup, the page releases at the end and how `look_up` keeps anchor positions, and
   passed the gate, but of seeds 101-130 only 109 ran again, in step 70's A/B, with the same output
-  as step 69's), with data generated on the replica by the organisers' generator (Python 3.11, which
+  as step 69's; step 77 ran all 30 again, below), with data generated on the replica by the
+  organisers' generator (Python 3.11, which
   reproduces the official sample seed 1 and its reference output byte for byte). Every run was
   byte-exact, with no crash, no nonzero exit and no output on stderr:
   - 30 fresh full-scale seeds (101-130) at 12 threads, seeds 101-102 also at 1 and 3 CPUs and
@@ -467,6 +492,13 @@ Evidence, on the binary the Dockerfile builds:
     20 CPUs for both users: 840 of 840;
   - copies of seed 101 whose every file is an exact multiple of 4096 bytes, so that a read past
     the end of a file would fault, at 1, 3, 7, 12 and 20 CPUs: 5 of 5.
+- **The submitted code's final gate** (step 77, on the replica, Mon 2 Nov), every output
+  byte-equal to the reference: fresh full seeds 101-130 at 1, 3, 7 and 12 CPUs (120 of 120 runs);
+  tiny and sample seeds 201-210 as root and as uid 65534 at 1, 3, 12 and 20 CPUs (160 of 160);
+  holdout 99 at nine CPU counts from 1 to 20 (9 of 9); 20 repeats of seed 101 at 12 and at 20 CPUs
+  (40 of 40); 18 board-like edge cases at 1 and 12 CPUs as both users (72 of 72); and the gate's
+  144 runs and 66 hand-made edge runs. Memory, max of 20 runs, 31.26 MB (PERF.md, "How the final
+  number was verified").
 - **The perfect hash, forced.** The per-region retry ran end to end from forced start seeds: in
   300 runs, 20 placed a region again, and all were exact.
 - **Time and memory on other seeds.** On the 30 fresh seeds step 59 ran 84.73 to 88.18 ms (medians
@@ -533,8 +565,9 @@ Measured or modelled on seed 1; none of this was built.
   - the ANCHOR branch on the probe's info word, 1.1M, which resolves late;
   - the superblock's first-id logging, 0.6M.
 
-  The per-range entry loop's 1.0M went with step 66. The ANCHOR branch is the one worth a
-  branch-free form, but the replica measured our first one (q14an) 1.2 ms slower.
+  The per-range entry loop's 1.0M went with step 66, and the ANCHOR branch with step 73: our
+  first branch-free form (q14an) had measured 1.2 ms slower on step 52, step 73's form −0.455
+  and −0.118 ms, and step 77 left-packs the anchors 8 at a time.
 - **A denser perfect hash.** The table runs at a load of 0.58 (2 MB). Placing buckets at a load
   near 0.9, as PTHash does with more pilot candidates, would fit it in 1.25 MB of slots and cut
   the misses of the scan's one random load per token. The build would take longer, on twelve

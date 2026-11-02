@@ -1,14 +1,18 @@
 # Track B: performance log
 
-**Result.** The reference runs 56.35 s at 2,200 MB and S 91. The submitted code (step 76, 433d16b,
-S 1142) is step 75 with review comments, the same code token for token; its one board run,
-0.094031 s, came in a dispatch where B alone ran slow. Step 75 is step 73 split into modules, with six review items in the setup and the same machine code
-for the scan (step 74, 9db18fc), and with the query parts kept as the threads split them (step 75).
-Its board run, run-54d2972c3d09, took 0.078867 s at 31.53 MB for 80.10 points; step 74's,
-run-9c2169af7f30, took 0.078856 s at 32.26 MB (80.09). Step 70's run-aecc0a5f3a09 (0.078573 s,
-32.06 MB, S 1099, 80.27 points) is the fastest Track B time and the best Track B points; step 71,
-the same code with review comments, ran 0.078623 s (80.26 points). The steps since 57 ran 0.0786 to
-0.0923 s in their clean runs, step 66's unexplained 0.094116 s aside. Three ideas carry it: no
+**Result.** The reference runs 56.35 s at 2,200 MB and S 91. The submitted code (step 77, bt9-1,
+3305ff6, S 1155) is step 76 with a cheaper token path: each stamp's cache line fetched for writing
+just before its store, the trigger and anchor lists left-packed 8 lanes per store, keys loaded from
+the window's start, and the term table read once per scan. Its board run, run-afcb0c2c9346, took
+0.074272 s at 31.38 MB for 80.72 points, the fastest Track B time and the best Track B points; the
+best before it was step 70's run-aecc0a5f3a09 (0.078573 s, 32.06 MB, S 1099, 80.27 points). Step 76
+(433d16b) is step 75 with review comments, the same code token for token; its one board run,
+0.094031 s, came in a dispatch where B alone ran slow. Step 75 is step 73 split into modules, with
+six review items in the setup and the same machine code for the scan (step 74, 9db18fc), and with
+the query parts kept as the threads split them (step 75). Its board run, run-54d2972c3d09, took
+0.078867 s at 31.53 MB for 80.10 points; step 74's, run-9c2169af7f30, took 0.078856 s at 32.26 MB
+(80.09). The steps since 57 ran 0.0743 to 0.0923 s in their clean runs, step 66's unexplained
+0.094116 s aside. Three ideas carry it: no
 index at all, every query answered during one parallel scan, so nothing grows with the corpus
 (step 6); a perfect hash that gives each token one probe, built per input on every thread (steps
 31 and 58); and BOOL queries evaluated per document from truth tables, with the common ones
@@ -16,8 +20,8 @@ evaluated once per 256 documents (steps 8 and 49-52). The last steps added a per
 threads, whose waiting workers also map the corpus in, a 4-byte first-id log made exact for any
 line lengths, checks for inputs the generator never writes, and the triggered BOOL entries
 evaluated 8 at a time (step 66), less setup work and a better plan (steps 67 to 73), the code
-split into modules (step 74) and the query parts kept as split (step 75), for 100 lines more than
-step 59.
+split into modules (step 74), the query parts kept as split (step 75) and the cheaper token path
+(step 77), for 113 lines more than step 59.
 Every run ID below is in the board's history for team SALAAR. A run with "probe" in place of T, or
 a failed run in the probe tables, is a timing build that reports through its exit code.
 
@@ -32,6 +36,7 @@ a failed run in the probe tables, is a timing build that reports through its exi
 | One persistent thread pool for the setup | 55 | replica −2.23% against step 54 |
 | Triggered BOOL entries evaluated 8 at a time | 66 | replica −2.8 to −3.3%; 0.085425 → 0.082048 s |
 | Less setup work, releases where threads wait, smaller plan intermediates, a larger sample | 67-70 | replica about −3.6 ms; 0.082048 → 0.078573 s |
+| Less copying on the main thread, branch-free anchors, stamp lines fetched for writing and lists left-packed | 72-77 | replica about −4.1 ms; 0.078573 → 0.074272 s |
 
 Every step from the reference to the current version, each with the live-board run that measured it,
 including the steps that were reverted. Points are the board's 50·log10(K). Reruns of one commit
@@ -129,7 +134,8 @@ row starts with its checkpoint's name, and an experiment that names a step ran o
 | 73 | f37f273 | b-stack-22: `look_up` keeps the document's anchor positions without a branch, as it does the trigger terms', and the anchor prefetch goes (replica −0.455 and −0.118 ms, 26 and 18 of 31; branch misses −11.8%; its run: B alone slow) | run-8640ff23f7c7 | 0.095266 | 32.38 | 1101 | 78.17 |
 | 74 | 9db18fc (run from 9b2ee21) | bj-2: the code split into modules (`pool`, `vocab`, `plan`, `scan`; `main.rs` keeps `main`, the slicing and the formatting) and six review items in the setup: the plan's records built by a function returning a named struct (`records`, `Records`), the hash's bucket placement as `place_regions` with bounds-checked stores, a compile-time check of `DocEntry`'s layout, the queries check once after `Plan::new`, the slice check on the slice's own ids, and `place` in plain statements (the scan's functions identical by objdump; replica −0.071 and +0.121 ms, +0.179 ms on holdout 99, against an A/A of +0.033: equal) | run-9c2169af7f30 | 0.078856 | 32.26 | 1147 | 80.09 |
 | 75 | 41e6cfe | bs-5j2: the queries stay in the threads' splits, one part per thread, so `parse_queries` no longer copies every line and term into one array on the main thread, and `Plan::new` and `records` take a part each (replica −0.520 and −0.245 ms, 27 and 21 of 31, and −0.689 ms on holdout 99, 29 of 31; memory, max of 10 runs, 31.32 MB) | run-54d2972c3d09 | 0.078867 | 31.53 | 1142 | 80.10 |
-| 76 | 433d16b (run from 1eb28f0) | Round-5 review comments on the bounds, the sample and the pool; the token stream is step 75's. **The submitted code**; its run came with B alone slow | run-1507537fc514 | 0.094031 | 31.44 | 1142 | 78.19 |
+| 76 | 433d16b (run from 1eb28f0) | Round-5 review comments on the bounds, the sample and the pool; the token stream is step 75's. Its run came with B alone slow | run-1507537fc514 | 0.094031 | 31.44 | 1142 | 78.19 |
+| 77 | 3305ff6 | bt9-1: `look_up`'s probe loop stores only the info words; a second pass over them, 8 at a time, makes the presence stores, each stamp's line fetched for writing (`prefetchw`) just before its store so that a miss no longer holds up the stores after it, and left-packs the trigger and anchor lists 8 lanes per store (`vmovmskps`, `pdep`/`pext`, `vpermd`); keys loaded from the window's start, and the vocabulary, hash and table read once per scan (replica, PGO, two builds a side: −2.734 and −2.827 ms on seed 1, 30 of 31 each, −2.122 and −2.542 ms on holdout 99, 29 and 31 of 31; memory, max of 20 runs, 31.26 MB). **The submitted code**; its run is the best Track B run | run-afcb0c2c9346 | 0.074272 | 31.38 | 1155 | 80.72 |
 
 **Code-quality pass (5a0612d, step 47; also pushed as 7f08fe7 and 045a6b5), on the box:**
 run-5892b2f7eb00 0.144406 s (a slow dispatch), run-eb924b66b4aa 0.115198 s (runs.log 09:47Z) and
@@ -139,10 +145,65 @@ offsets as step 44's in local PGO, local plain and test-server PGO builds (objdu
 and two PGO builds of each time the same on the test server (medians of 31 interleaved rounds of
 11 runs: 80.90 and 81.02 ms for step 44, 81.05 and 80.89 for the quality pass).
 
-**The submitted code is step 76 (433d16b), S 1142**: step 75 with the round-5 review comments on the
-bounds, the sample and the pool, the same code token for token. Its one board run, run-1507537fc514
-(0.094031 s, 31.44 MB, 78.19 points), came in a dispatch where A and C ran normally: one of B's slow
-runs, like step 73's 0.095266 s.
+**The submitted code is step 77 (bt9-1, 3305ff6), S 1155**: step 76 with a cheaper token path. Its
+board run, run-afcb0c2c9346 (0.074272 s, 31.38 MB, 80.72 points), is the best Track B run.
+- *Step 76.* Step 75 with the round-5 review comments on the bounds, the sample and the pool, the
+  same code token for token. Its one board run, run-1507537fc514 (0.094031 s, 31.44 MB, 78.19
+  points), came in a dispatch where A and C ran normally: one of B's slow runs, like step 73's
+  0.095266 s.
+- *Step 77 (bt9-1).* Only `scan.rs` changed, in five pieces (pw1, c1, f2, w1 and h1), each
+  measured on the replica against the one before (ab.sh, 31 pairs, non-PGO screens on seed 1),
+  then the whole step with PGO (the production Dockerfile, two builds a side).
+  - *Bottleneck.* Timing-only builds of step 76 (wrong output; non-PGO, 31 pairs, full seed 1)
+    split its 77.7 ms into 21.0 ms for the phrases, the triggered evaluation and the `always`
+    superblocks, 18.9 ms for the rest, and 37.9 ms for the token path: extraction 11.72 ms, the
+    hash, pilot, slot and prefetch 7.28, the presence stores 8.19 (row ORs 3.93, stamps 2.84),
+    the `pending` and `look_up` stores 6.22 and the probe 4.66; the trigger and anchor lists'
+    scalar stores alone cost 3.66. The token path ran about 70 uops per token at about 4.5 per
+    cycle per core, close to what the core can rename, and the store buffer was full
+    (`resource_stalls.sb`) in 168M of 1,620M cycles, about 119M of them from the stamp store
+    (13M read-for-ownership requests). Stores commit to L1 in program order, so a stamp store
+    whose line is not in L1 holds up every store after it until the line arrives.
+  - *Design.* The probe loop now stores only the info words. A second pass takes them 8 at a
+    time. For each token it fetches the stamp's line for writing (`prefetchw`, `_MM_HINT_ET0`)
+    just before the stamp store, then writes the stamp and the row bit as before. A prefetch is
+    not a store: it runs out of order, as soon as its address is known, so the line is on its way
+    long before the store's turn to commit. For the 8 tokens together it loads their info words
+    into one AVX2 register and left-packs the trigger occurrences (TRIG, bit 30, shifted to the
+    sign bit) and the anchors' positions (ANCHOR, the sign bit): `vmovmskps` gives an 8-bit mask,
+    `pdep` spreads it to a byte per lane, `pext` picks those lanes' numbers, `vpermd` moves the
+    kept lanes to the front, and one 32-byte store writes them, where the scalar code made two
+    stores and two adds per token. It is step 66's pack, now one function, `left_pack`, which
+    `trigger` shares with the same machine code. Keys are loaded from the window's start plus the
+    token's offset, with no `at + b` per token. And `run` reads the vocabulary, the hash and the
+    table's address once per scan: read in the loop, LLVM loaded them again after every run of
+    tokens and kept the table's address on the stack, one reload per token. (An earlier try of
+    the same move, on the test server, left the instructions unchanged: experiments table.)
+  - *Why it is exact.* The same stores and the same lists. Every token's stamp and row bit are
+    written, only in a later loop, and a prefetch changes no data. `left_pack` keeps exactly the
+    lanes whose flag bit is set, in order, so `trig` and `anchors` hold what the scalar code kept;
+    the spare lanes are overwritten by the next store or lie past the list's end, inside the room
+    each list reserves (one entry per token, plus 8). The last 8 ids may include some of the 8
+    `miss` ids that `look_up` writes after the tokens: `miss` has no flag, so no list keeps one,
+    and its stamp and row bit go to the sinks, `miss`'s own stamp and the sink row, which no
+    evaluation reads, as for any token of no query term.
+  - *Measured.* Non-PGO screens on seed 1, each piece against the one before: the `prefetchw`
+    (pw1) −1.709 ms (30 of 31; store-buffer stalls 161M → 50M cycles), the left-pack (c1) −0.711
+    ms (30 of 31), the presence stores moved into the same 8-token pass (f2) −0.624 ms (28 of 31),
+    keys from the window's start (w1) −0.359 ms (24 of 31), and the vocabulary, hash and table
+    read once (h1) −0.773 ms (29 of 31): −4.217 ms in all (31 of 31). With PGO, two builds a
+    side: −2.734 and −2.827 ms on seed 1 (30 of 31 each), −2.122 and −2.542 ms on holdout 99 (29
+    and 31 of 31), against an A/A of +0.256 ms; every build gave the seed-1 output f86973c21022….
+    A first tidy-up that reordered statements in `look_up` got another register allocation and
+    ran 0.3 to 0.7 ms slower with PGO. So the submitted `look_up`, `run` and `end_doc` are h1's,
+    identical by normalized objdump (non-PGO), and `trigger`, which now calls the shared
+    `left_pack`, has the same machine code as before; h1's own PGO builds measured −2.985 and
+    −2.926 ms on seed 1 (31 and 30 of 31) and −2.489 and −2.164 ms on holdout 99 (30 and 31 of
+    31). The final gate passed ("How the final number was verified"); memory, max of 20 runs,
+    31.26 MB. S 1142 → 1155.
+  - *Not kept* (experiments table): the `prefetchw` earlier, in the probe loop (+1.404 ms), the
+    probes and the presence in one loop again (+2.156 ms), and four more variants of the stores
+    and the window loop.
 
 **Step 75 (bs-5j2, 41e6cfe), S 1142**: step 70 with one step of comments
 (71), three code steps (72, 73 and 75) and one of structure (74), the last four each measured on
@@ -663,6 +724,15 @@ step 24 ran without the disturbance.
   into modules and took six review items, with the scan's machine code unchanged by objdump, and
   step 75 dropped the main thread's copy of the queries into one array (−0.25 to −0.69 ms).
   S 1099 → 1142.
+- **Steps 76 and 77: a store that misses L1 holds up the stores behind it.** Step 76 changed
+  comments only. On its token path, about 70 uops per token ran close to the core's rename limit,
+  and the stamp store, which had to fetch its line 13M times, kept the store buffer full for about
+  119M cycles. A `prefetchw` just before the store starts that fetch out of order (−1.7 ms);
+  placed earlier, in the probe loop, it lost 1.4 ms. The other pieces cut uops: the trigger and
+  anchor lists left-packed 8 at a time in the same pass as the presence stores, keys from the
+  window's start, and the table's address no longer reloaded from the stack per token. Non-PGO
+  −4.2 ms; with PGO −2.1 to −2.8 ms, after a statement order that changed only the register
+  allocation had cost 0.3 to 0.7 ms. S 1142 → 1155.
 
 
 ## Box probes since step 47
@@ -859,6 +929,12 @@ Board-measured reverts are in the table above (steps 11, 12, 14, 24, 27, 46, 48,
 | That version with a prefetch of each range's first answer state | Replica −0.870 ms against step 65 (26 of 31): the prefetch cost 0.24 to 0.47 ms |
 | Entries of 28 bytes (7 words, no padding) under the 8-wide evaluation | 0.775 ms slower than 32-byte entries (29 of 31) |
 | Each token's entry range (`group[t]`) prefetched when its slot is probed | Replica +2.59 ms on step 65, +2.09 ms on an earlier 8-wide version |
+| `prefetchw` of the stamp's line in the probe loop, as soon as its id is known, instead of just before the store; and with the row word's line too (step 77 work) | Replica, non-PGO: +1.404 ms (1 of 31); +1.838 ms (0 of 31) |
+| The stamps of phrase-only terms all written to one byte, `lastdoc[id.min(bool_terms)]` (on pw1, step 77's first piece) | Replica, non-PGO: +1.252 ms (0 of 31) |
+| 16-byte `pending` entries, the slot offset in the key's spare lane 3 by `vpinsrd` (on pw1; and on c1, step 77's second piece) | Replica, non-PGO: +0.390 ms (8 of 31); +0.50 ms on c1 |
+| The probes and the presence stores in one loop again, with the `prefetchw` (on c1) | Replica, non-PGO: +2.156 ms (0 of 31) |
+| The `pending` write pointer kept across windows; the next window's masks computed after the token loop; both (on h1, step 77's last piece) | Replica, non-PGO: +0.140 ms (12 of 31), +0.333 ms (4 of 31), +0.180 ms |
+| A 64-bit `vpmovmskb` (no zero extension) and a wrapping end clip in `masks` (on h1) | Replica, non-PGO: +0.423 ms (6 of 31) |
 
 - **A faster setup can leave the whole run as it was.** Two setup changes above measured faster on
   their own, −0.424 and −0.185 ms, and in the whole run the same speed and +0.28 ms. Phase marks
@@ -876,9 +952,10 @@ Board-measured reverts are in the table above (steps 11, 12, 14, 24, 27, 46, 48,
 README, "Robust on unseen seeds", has the full argument. In short: the plan is made per input from
 that input's own sample, the perfect hash places a region again or re-seeds rather than answer
 wrongly, holdout seed 99 and fresh tiny and sample seeds match the reference at every gate, step
-59 was byte-exact on 30 fresh full-scale seeds and in 1,505 more runs, and step 66, whose 8-wide
+59 was byte-exact on 30 fresh full-scale seeds and in 1,505 more runs, step 66, whose 8-wide
 BOOL evaluation the submitted code still runs, on fresh seeds 101-110, in 200 repeats and on two
-corpora made to stress it ("How the final number was verified"), and on the test server the
+corpora made to stress it, and the submitted step 77 on the 30 fresh seeds at 1, 3, 7 and 12 CPUs
+(120 of 120 runs; both in "How the final number was verified"), and on the test server the
 quality-pass source (step 46b's code) times the same on three full-scale seeds: medians of two PGO
 builds, 21 runs each, 12 threads.
 
@@ -1032,7 +1109,24 @@ terms (the second corpus also with repeats, upper case and 1% empty documents). 
 document, the same at 1, 3 and 8 threads. Steps 67 to 70 passed the same gate (the 144 runs and
 the 66 hand-made edge runs), with `vpinsrb` at 0; memory, max of 10 runs, 31.53, 31.85, 32.73 and
 31.69 MB. Steps 72 to 75 passed it too (31.81 and 32.07 MB; step 74, max of 5, 31.75 MB;
-step 75, max of 10, 31.32 MB); step 71 changes comments only.
+step 75, max of 10, 31.32 MB); steps 71 and 76 change comments only. Step 77, the submitted code,
+passed it within its final gate (below).
+
+**The submitted code's final gate** (step 77, replica, Mon 2 Nov 01:53 UTC): the exact Dockerfile
+build, from the production Dockerfile and 3305ff6's six source files (sha256-checked; binary
+4851c1fe3b5d…), 15 checks, all passed. Every run that writes answers was byte-equal to the
+reference:
+- the gate above: full seed 1 (f86973c21022…) at 1, 3, 7 and 12 CPUs, samples 1 to 4, holdout 99,
+  the 144 tiny, fresh and adversarial runs and the 66 hand-made edge runs; `vpinsrb` 0;
+- 18 board-like edge cases at 1 and 12 CPUs, as root and as uid 65534: 72 of 72 runs;
+- fresh full seeds 101-130 at 1, 3, 7 and 12 CPUs: 120 of 120;
+- fresh tiny and sample seeds 201-210, as root and as uid 65534, at 1, 3, 12 and all 20 CPUs:
+  160 of 160;
+- holdout 99 at 1, 2, 3, 4, 6, 7, 8, 12 and all 20 CPUs (E-cores too): 9 of 9;
+- 20 repeats of fresh seed 101 at 12 CPUs and 20 at all 20: 40 of 40;
+- malformed queries with tiny seed 201's documents (a BOOL query of 7 terms, a phrase of 9 terms,
+  an empty queries.txt): each stops with exit 134 and its panic message;
+- memory, max of 20 runs, 31.26 MB; `rustfmt` clean on every file; S 1155 by the official count.
 
 **Robustness runs** (replica, Sun 1 Nov, about 17:00 to 19:20 UTC), on the exact Dockerfile
 build, with data generated on the replica by the organisers' generator (it reproduces the official
@@ -1063,7 +1157,7 @@ bucket first (README, "Robust on unseen seeds").
 **The box number.** Single board runs of one binary have spread up to 45% in disturbed
 dispatches, so:
 
-- **The replica first** (steps 52 to 75): paired runs, each part against the stack before it.
+- **The replica first** (steps 52 to 77): paired runs, each part against the stack before it.
 - **Board samples** then check. Step 52's last two runs were 0.093419 and 0.092845 s, and step
   53's runs 0.091413 to 0.092929 s, against step 49's median of 0.101022 s. An in-process probe on
   the box read step 52 8.7 ms faster than step 49. Steps 54 and 55's runs, 0.089795 to 0.114435
@@ -1072,7 +1166,7 @@ dispatches, so:
   unexplained: Track A ran slow in all three of its dispatches), steps 68 and 69 0.079675,
   0.081637 and 0.07961 s, step 70 0.078573 s, steps 71 and 72 0.078623 and
   0.080472 s, step 73 0.095266 s with B alone slow, step 74 0.078856 s, step 75
-  0.078867 s, and the submitted step 76 0.094031 s with B alone slow.
+  0.078867 s, step 76 0.094031 s with B alone slow, and the submitted step 77 0.074272 s.
 - **Alternating dispatches**, before the replica: candidates pushed in turn, minutes apart, against
   the code they would replace, and a result had to repeat (steps 41 to 44: 0.12433 for the
   sort-free first ids, 0.114997 back on the sort, 0.112506 sort-free again; steps 45, 46b and 47
