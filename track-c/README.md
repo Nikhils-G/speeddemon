@@ -16,23 +16,27 @@ each cut their own runs, trusting spec 2.2 behind tripwires; a simdjson-style bi
 the three numbers converted in one AVX2 pass; the region entry prefetched as soon as the id is
 known, and the record counted one record later; names hashed with AES into one table per thread,
 the pairs handed over in buffers, so no atomics and no barriers; and only four threads fault in
-memory. The best run, run-11ac398da908, of the submitted code, took 0.016899 s at 8.00 MB, 84.60 points: about 850x
-faster than the reference with 46x less memory. On 20 fresh full seeds, step 70's code (the
-submitted code less two cold lines and the vector add) scores 84.02 points on average (std 0.19),
+memory. The best run, run-11ac398da908, of step 74's code, took 0.016899 s at 8.00 MB, 84.60 points: about 850x
+faster than the reference with 46x less memory. The submitted code is step 75 (d75329f, S 548):
+step 74's with four cold lines fewer, at the same speed on the replica; its board run is pending.
+On 20 fresh full seeds, step 70's code (step 74's
+code less two cold lines and the vector add) scores 84.02 points on average (std 0.19),
 and its output matched the organisers' reference on all 20.
 
 | | Run | T | M (MB) | S | Points |
 |---|---|---|---|---|---|
 | Reference | | 14.44 s | 367 | 108 | |
-| Best run: the submitted code, step 74 (c55ea87), from push 7c45267 | run-11ac398da908 | 0.016899 s | 8.00 | 552 | 84.60 |
+| The submitted code, step 75 (d75329f), step 74 with four cold lines fewer in the setup and the merge | pending | | | 548 | |
+| Best run: step 74 (c55ea87), from push 7c45267 | run-11ac398da908 | 0.016899 s | 8.00 | 552 | 84.60 |
 | Its other runs: step 74 (c55ea87), step 71 with a group's four sums in one 256-bit add | run-4785d0ca4b6a, run-22d43fe21a46, run-720b875a4f70 | 0.016778 s, the fastest Track C time, and 0.016847 s, both within the board's spread; 0.019039 s in a dispatch where Track A ran 0.021276 s | 9.38, 9.98, 10.67 | 552 | 83.99, 83.68, 82.06 |
 | 20 fresh full seeds 9101-9120, step 70's code, two PGO builds (replica; PERF.md, "How the final number was verified") | | mean 17.73 ms by the final's rule | median 7.72 (replica; the board reads about 0.33 more) | 552 | mean 84.02, std 0.19, worst 83.49; 20 of 20 equal to the reference |
 
-Steps 71 and 74 change two cold lines and the totals' add against step 70; step 74 measured
+Steps 71 and 74 change two cold lines and the totals' add against step 70, and step 75 four cold
+lines against step 74 (replica: a mean of −0.03% over eight pairings); step 74 measured
 −1.05% (full seed 1) and −1.19% (holdout 99) against step 71 on the replica. So a typical final
 is about 84.0 to 84.1 points, 0.5 to 0.6 under the best board run; most of that gap is where the
 input file sits in physical memory and the box's load, not the seeds' content. Three of the
-submitted code's four board runs peaked at 9.38 to 10.67 MB, over the replica's max of 20 runs
+step 74's four board runs peaked at 9.38 to 10.67 MB, over the replica's max of 20 runs
 (7.91 MB); the board shows such peaks for other teams too.
 
 ## The design at a glance
@@ -760,7 +764,8 @@ Evidence, on the binary the Dockerfile builds:
   | 65-67 | The CPU move and six attributes removed, the spin in `wait` shortened | The same gate on two builds each, seed-1 hash at 1, 3, 7 and 12 CPUs |
   | 68 | Five memory constants | The same gate on two builds of step 64 with those constants and on its own build; 0 of 20 runs in a fresh cgroup and 0 of 30 direct runs failing |
   | 69-71 | An inbox taken over at 2 × threads buffers; eleven cold lines cut | Two builds of step 71, step 70's merge (0 of 10 runs in a fresh cgroup failing) and two builds of step 70's cuts, seed-1 hash at 1, 3, 7 and 12 CPUs; on a local build of each, every mutant's exit code unchanged and five fresh full seeds (7101, 7202, 7303, 7404 and 7505) identical to the reference at 1 and 8 CPUs |
-  | 72-74 | The name table's key slots and `KEEP` aligned (72); a group's four sums added in one vector (73, and 74 without 72). Step 74 is the submitted code; 72 and 73 were reverted | Each on its PGO build, seed-1 hash at 1, 3, 7 and 12 CPUs |
+  | 72-74 | The name table's key slots and `KEEP` aligned (72); a group's four sums added in one vector (73, and 74 without 72); 72 and 73 were reverted | Each on its PGO build, seed-1 hash at 1, 3, 7 and 12 CPUs |
+  | 75 | `merge` folded into `finish`, `fill` taking `&Shared`: four cold lines fewer. The submitted code | Two PGO builds, seed-1 hash at 1, 3, 7 and 12 CPUs on both |
 
   Step 68's one behaviour change is outside the spec: a listed region id from 1,000,000 to
   1,048,574 now stops the program, where step 67 accepted it; spec 2.3 lists ids below 1,000,000.

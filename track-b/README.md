@@ -1,7 +1,9 @@
 # Track B: Index
 
-**Result.** The submitted code is PERF.md's step 95 (8f57770, S 1174). The best of its nine board
-runs is run-4acf92b53275: 0.066011 s at 32.14 MB, 81.94 points. The best Track B run,
+**Result.** The submitted code is PERF.md's step 96 (c2df45a, S 1164): step 95's code (8f57770,
+S 1174) with ten cold lines fewer in the setup and the plan, at the same speed on the replica
+(+0.10%, within the PGO builds' spread); its board run is pending. The best of step 95's nine
+board runs is run-4acf92b53275: 0.066011 s at 32.14 MB, 81.94 points. The best Track B run,
 run-dec3de0cc771 (0.065617 s at 31.73 MB, 82.01 points, 859× faster than the reference's 56.35 s at
 2,200 MB), is of step 94's code (285539d, S 1172), which step 95 changes by one prefetch in the
 format; it came from push ae81227, which changed no Track B file. The two runs are 0.6% apart,
@@ -59,12 +61,13 @@ two builds a side, crossed, and the mean decides.
 | Step 93: PGO at full scale, against step 92's plain build | 2 PGO builds | seed 1 −0.414 ms (25) and −0.400 ms (24); holdout 99 −0.383 ms (26) |
 | Step 94: the queries split in one AVX2 pass | 4 builds of step 93's source × 2 of step 94's: 24 A/Bs on seed 1, holdout 99 and fresh seeds 101, 103, 105 and 107 | mean about −0.36 ms, 23 of 24 below zero; against the two faster old builds alone about −0.21 ms |
 | Step 95: the format's prefetch | 2 × 2: 16 A/Bs on seed 1, holdout 99 and fresh seeds 118 and 126 | mean −0.356 ms (−0.54%), 15 of 16 below zero; against the faster old build alone −0.274 ms |
+| Step 96: ten cold lines fewer, S 1174 → 1164 | 2 × 2: 12 A/Bs on seed 1 and holdout 99 | mean +0.064 ms (+0.10%), within the PGO builds' own spread; memory, max of 5 runs, 31.80 MB |
 | Points on unseen seeds, step 94's code | 2 PGO builds, 18 fresh full seeds (8201-8210, 9101-9108) | mean 81.97, std 0.068 (T the median of 11 runs); by the final's rule 81.97, std 0.082, worst 81.72, best 82.15; T 65.09 to 66.62 ms; M at most 32.60 MB |
 
 On the board these steps are within noise. Step 92's machine code ran 0.065903 to 0.098793 s in
 seven runs; its best, run-2116938ec9fc (0.065903 s, 82.01 points), came from push 631ec7f, which
 changed no Track B file. Step 94's best run is 0.43% under it, the direction the replica measured,
-and step 95's best is 0.6% over step 94's. One binary's board runs have spread up to 45% in
+and step 95's best is 0.6% over step 94's; step 96's run is pending. One binary's board runs have spread up to 45% in
 disturbed dispatches (PERF.md, "Reading the numbers").
 
 **Checking the output.** With Docker and Python 3, from the repository's root (root README,
@@ -78,9 +81,10 @@ python3 check.py b --data data/b --expected f86973c210228141bcb6f1f1b10188ad2a9b
 The hash is the spec's for seed 1 at full scale. For any other seed, generate it the same way, run
 the organisers' `reference/b_index.py` on the same files and compare `results.txt` byte for byte.
 Before each push our gate kit did that on the replica, on the exact Dockerfile build. For the
-submitted code, two PGO builds passed 14 of 14 checks each (full seed 1 at 1, 3, 7 and 12 CPUs;
-holdout 99 and samples 1 to 4 at 12 CPUs and at 1), and the second also the gate script's 144
-tiny, fresh and adversarial runs: every output byte-equal to the reference. Step 94's final gate
+submitted code, two PGO builds passed the kit on full seed 1 and holdout 99 at 12 CPUs, and the
+plain build of the same source the gate script (full seed 1 at 1, 3, 7, 12 and all CPUs, samples
+1 to 4, holdout 99 and the 144 tiny, fresh and adversarial runs): every output byte-equal to the
+reference. Step 95's gate ran two PGO builds through 14 of 14 kit checks each. Step 94's final gate
 added 30 fresh full seeds at four CPU counts (120 of 120) and 18 board-like edge cases as root
 and as uid 65534 (72 of 72). The rest is under "Why the output is exact" and "Robust on unseen
 seeds" below, and in PERF.md, "How the final number was verified".
@@ -677,7 +681,12 @@ Evidence, on builds of the Dockerfile:
     20 CPUs for both users: 840 of 840;
   - copies of seed 101 whose every file is an exact multiple of 4096 bytes, so that a read past
     the end of a file would fault, at 1, 3, 7, 12 and 20 CPUs: 5 of 5.
-- **The submitted code's gate** (step 95, on the replica, Mon 2 Nov): two PGO builds of the
+- **The submitted code's gate** (step 96, on the replica, Mon 2 Nov): two PGO builds of the
+  Dockerfile, each the kit on full seed 1 and holdout 99 at 12 CPUs, and the plain build of the
+  same source through the gate script (full seed 1 at 1, 3, 7, 12 and all CPUs, samples 1 to 4,
+  holdout 99, the 144 tiny, fresh and adversarial runs): every output byte-equal to the reference.
+  Memory, max of 5 runs, 31.80 MB.
+- **Step 95's gate** (on the replica, Mon 2 Nov): two PGO builds of the
   Dockerfile, each 14 of 14 checks (full seed 1 at 1, 3, 7 and 12 CPUs; holdout 99 and samples 1
   to 4 at 12 CPUs and 1), and the gate script's 144 runs on the second: every output byte-equal to
   the reference. Memory, max of 5 runs, 31.62 and 31.53 MB.
