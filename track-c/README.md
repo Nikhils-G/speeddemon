@@ -20,12 +20,12 @@ names must be counted per country over all records.
 
 ## Where the time goes on the box
 
-The reference runs 14.44 s at 367 MB and S 108. The submitted code, PERF.md step 67 (9ccf3cb,
-S 561), ran 0.017362 s at 8.16 MB, 84.17 points (run-0c9eb554171b). Its parse is step 66's, whose
-run-434f22246279 (0.017069 s, 8.23 MB, 84.32 points) has the best Track C points: 846x faster than
-the reference, with 45x less memory. The time comes from a simdjson-style parse, cuts and a record
-path that trust spec 2.2, and a join and a name count with no shared state (steps 7-49); the
-memory from four faulting threads that charge whole 64-page batches (steps 60-63). Details: PERF.md.
+The reference runs 14.44 s at 367 MB and S 108. The submitted code, PERF.md step 68 (9514121,
+S 561), ran 0.016995 s at 8.17 MB, 84.40 points (run-38f216bf39eb), the best Track C points: 850x
+faster than the reference, with 45x less memory. The time comes from a simdjson-style parse, cuts
+and a record path that trust spec 2.2, and a join and a name count with no shared state (steps
+7-49); the memory from four faulting threads that charge whole 64-page batches (steps 60-63 and
+68). Details: PERF.md.
 
 Per record, step 46 executed about 193 instructions in all, parse and deduplication together
 (640.9M instructions for 3.32M records at 12 threads). The single largest stall is the join
@@ -46,7 +46,7 @@ the replica than counting at once: step 48's hot path against step 46's, 198 of 
 | Distinct names in one table per thread, buffers handed over | Atomics and cache-line traffic of one shared name table | A shared lock-free table 0.0539 vs 0.0461 s (run-edc1e75d5cee); one table against four per thread −2.13%; buffers handed over, 0.19 vs 1.2 ms a flush copied (server) |
 | Runs claimed one at a time, no barriers | One slow CPU holding up every thread | With one CPU shared with a busy loop, 42 ms with barriers, 25 without (server) |
 | Input released in two calls per thread, small pooled buffers, tables dropped in parallel, exit without frees | Memory peak and the exit's serial unmap | About −1% (steps 51-52) |
-| Memory faulted in by four threads only, on one heap and pre-faulted stacks | The per-CPU charge stock that every faulting CPU adds to the memory peak | Max of 20 runs 10.61 → 8.54-8.69 MB (step 60); whole batches, mean 8.39 → 7.86 MB (step 63) |
+| Memory faulted in by four threads only, on one heap and pre-faulted stacks | The per-CPU charge stock that every faulting CPU adds to the memory peak | Max of 20 runs 10.61 → 8.54-8.69 MB (step 60); whole batches, mean 8.39 → 7.86 MB (step 63); one batch less, modes 7.74/7.97 → 7.47/7.71 MB (step 68) |
 
 **What decided what stays.** By the board's formula, a code line costs about 0.052% of T or
 0.01 MB of M (S 583 → 561 is +0.125 points). On the replica, in 201 interleaved pairs, an A/A of
@@ -73,8 +73,9 @@ stops the program; other breaks of 2.2 are answered as parsed (see "Error handli
 against the reference).
 
 **The lookup table.**
-- *Size.* The join table has one byte per region id, for 2^20 ids: listed ids are below 1,000,000
-  (spec 2.3), and every id above the table reads its last entry, which no listed id can set.
+- *Size.* The join table has one byte per region id, for ids 0 to 1,000,000: listed ids are below
+  1,000,000 (spec 2.3), and every id above the table reads its last entry, id 1,000,000, which no
+  listed id can set.
 - *Filling.* Threads claim 64 line-aligned chunks of regions.csv as they start and store each
   region's group. A country's three letters, read as a base-26 number (`(a * 26 + b) * 26 + c`),
   index the table of codes already seen.
@@ -244,6 +245,12 @@ pays only when a CPU's count crosses a multiple of 64. In step 62 each of worker
 keeps fewer buffers alive, so the heap margin is 1 MB instead of 1.25, and has the main thread
 fault 104 pages more of it than each of them: they charge 309 to 314 pages, five batches. On the
 replica (mem.sh, 100 runs of each build) the mean peak went from 8.39 to 7.86 MB on full seed 1.
+Main still charged 14 batches. Step 68 takes 66 pages without a line: the join table stops at id
+1,000,000, 20 KB of each stack's top is faulted in instead of 24, the rows keep 3 standard
+deviations of room instead of 4, and the margin is 896 KB; main's extra share becomes 68 pages.
+Main now charges 786 to 789 pages, under 13 batches with the exec's pages, and workers 1 to 3 308
+to 313, still five. On the replica (mem.sh, 100 runs of each build) both modes went one batch
+lower, 7.74/7.97 → 7.47/7.71 MB.
 
 ## Techniques
 
@@ -258,7 +265,7 @@ are exact; the distinct-name count rests on a hash (technique 6 below).
 4. Cuts after the first LF followed by a digit or a BOM byte (`run_start`). Exact: by spec 2.2 such an LF ends a record.
 5. Each thread finds its own cuts: no serial pass. Exact: the cut search is monotonic, so the runs cover the file once.
 6. Tripwires: every half-run must end exactly at its cut (`assert_eq!` in `parse_run`). Exact on 2.2 input; input that moves a record boundary almost always stops here, and other breaks of 2.2 are answered as parsed ("Error handling").
-7. Dense join table of 2^20 bytes, allocated zeroed (`group_of`, `REGION_IDS`). Exact: listed ids are below 1,000,000 (spec 2.3; a listed id of 2^20 − 1 or more panics in `fill`), and ids past the table are clamped to its last entry, which no listed id sets.
+7. Dense join table of 1,000,001 bytes, allocated zeroed (`group_of`, `REGION_IDS`). Exact: listed ids are below 1,000,000 (spec 2.3; a listed id of 1,000,000 or more panics in `fill`), and ids past the table are clamped to its last entry, id 1,000,000, which no listed id sets.
 8. regions.csv filled in parallel from 64 claimed chunks (`fill`). Exact: chunks are cut at line starts, and each region id is stored once.
 9. Country codes indexed by 26^3, numbered under a lock on first sight (`codes`, double-checked load). Exact: one number per code.
 10. Groups numbered as first seen, sorted by code at output (`write_output`). Exact: byte order, `_UNMATCHED` last.
@@ -397,10 +404,10 @@ exact. The distinct-name count rests on a hash; its odds are stated in technique
 - **Design.** A dense table by region id, one byte per id: the group number, or 0, `_UNMATCHED`,
   for an id that is not listed. It is filled in parallel from 64 claimed chunks of regions.csv.
   The record's region id is clamped to the table's last entry.
-- **Why exact.** Listed ids are below 1,000,000 (spec 2.3), so they fit the table's 2^20 entries;
-  a listed id of 2^20 − 1 or more panics in `fill`. The last entry is never set, so every id
-  above the table reads 0, `_UNMATCHED`. Each country's group number is handed out once under a
-  lock, and the output sorts the groups by code.
+- **Why exact.** Listed ids are below 1,000,000 (spec 2.3), so they fit the table's 1,000,001
+  entries; a listed id of 1,000,000 or more panics in `fill`. The last entry is never set, so
+  every id above the table reads 0, `_UNMATCHED`. Each country's group number is handed out once
+  under a lock, and the output sorts the groups by code.
 
 ### 6. Distinct names without atomics
 
@@ -457,14 +464,14 @@ exact. The distinct-name count rests on a hash; its odds are stated in technique
     cost far more time (6 threads: +26% for −1.5 MB; PERF.md, experiments).
   - *The main thread*, before it starts the workers: the join table (`populate`, which is
     `madvise(MADV_POPULATE_WRITE)`), the page tables of regions.csv (`touch`, a byte read per 2
-    MB), the first 64 KB of the heap past `run`'s own allocations, and the top 24 KB of each
+    MB), the first 56 KB of the heap past `run`'s own allocations, and the top 20 KB of each
     worker's stack (`STACK_USED`).
   - *The faulters*, a share each (`fault_in`; a quarter from 4 threads on): the page tables of the
-    input and the 1 MB heap margin (`MARGIN`, nearly all of it for pair buffers; the main thread's
-    share is 104 pages larger, `MAIN_EXTRA`, so that each of workers 1 to 3 charges five whole
-    batches of 64 pages), which every thread's parse waits for (`faulted`); then their share of
-    the name tables (three each at 12 threads), rows populated and keys zeroed, which every
-    thread's first take waits for (`made`).
+    input and the 896 KB heap margin (`MARGIN`, nearly all of it for pair buffers; the main
+    thread's share is 68 pages larger, `MAIN_EXTRA`, so that each of workers 1 to 3 charges five
+    whole batches of 64 pages and main 13), which every thread's parse waits for (`faulted`);
+    then their share of the name tables (three each at 12 threads), rows populated and keys
+    zeroed, which every thread's first take waits for (`made`).
   - *One heap.* Every thread allocates from the main thread's heap (`mallopt(M_ARENA_MAX, 1)`), so
     every allocation lands in faulted memory; `M_TOP_PAD` (32 MB) grows that heap 32 MB at a time,
     so the margin past its top is already mapped. That holds at 11 threads or more, as on the
@@ -475,15 +482,17 @@ exact. The distinct-name count rests on a hash; its odds are stated in technique
     memory gain is lost.
   - *Stacks.* The workers run on stacks the main thread allocated and faulted in: `pthread_create`
     with `pthread_attr_setstack`, since `std::thread` cannot take a stack. A stack is 256 KB
-    (`STACK`), and a worker uses about 20 KB of it, with no recursion. Unlike the stacks pthread
-    makes itself, these have no guard page.
-  - *Rows.* Each table reserves rows for its share of the names plus 4 standard deviations (8,780
+    (`STACK`), and a worker uses at most 18.4 KB of it (measured), with no recursion. Unlike the
+    stacks pthread makes itself, these have no guard page.
+  - *Rows.* Each table reserves rows for its share of the names plus 3 standard deviations (8,689
     at 12 threads; the fullest we measured held 8,650), all faulted in by its faulter; a table
     that needs more grows, on its owner's CPU.
   - *Checked.* A perf trace of each thread's user page faults, over 40 runs, found no write fault
     in any of the other eight workers. Replica, max of 20 runs: 8.54 to 8.69 MB against 10.61 and
     10.63 for step 59, for about 0.7% of time (PERF.md, step 60); step 63, mean of 100 runs 7.86
-    against 8.39 MB for step 62, and 0.35 to 0.53% faster (PERF.md, step 63).
+    against 8.39 MB for step 62, and 0.35 to 0.53% faster (PERF.md, step 63); step 68's
+    constants, expected max of 5 runs 7.83 to 7.90 MB against 7.98 to 8.11 for step 64, and 0.30
+    to 0.39% faster (PERF.md, step 68).
   - *Release.* Once no thread files pairs any more, each thread drops its share of the input's
     first two thirds in one call, and the threads other than the writer drop the last third while
     it writes: 23 TLB-shootdown rounds in all. Dropping each 8 runs' pages as they were
@@ -509,9 +518,10 @@ exact. The distinct-name count rests on a hash; its odds are stated in technique
   and the pages fault in where they are first touched: about step 59's memory, the same output.
   Under contention a worker can still fault: with a busy loop on one CPU, the max of 15 runs was
   10.75 to 10.80 MB against step 59's 10.79 to 11.30 (PERF.md, step 60). A worker that faults in
-  pages of its own, for instance buffers past the 1 MB margin, keeps a charge stock on its CPU
-  again, so a heavily contended run peaks higher: two board runs in disturbed dispatches peaked at
-  10.52 and 10.67 MB (PERF.md, steps 62 and 63). Two runs at normal speed also peaked high:
+  pages of its own, for instance buffers past the 896 KB margin (about 2 runs in 100 on the
+  replica), keeps a charge stock on its CPU again, so a heavily contended run peaks higher: two
+  board runs in disturbed dispatches peaked at 10.52 and 10.67 MB (PERF.md, steps 62 and 63). Two
+  runs at normal speed also peaked high:
   run-0aed7bbdd563 (0.017127 s, 10.12 MB) and run-999b7573a7f5 (0.017202 s, 10.77 MB), with Track
   B at its usual time in both dispatches (0.071064 and 0.067066 s). So contention does not explain
   every high peak. The replica has the same rare tail: over 150 mem.sh runs each, the max was 10.73
@@ -556,7 +566,7 @@ above:
 - **Fields and numbers.** A `""` pair leaves the quote mask unchanged, so an escaped quote never
   ends a field (technique 2). Every number has at most 8 digits under the spec's magnitudes, and an
   amount's digits without its dot are its cents, so sums are exact integers (technique 3).
-- **The join.** Listed region ids are below 1,000,000 (spec 2.3) and fit the table's 2^20
+- **The join.** Listed region ids are below 1,000,000 (spec 2.3) and fit the table's 1,000,001
   entries; every other id reads 0, `_UNMATCHED` (technique 5).
 - **Distinct names.** Equal names have equal raw bytes and so equal hashes. Two different names
   are counted as one only if they agree on all 47.6 compared bits at 12 threads (42 on one
@@ -605,7 +615,7 @@ seed and scale; the parser relies on that and nothing else. Nothing is fitted to
 
 | What could change with the seed | What the program does |
 |---|---|
-| Region ids and their count | A table of 2^20 entries for ids below 1,000,000 (spec 2.3); an id above it is `_UNMATCHED`, a listed one of 2^20 − 1 or more stops the program |
+| Region ids and their count | A table of 1,000,001 entries for ids below 1,000,000 (spec 2.3); an id above it is `_UNMATCHED`, a listed one of 1,000,000 or more stops the program |
 | Countries | Numbered as first seen, sorted at output; more than 240 stops the program |
 | Names | Tables sized from the generator's 100,000-name pool plus 8 standard deviations; more stops the program. The odds of two names taken as one are per dataset, for any seed: about 2.4e-5 at 12 threads (technique 6) |
 | Long names and notes, the file's end | The walker, which reads the same five fields byte by byte |
@@ -656,14 +666,21 @@ Evidence, on the binary the Dockerfile builds:
 - **Step 64**, which changes only how far ahead the record stream is
   prefetched, passed the same gate on two builds, with the seed-1 hash at 1 and 12 CPUs (PERF.md,
   step 64).
-- **Steps 65 to 67, the submitted code**, which remove the CPU move and six attributes and shorten
-  the spin in `wait`, passed the same gate on two builds each, with the seed-1 hash at 1, 3, 7 and
-  12 CPUs (PERF.md, steps 65 to 67).
+- **Steps 65 to 67**, which remove the CPU move and six attributes and shorten the spin in
+  `wait`, passed the same gate on two builds each, with the seed-1 hash at 1, 3, 7 and 12 CPUs
+  (PERF.md, steps 65 to 67).
+- **Step 68, the submitted code**, which changes five memory constants, passed the same gate on
+  two builds of step 64 with those constants and on its own build, with 0 of 20 runs in a fresh
+  cgroup and 0 of 30 direct runs failing (PERF.md, step 68). Its one behaviour change is outside
+  the spec: a listed region id from 1,000,000 to 1,048,574 now stops the program, where step 67
+  accepted it; spec 2.3 lists ids below 1,000,000.
 - **Room for the names, measured.** The generator writes at most 100,529 distinct names (100,515
   to 100,524 measured). The fullest partition held at most 8,650 of its 10,240 rows (84.5%) at 12
   threads, 61.4% at one thread and 51.4% at 20. A table that filled up would stop the program,
-  never drop a name. Step 60 faults in 8,780 rows a table at 12 threads; a table that needs more
-  grows, with the same output and a little more memory.
+  never drop a name. Step 68 faults in 8,689 rows a table at 12 threads (8,780 in steps 60 to 67);
+  a table that needs more grows, with the same output and a little more memory: one batch more in
+  every run of a seed whose fullest table passes 8,689 names, about 0.2% of datasets by the
+  binomial.
 - **Time and memory on other seeds.** On the 30 fresh seeds step 52 ran 17.61 to 18.09 ms (medians
   of 7 runs). Seed 1, at 17.19 ms, is about 4% faster than a typical fresh seed. The memory peak
   on seeds 101-110 was 10.23 to 11.19 MB (max of 5 runs; seed 1: 10.51 MB). About one run in 50
@@ -698,7 +715,7 @@ edge cases of the robustness runs, each run through this program and through the
   stops the program. It is a tripwire, not a proof: for general 2.1 input, the step-24 version in
   PERF.md is the one to use.
 - *Other panics.* A file that cannot be mapped, whose message names the OS error; indexing out of
-  bounds, an unexpected header, a listed region id of 2^20 − 1 or more, more than 240 countries,
+  bounds, an unexpected header, a listed region id of 1,000,000 or more, more than 240 countries,
   and more distinct names than the tables hold. The build aborts on
   panic (`panic = "abort"`), so each one prints its message and the exit status is nonzero. The
   status is 134 (SIGABRT) when the program runs directly. As PID 1 in a container without
