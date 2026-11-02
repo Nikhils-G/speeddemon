@@ -33,10 +33,14 @@
 //!    all of it is written, the threads drop its page-table entries in parallel, so
 //!    the exit does not.
 
-// The C runtime calls `main` below directly: std's start-up (the main thread's stack
-// guard, found by reading /proc/self/maps, and signal handlers with an alternate signal
-// stack, which every spawned thread then maps too) is not needed, as nothing here
-// recurses deeply. Panics still print their message, then abort (panic = "abort").
+// The C runtime calls `main` below directly and exits with what it returns, so std's
+// start-up is skipped: the main thread's stack-guard lookup (it reads /proc/self/maps),
+// the signal handlers that report a stack overflow, with an alternate signal stack
+// that every spawned thread then maps too, SIGPIPE set to ignore, and the check of
+// fds 0 to 2. Nothing here needs them: it does not recurse deeply, write to a pipe or
+// use stdin or stdout. The arguments still reach std::env::args (glibc passes them to
+// std through .init_array), and a panic still prints its message, then aborts
+// (panic = "abort").
 #![no_main]
 
 #[cfg(not(target_feature = "avx2"))]
@@ -65,7 +69,9 @@ const MAX_NAME: usize = 125;
 /// An output line starts with the hour label "YYYY-MM-DDTHH:00:00Z" and a space.
 const LABEL: usize = 21;
 
-// SAFETY: the one symbol named `main`, with the C signature the C runtime calls it by.
+// SAFETY: the only symbol named `main` (`#![no_main]` leaves out rustc's own, and the
+// crate has no dependencies), with the signature the C runtime calls it by, C's
+// `int main(int argc, char **argv)`.
 #[unsafe(no_mangle)]
 extern "C" fn main(_: i32, _: *const *const u8) -> i32 {
     // The phases, in order:
@@ -136,21 +142,26 @@ extern "C" fn main(_: i32, _: *const *const u8) -> i32 {
     // took 18.1-20.8 ms against 14.6-15.6 ms (PERF.md, step 38). Now a slowed thread
     // just parses fewer slices. (Four pairs a thread: 0.3 ms slower on the test
     // server, 61 interleaved runs, from the per-slice work, mostly each slice's
-    // release; pinning each thread to a CPU instead: worse, a pinned thread cannot
-    // leave a CPU that something else is using.) A pair is parsed side by side (see
-    // `parse`); the count is even, so a pair's second slice always exists.
+    // release, one a slice then; pinning each thread to a CPU instead: worse, a pinned
+    // thread cannot leave a CPU that something else is using.) A pair is parsed side
+    // by side (see `parse`); the count is even, so a pair's second slice always exists.
     let slices = threads * 4;
-    // Slice q's share of the log, in units of half a percent of an even share. The first
-    // round's pairs (one a thread, claimed in start order) shrink by half a percent a
-    // claim: each of the 11 spawns takes about 50 us, so later threads start later. The
-    // first pair is 5% smaller again: its thread adds most of the endpoints to the table
-    // while the spawns are still under way. (Fitted to the parse ends of every thread in
-    // 14 runs on the replica, where the last thread trailed the mean by 190 us.)
+    // Slice q's weight (slice q is in pair q / 2): the cuts share out the log in
+    // proportion (`at`). A second-round slice weighs 200, so a unit is half a percent of
+    // it. The first round's pairs (one a thread, claimed in start order) shrink by a unit
+    // a claim (the slope): each of the 11 spawns takes about 50 us, so each claim's
+    // thread starts about 50 us after the one before. The first pair is 10 units (5%)
+    // smaller again: its thread adds most of the endpoints to the table while the spawns
+    // are still under way. (Fitted to the parse ends of every thread in 14 runs on the
+    // replica, where the last thread trailed the mean by 190 us. Measured, the 5% cut is
+    // the gain and the slope adds nothing measurable; without the slope, in closed form,
+    // the worker compiled differently and ran +0.33%: PERF.md, step 72 and experiments.)
     let w = |q: usize| 200 + threads.saturating_sub(q / 2) - 10 * (q < 2) as usize;
     let at = |p: usize| len * (0..p).map(w).sum::<usize>() / (0..slices).map(w).sum::<usize>();
-    // Cut p: at(p) less the part line before it. It may read the end of slice p - 1
-    // after its pages were released: they fault back in from the page cache unchanged
-    // (see release).
+    // Cut p: at(p) less the bytes after the last LF before it (rsplit always yields a
+    // piece: the unwrap cannot fail). Those bytes and that LF may be in pages already
+    // released, by this thread or another: they fault back in from the page cache
+    // unchanged (see release).
     let cut = |p| at(p) - log[..at(p)].rsplit(|&b| b == b'\n').next().unwrap().len();
     // One pool of threads for both passes: each parses slices, then waits for the
     // merge (done by the last thread to finish pass 1, once every part is in) and
@@ -186,8 +197,9 @@ extern "C" fn main(_: i32, _: *const *const u8) -> i32 {
             let claim = || slice.fetch_add(2, Relaxed);
             for p in std::iter::repeat_with(claim).take_while(|&p| p < slices) {
                 let pair = [&log[cut(p)..cut(p + 1)], &log[cut(p + 1)..cut(p + 2)]];
-                // SAFETY: the slices are part of the log: a read-only file mapping,
-                // which PAD zero bytes follow.
+                // SAFETY: the slices are adjacent (cut p to p + 1, then p + 1 to p + 2)
+                // in the log: one private, read-only file mapping, which PAD zero bytes
+                // follow.
                 let [a, b] = unsafe { parse(pair, &mut free) };
                 // Each index comes from the counter once, so these are the only sets
                 // of parts p and p + 1 and cannot fail. (Unchecked on purpose:
@@ -304,7 +316,8 @@ extern "C" fn main(_: i32, _: *const *const u8) -> i32 {
                         let at = &mut start[(record >> ENDPOINT_SHIFT) as usize + 1];
                         // SAFETY: each id's cursor stays below the next id's
                         // start, which is at most this hour's record count (the
-                        // counts above are this hour's), which fits `values`.
+                        // counts above are this hour's), so at most `largest`, the
+                        // length of `values`.
                         unsafe { *values.get_unchecked_mut(*at as usize) = latency };
                         *at += 1;
                     }
@@ -369,9 +382,9 @@ extern "C" fn main(_: i32, _: *const *const u8) -> i32 {
     std::process::exit(0)
 }
 
-/// The merge between the passes: every part's runs sorted by (hour, part) and cut
-/// into hours, each part's run count, and the output mapped at a size no output
-/// can exceed. The endpoints' name order follows, from `names`.
+/// The merge between the passes: every part's runs sorted by hour and cut into
+/// hours, each part's run count, and the output mapped at a size no output can
+/// exceed. The endpoints' name order follows, from `names`.
 fn merge(parts: &[OnceLock<Part>], readers: &[AtomicUsize], output: &File) -> Merged<'static> {
     // Every part's runs, in order of hour. Every part is in (this is the last thread
     // to finish pass 1), so no `wait` here blocks. Two adjacent starts of a part make
@@ -382,6 +395,7 @@ fn merge(parts: &[OnceLock<Part>], readers: &[AtomicUsize], output: &File) -> Me
         let ends = p.wait().starts.windows(2).map(|w| (w[0], w[1].at));
         runs.extend(ends.map(|(begin, end)| Run { begin, part, end }));
         // Each run is one reader of its part: the last one placed gives the part back.
+        // (Relaxed: the hand-off orders this store before every decrement in pass 2.)
         readers[part].store(p.wait().starts.len() - 1, Relaxed);
     }
     // By hour only: the order of an hour's runs changes no output byte (each run reads
@@ -518,9 +532,9 @@ struct Run {
     end: usize,
 }
 
-/// What the merge between the passes hands to pass 2: the runs in order of hour
-/// then part, cut into hours; the output mapping's address; and each hour's output
-/// length once known.
+/// What the merge between the passes hands to pass 2: the runs in order of hour, cut
+/// into hours; the output mapping's address; and each hour's output length once
+/// known.
 type Merged<'a> = (Vec<&'a [Run]>, usize, Vec<OnceLock<usize>>);
 
 /// Parses two slices of the mapped log side by side, one line of each in turn: a
@@ -533,8 +547,8 @@ type Merged<'a> = (Vec<&'a [Run]>, usize, Vec<OnceLock<usize>>);
 ///
 /// The PAD bytes after each slice must be readable: the loads of a line run on past
 /// its end. And the slices must be adjacent (the second starts where the first ends)
-/// file-mapped memory that this process never writes, as their whole pages go back to
-/// the kernel at the end (see `release`).
+/// in one private file mapping that this process never writes, as their whole pages
+/// go back to the kernel at the end, in one call (see `release`).
 unsafe fn parse(chunks: [&[u8]; 2], free: &mut &'static mut [u32]) -> [Part; 2] {
     // The loop writes without capacity checks: it moves on at least MIN_LINE bytes
     // per line whatever the bytes are (the endpoint ends at byte 32 or later, then
@@ -634,9 +648,10 @@ unsafe fn parse(chunks: [&[u8]; 2], free: &mut &'static mut [u32]) -> [Part; 2] 
     // Both slices go back to the kernel in one call (they are adjacent, the caller's
     // contract): every call is a round of TLB shootdowns on the other threads' CPUs.
     let pair = ptr::slice_from_raw_parts(chunks[0].as_ptr(), chunks[0].len() + chunks[1].len());
-    // SAFETY: the slices go back to the kernel (the caller's contract). Only a later
-    // `cut` may read their last bytes again, and those fault back in unchanged (see
-    // release).
+    // SAFETY: the slices are adjacent in one private file mapping (the caller's
+    // contract), so `pair` is exactly their bytes, within that mapping, and they may go
+    // back to the kernel (the same contract). Only the cuts at the pair's two ends may
+    // read some of its bytes again, and those fault back in unchanged (see release).
     unsafe { release(pair) };
     // SAFETY: each slice's records run from its start to its next place.
     let lines = [0, 1].map(|k| unsafe { record[k].offset_from_unsigned(start[k]) });
@@ -960,8 +975,9 @@ fn map(at: *mut u8, len: usize, prot: i32, flags: i32, fd: i32) -> *mut u8 {
 }
 
 /// Gives the whole pages inside `slice` back to the kernel (MADV_DONTNEED); the
-/// pages it shares with memory around it are kept. Used on the log's slices, on a
-/// part's records once no hour reads them, and on the endpoint keys after the sort.
+/// pages it shares with memory around it are kept. Used on the log's slices, a parsed
+/// pair at a time, on a part's records once no hour reads them, and on the endpoint
+/// keys after the sort.
 /// The parse threads drop the log's pages this way, in parallel: left to one unmap
 /// (the exit's when measured, the merging thread's `munmap` now), its 58,000 pages go
 /// one by one on one core (1.3 ms slower overall when measured, see PERF.md). A failed
@@ -973,11 +989,12 @@ fn map(at: *mut u8, len: usize, prot: i32, flags: i32, fd: i32) -> *mut u8 {
 /// records, the keys), nothing may read the slice again: its pages are freed and
 /// read as zeros afterwards. A page of a file mapping that this process never
 /// wrote (the log) is only dropped from the process: read again, it faults back in
-/// from the page cache unchanged. It takes a raw pointer (callers pass a slice,
-/// which coerces), so that no reference to the memory is live across the call.
+/// from the page cache unchanged. It takes a raw pointer (a slice coerces to one;
+/// `parse` builds one over its two adjacent slices), so that the call needs no live
+/// reference to the memory.
 unsafe fn release<T>(slice: *const [T]) {
     let start = (slice.cast::<T>() as usize).next_multiple_of(PAGE);
-    // SAFETY: `slice` is one allocation (the caller's slice), so its end is in bounds.
+    // SAFETY: `slice` lies in one mapping (see # Safety), so its end is in bounds.
     let end = unsafe { slice.cast::<T>().add(slice.len()) } as usize / PAGE * PAGE;
     // SAFETY: madvise only changes how the whole pages inside `slice` are backed,
     // which the caller allows (see # Safety).
