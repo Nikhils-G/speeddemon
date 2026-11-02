@@ -25,6 +25,12 @@
 //! Modules: `vocab` (1), `plan` (what each query needs, 2 to 4), `scan` (the scan
 //! and 5), `pool` (the threads of `par`) and `mmap` (the system calls).
 
+// The C runtime calls `main` below directly: std's start-up (the main thread's stack
+// guard, found by reading /proc/self/maps, and signal handlers with an alternate signal
+// stack, which every spawned thread then maps too) is not needed, as nothing here
+// recurses deeply. Panics still print their message, then abort (panic = "abort").
+#![no_main]
+
 mod mmap;
 mod plan;
 mod pool;
@@ -109,12 +115,16 @@ const MIN_SLICES: usize = 8;
 /// place their groups in parallel.
 const GROUPS: usize = 64;
 
-fn main() {
+// SAFETY: the one symbol named `main`, with the C signature the C runtime calls it by.
+#[unsafe(no_mangle)]
+extern "C" fn main(_: i32, _: *const *const u8) -> i32 {
     let mut args = std::env::args().skip(1);
     let data_dir = args.next().unwrap_or_else(|| "/data".into());
     let out_dir = args.next().unwrap_or_else(|| "/out".into());
     mmap::set_up_memory();
-    let open = |name: &str| mmap::map(&format!("{data_dir}/{name}"));
+    // Joined with concat rather than format!: that code size keeps the scan's hot functions at
+    // their 64-byte offsets of before no_main (format! moved them by 32: 0.085 ms slower).
+    let open = |name: &str| mmap::map(&[&data_dir, "/", name].concat());
     let docs = open("docs.txt");
     // The corpus: `docs` without the mmap::PAD zero bytes that follow it.
     let text = &docs[..docs.len() - mmap::PAD];
