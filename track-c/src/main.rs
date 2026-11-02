@@ -535,7 +535,7 @@ extern "C" fn worker(w: usize) -> usize {
             // but lost its core to this thread (two threads on one CPU, in about 2%
             // of runs), yielding gives the core back. Replica, 200 runs: memory
             // peaks up to 12.0 MB without the yield, 10.9 MB with it.
-            if inbox.len() > 4 * threads {
+            if inbox.len() > 2 * threads {
                 drop(inbox);
                 take(s, t, &mut taken, &mut totals);
                 thread::yield_now();
