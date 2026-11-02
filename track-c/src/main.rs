@@ -68,9 +68,10 @@ const GROUPS: usize = 256;
 /// 240 countries), so word 3's bits 49..64 hold 15 more bits of the name's hash.
 const WORDS: usize = GROUPS / 64;
 /// Entries of the join table, one per region id: listed ids are below 1,000,000
-/// (spec 2.3), and every id past the table is clamped to its last entry, which no
-/// listed id sets (`fill` panics on a listed id that large).
-const REGION_IDS: usize = 1 << 20;
+/// (spec 2.3), and every id past the table is clamped to its last entry, 1,000,000,
+/// which no listed id sets (`fill` panics on a listed id that large). (2^20 entries
+/// took 11 more pages, all past the listed ids.)
+const REGION_IDS: usize = 1_000_001;
 /// regions.csv is entered in this many parts, which threads claim as they start,
 /// so the ones that start first do more of it.
 const REGION_CHUNKS: usize = 64;
@@ -148,27 +149,34 @@ const PAGE: usize = 4096;
 /// Threads that fault in the memory every thread writes, a share each (see `run`).
 const FAULTERS: usize = 4;
 /// A worker's stack, and its top part, which is faulted in before the worker starts. A
-/// worker uses about 20 KB, glibc's thread descriptor and TLS at the top included: no
-/// recursion, and its largest local, `totals`, is 14 KB. The stack has no guard page
-/// (see `run`), hence 12 times that.
+/// worker uses at most 18.4 KB, glibc's thread descriptor and TLS at the top included
+/// (18,823 bytes: the lowest byte written in each stack, full seed 1 and holdout 99): no
+/// recursion, and its largest local, `totals`, is 14 KB. A page it touched below the
+/// faulted part would fault in on its own CPU, which would then keep a charge stock (see
+/// `run`). The stack has no guard page (see `run`), hence about 14 times that.
 const STACK: usize = 256 << 10;
-const STACK_USED: usize = 24 << 10;
+const STACK_USED: usize = 20 << 10;
 /// The heap past its top as the workers start (`Shared::heap`), faulted in for the
-/// workers' allocations (nearly all of them pair buffers: 0.74 to 0.92 MB in all,
-/// measured on full seed 1 and holdout 99). Past it, a worker faults its own pages: more
-/// memory, the same output.
-const MARGIN: usize = 1024 << 10;
+/// workers' allocations (nearly all of them pair buffers: median 733 KB, 874 KB at the
+/// 98th percentile and at most 937 KB, in 100 runs on full seed 1 and holdout 99). Past
+/// it, a worker faults its own pages: more memory in that run, the same output. (1 MB,
+/// which covers the rare runs past 896 KB too, kept the peak a batch higher in every run:
+/// see MAIN_EXTRA.)
+const MARGIN: usize = 896 << 10;
 /// How much more of the margin main faults in than each other faulter. A CPU's stock is
 /// charged 64 pages at a time (see `run`), so a faulter that charges one page past a
-/// multiple of 64 keeps 63 unused ones. With equal shares, workers 1 to 3 charge 334 to
-/// 340 pages each (perf, kmem:mm_page_alloc, seed 1 and holdout 99, 12 threads), just
-/// past 5 batches (320). The split (see `fault_in`) takes MAIN_EXTRA / FAULTERS, 26
-/// pages, from each one's share and gives the 78 to main: they charge 309 to 314, 5
-/// batches each. In a sweep, the peak's lowest mode sat two batches under equal shares'
-/// from 80 to 112 pages, and one under at 128, where main crosses one more (PERF.md,
-/// step 63): 104 is mid-way. At other thread counts the split is only less tuned; the
-/// output is the same.
-const MAIN_EXTRA: usize = 104 * PAGE;
+/// multiple of 64 keeps 63 unused ones. With equal shares, workers 1 to 3 would charge
+/// 325 to 330 pages each (perf, kmem:mm_page_alloc, seed 1 and holdout 99, 12 threads,
+/// less the 13 that every worker allocates for the end's page drops), just past 5 batches
+/// (320). The split (see `fault_in`) takes MAIN_EXTRA / FAULTERS, 17 pages, from each
+/// one's share and gives the 51 to main: they charge 308 to 313, 5 batches each, and main
+/// 786 to 789, which with the exec's pages on its CPU stays under 13 batches (832). In a
+/// sweep at this margin (4 runs each, started by fork and exec as the box starts them),
+/// the peak sat one batch under that of the previous split (a 1 MB margin, 104 pages)
+/// from 48 to 88 pages: below that, workers 1 to 3 cross a batch, and above it, main does.
+/// 68 is mid-way. At other thread counts the split is only less tuned; the output is the
+/// same.
+const MAIN_EXTRA: usize = 68 * PAGE;
 
 /// Maps a whole file read-only for the rest of the process. It is never unmapped:
 /// the process exits right after using it, and exit unmaps everything.
@@ -334,7 +342,7 @@ static SHARED: std::sync::OnceLock<Shared<'static>> = std::sync::OnceLock::new()
 /// in the memory peak. With every thread faulting (step 59), they were 1.9 to 2.6 MB of its
 /// 9.6 to 10.1 MB on the replica; this way, only the CPUs that fault keep one.
 /// - Here, before the workers start: the join table, regions.csv's page tables, the
-///   heap margin's first 64 KB (`MARGIN / 16`, for the threads' first, small
+///   heap margin's first 56 KB (`MARGIN / 16`, for the threads' first, small
 ///   allocations) and the top `STACK_USED` of each worker's stack.
 /// - The faulters, a share each (`fault_in`): the input's page tables and the heap margin
 ///   (the pair buffers), which every thread waits for before its parse (`faulted`); then
@@ -376,10 +384,11 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
     // SAFETY: all zero bits are a valid AtomicU8 (0).
     let group_of: Box<[AtomicU8; REGION_IDS]> = unsafe { Box::new_zeroed().assume_init() };
     populate(group_of.as_ptr() as usize, REGION_IDS);
-    // Rows of WORDS words for a table's share of names and 4 standard deviations more
-    // (the fullest table we measured held 8,650 rows, against room for 8,780 here, at 12
-    // threads); a table that needs more grows, on the CPU of the thread that fills it.
-    let rows = (names + 4 * names.isqrt()) * WORDS;
+    // Rows of WORDS words for a table's share of names and 3 standard deviations more
+    // (the fullest table we measured held 8,650 rows, against room for 8,689 here, at 12
+    // threads; 4 deviations took a 69th page per table); a table that needs more grows, on
+    // the CPU of the thread that fills it.
+    let rows = (names + 3 * names.isqrt()) * WORDS;
     let table = || Mutex::new((Vec::with_capacity(slots), Vec::with_capacity(rows)));
     // The workers' stacks, slot w for worker w (slot 0 unused), allocated before the
     // heap's top is taken, so that they do not take the margin.
@@ -419,8 +428,8 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
         // runs on this thread's stack). `as_mut_ptr` makes no reference to the buffer, so
         // it leaves the running workers' stacks valid. `run` never returns, so `stacks` is
         // never freed, and glibc keeps each thread's descriptor and TLS at the top of its
-        // stack. A worker uses about 20 KB of its 256 KB (see STACK), so with no guard page
-        // it still never reaches the stack below. Populating writes no byte; `w` is
+        // stack. A worker uses at most 18.4 KB of its 256 KB (see STACK), so with no guard
+        // page it still never reaches the stack below. Populating writes no byte; `w` is
         // `worker`'s argument.
         unsafe {
             let (stack, mut attr) = (stacks.as_mut_ptr().add(w * STACK), [0; 8]);
