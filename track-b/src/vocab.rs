@@ -26,15 +26,35 @@ fn split_lines(chunk: &'static [u8], padded: &'static [u8], seed: u64) -> Split 
     let most = chunk.len() / 2 + 1;
     let (mut lines, mut long) = (Vec::with_capacity(most / 3), Vec::new());
     let mut terms = Vec::with_capacity(most);
-    // Every line is a query of the spec's grammar (2.3) and ends with LF.
-    for line in chunk.split_inclusive(|&b| b == b'\n') {
-        let (start, phrase) = (terms.len(), line[0] == b'P');
-        // The words after `BOOL ` or `PHRASE "`, before LF or `"` and LF.
-        // A BOOL line's first term has OR (see Queries).
-        let (from, to, mut op) = if phrase { (8, 2, 0) } else { (5, 1, OR) };
-        let words = &line[from..line.len() - to];
-        for (i, word) in words.split(|&b| b == b' ').enumerate() {
-            if phrase || i % 2 == 0 {
+    // Every line is a query of the spec's grammar (2.3) and ends with LF: `BOOL` or
+    // `PHRASE`, then its words, each ended by a space or the LF. The spaces and LFs of 32
+    // bytes are found at once (AVX2): a search byte by byte took two loops (lines, then
+    // words) and a mispredicted exit per word. A phrase's words lie between quotes, and a
+    // BOOL line's first term has OR (see Queries).
+    let base = chunk.as_ptr() as usize - padded.as_ptr() as usize;
+    // The line's first term and kind, and the next word's start (after a space or LF),
+    // number (0 for `BOOL` or `PHRASE`) and operator.
+    let (mut start, mut phrase, mut from, mut i, mut op) = (0, false, 0, 0, 0);
+    for block in (0..chunk.len()).step_by(32) {
+        // SAFETY: base + block is in the file, and the PAD (256) bytes after the file are in
+        // `padded`, so the 32 bytes loaded are; AVX2 is enabled for the whole build.
+        let v = unsafe { _mm256_loadu_si256(padded[base + block..].as_ptr().cast()) };
+        // SAFETY: AVX2 is enabled for the whole build.
+        let m = |b| unsafe { _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(b))) };
+        // Bit k: byte block + k is a space (32) or LF (10) of the chunk.
+        let mut seps = (m(32) | m(10)) as u32 & u32::MAX >> (32 - (chunk.len() - block).min(32));
+        while seps != 0 {
+            let sep = block + seps.trailing_zeros() as usize;
+            seps &= seps - 1;
+            let lf = chunk[sep] == b'\n';
+            // A phrase's words lie between quotes.
+            let word = &chunk[from + (i == 1 && phrase) as usize..sep - (lf && phrase) as usize];
+            assert!(i > 0 || !lf, "queries.txt: a line without terms");
+            if i == 0 {
+                // `BOOL` or `PHRASE`.
+                (start, phrase) = (terms.len(), word[0] == b'P');
+                op = OR * !phrase as u32;
+            } else if phrase || i % 2 == 1 {
                 let at = (word.as_ptr() as usize - padded.as_ptr() as usize) as u32;
                 terms.push((at, word.len() as u32 | op << 30));
                 long.extend((word.len() > KEY).then_some(word));
@@ -44,8 +64,11 @@ fn split_lines(chunk: &'static [u8], padded: &'static [u8], seed: u64) -> Split 
                 // operator its first byte's low two bits pick, 00 as AND.
                 op = [0, AND, NOT, OR][(word[0] & 3) as usize];
             }
+            (from, i) = (sep + 1, (i + 1) * !lf as usize);
+            if lf {
+                lines.push((start as u32, (terms.len() - start) as u32, phrase));
+            }
         }
-        lines.push((start as u32, (terms.len() - start) as u32, phrase));
     }
     // The terms' keys grouped by hash & 63, the hash group. Key length 0 gives
     // the zero key, which marks a long term.

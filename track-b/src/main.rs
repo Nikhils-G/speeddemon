@@ -203,7 +203,7 @@ extern "C" fn main(_: i32, _: *const *const u8) -> i32 {
 
     // Formatted in parallel, one range of lines per thread, then written in order.
     // A reference to the path, not the String: that code size keeps the scan's hot functions at
-    // their 64-byte offsets (al.sh) now that Scan::new is smaller.
+    // their 64-byte offsets now that Scan::new is smaller (PERF.md, steps 87 and 88).
     let file = std::fs::File::create(&format!("{out_dir}/results.txt")).expect("results.txt");
     let chunks = par(parts, &|p| format_part(&plan, &results, p, parts));
     // This thread writes them while the workers drop the corpus's pages and give the
