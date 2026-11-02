@@ -261,6 +261,10 @@ fn format_part<'a>(plan: &Plan, results: &'a [Results], p: usize, parts: usize) 
     let mut out = Vec::with_capacity(lines.len() * 32);
     for line in lines {
         let answer = plan.answer_of[line] as usize;
+        // The states of the line 4 lines on, fetched now: random reads, mostly from the
+        // caches of the other cores (the last 4 lines fetch answer 0's, which is harmless).
+        let ahead = *plan.answer_of.get(line + 4).unwrap_or(&0) as usize;
+        results.iter().for_each(|r| prefetch(&r.state[0], ahead));
         let s: u64 = results.iter().map(|r| r.state[answer]).sum();
         push_decimal(&mut out, s >> SUM_BITS);
         push_decimal(&mut out, s & ((1 << SUM_BITS) - 1));

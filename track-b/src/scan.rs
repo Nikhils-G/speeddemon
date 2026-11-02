@@ -650,7 +650,7 @@ static PACK: [u64; 256] = {
 const LANES: __m256i = unsafe { transmute([0u32, 1, 2, 3, 4, 5, 6, 7]) };
 
 /// Fetches the cache line of `base[i]` into L1.
-fn prefetch<T>(base: *const T, i: usize) {
+pub fn prefetch<T>(base: *const T, i: usize) {
     // SAFETY: a prefetch reads nothing and never faults, whatever the address.
     unsafe { _mm_prefetch::<_MM_HINT_T0>(base.wrapping_add(i).cast()) }
 }
