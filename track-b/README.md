@@ -1,5 +1,20 @@
 # Track B: Index
 
+**Result.** The submitted code is PERF.md's step 95 (8f57770, S 1174): step 94's (285539d, S
+1172), built with PGO trained at full scale since step 93, with the format fetching the threads'
+states four lines ahead (replica −0.36 ms, −0.54%). Its three board runs took 0.087889 s, a slow run
+(PERF.md, "Two groups of B runs"), 0.07793 s and 0.066258 s (run-fb530d36f965, 81.90 points), inside the board's spread. On 18
+fresh full seeds, step 94's code scores 81.97 points on average (std 0.08, worst 81.72, by the
+final's middle-3 rule; PERF.md, "How the final number was verified"). The best Track B run,
+run-dec3de0cc771 (push ae81227, which changed no Track B file), is of step 94's code: 0.065617 s at 31.73 MB for 82.01 points, 859× faster than the
+reference (56.35 s at 2,200 MB). It is 0.43% under step 92's best run, run-2116938ec9fc (0.065903
+s, a plain build), the direction the replica's pairs measured for steps 93 and 94, but inside the
+board's spread: step 92's machine code ran 0.065903 to 0.098793 s in seven runs (step 92's six and
+step 91's one), so steps this small rest on paired runs on the replica. Three ideas carry the speed: no index
+(step 6: 0.355 s at 203 MB → 0.267 s at 38.4 MB), a perfect hash with one branch-free probe per
+token (step 31: 0.1338 → 0.1199 s), and BOOL queries as truth tables evaluated per document
+(step 49: best runs 0.108491 → 0.097889 s).
+
 The task, the input files and the exact output format are in the [spec](https://github.com/hackathon-raptors/speed-demon-2026/blob/main/specs/b-index.md).
 The step-by-step history, with a board run for every step that reached the board (all but steps
 25 and 27), is in [PERF.md](PERF.md).
@@ -53,7 +68,10 @@ left"). Steps 87 to 89 change only the start-up and the line count, step 90 take
 the plan, step 91 keeps `csr`'s running sums in registers and cuts 18 lines, step 92 changes
 comments and names only, with step 91's machine code, step 93 builds with PGO trained at full
 scale (replica −0.41 and −0.38 ms), and step 94 splits the queries in one AVX2 pass (the parse
-−0.42 ms) (PERF.md, steps 90 to 94).
+−0.42 ms) (PERF.md, steps 90 to 94). The later setup marks, on plain builds (seed 1, medians of 9;
+PERF.md step 94): the queries parsed at 3.282 ms on step 92's code and 2.862 on step 94's, the
+sample done at 4.347 and 3.921, the plan at 6.862 and 6.504, the vocabulary finished at 7.082 and
+6.736. The scan, merge, format and release phases have not been marked again since step 86.
 
 | Phase | Ends at (ms) | What |
 |---|---|---|
@@ -64,53 +82,28 @@ scale (replica −0.41 and −0.38 ms), and step 94 splits the queries in one AV
 | Format | 64.5 | |
 | Releases | 65.6 | pages given back while results.txt is written |
 
-The scan is about 54 ms of 66. The twelve scans end within 0.8 ms of each other, so slices of
-equal bytes cost at most that, and no work stealing was built. Builds with wrong output, used
-for timing only, price what is left in step 86's scan:
+The scan is about 54 ms of 66. The twelve scans end within 0.8 ms of each other here; over 31
+runs of step 92's code their ends spread 0.6 to 1.9 ms a run, the last 0.41 to 0.50 ms after
+the mean, with no slice last every time. A tail taken over by another thread would cost it a
+`Scan::new` (0.27 to 0.48 ms), its line ends and a log loop, so no work stealing was built
+(PERF.md, experiments). Those runs were quiet: B's time with one CPU busy, where the run waits
+for the slowest thread's one slice, has not been measured (the busy-loop runs below check only
+the output). Builds with wrong output, used for timing only, price what is left in step 86's
+scan:
 - making the answer states hot saves 1.769 ms, mostly through the first-id log;
 - skipping the merge's log loop saves 0.436 ms;
 - dropping the log's writes during the scan saves a further 1.109 ms.
 
-Step 49's phase table (12.5 ms of setup, a 77 ms scan) is in PERF.md, "How we measured".
-
-On step 49's code, exit-code probes on the box put the scan's token path with its per-token stores
-at 49.5 ms, the per-document BOOL evaluation at 14 ms more, and the superblocks at 9 ms more
-(PERF.md, "Box probes since step 47"; each level in its own dispatch).
-
-Inside the scan of step 53 (a 90.6 ms run on the replica; cut since), from builds that skip one
-part (wrong output, timing only; PERF.md, "Where the scan's time goes"):
-
-| Part skipped | Time saved |
-|---|---|
-| Phrase checks | 2.21 ms |
-| The triggered per-document evaluation | 14.73 ms |
-| The `always` superblocks | 9.24 ms |
-| The per-token stores (stamps and row ORs) | 25.67 ms |
-| The row ORs alone | 10.74 ms |
-| Everything but the token path | 34.88 ms: token path, setup and tail are about 56.6 ms |
-
-37% of the tokens are of no row term and go to one sink row, whose word every such token ORs.
-
-The reference runs 56.35 s at 2,200 MB and S 91. The submitted code is PERF.md's step 92
-(b-merge-1c, 1a5a6ba, S 1157), step 91's machine code byte for byte with review fixes in comments
-and names; that machine code ran 0.066969 s at 31.81 MB for 81.83 points in run-a492afc03dad, 841×
-faster than the reference (and 0.086307 s in run-ac43df513301, with B alone slow). The best Track B run, run-96f4490eeb42, is step 90's
-code (S 1175): 0.066 s at 31.37 MB for 81.94 points, 854× faster; the board cannot separate steps
-90 and 91. Three ideas carry it: no index, every query answered in one parallel scan
-(step 6: 0.355 s at 203 MB → 0.267 s at 38.4 MB); a perfect hash with one
-branch-free probe per token, built on 12 threads (step 31: 0.1338 → 0.1199 s); and BOOL queries
-folded into truth tables and evaluated per document, 8 at a time, with the common ones per 256
-documents (steps 49 and 66; the superblocks since step 8). The board's runs of one binary spread
-more than the last steps' gains, so those rest on paired runs on a replica of the box. Every step,
-with its board runs and replica A/Bs, is in PERF.md.
+The phase table, box probes and part-skipping builds of steps 49 and 53 are in PERF.md ("How we
+measured", "Box probes since step 47" and "Where the scan's time goes").
 
 ## The design
 
 There is no index. The queries are read first, the corpus is scanned once in parallel slices of
 whole lines, and every query is answered during that scan, so nothing grows with the corpus. The
-board's M for the submitted machine code's two runs was 31.79 and 31.81 MB (step 90's four: 31.05
-to 31.98 MB), and the replica's max of 20 runs of it 31.62 MB, under the 44 MB credit; every
-step's M is in PERF.md's step table.
+board's M for step 94's four runs was 31.38, 31.73, 31.73 and 31.85 MB, for step 95's three 31.57, 31.68 and 31.8 MB (step 92's machine code's
+seven: 31.31 to 31.81 MB), and the replica's max of 20 runs of its gate build 31.65 MB, under the
+44 MB credit; every step's M is in PERF.md's step table.
 malloc's mmap threshold is fixed at 1 MB, with transparent huge pages off (`mmap::set_up_memory`):
 at 32 MB the scan's first-id logs came from cleared heap and the peak reached 40 MB. Since step
 82 freed memory also stays in the heaps (a trim threshold of 1 GB): a trim flushes the TLB of every
@@ -353,7 +346,7 @@ What each technique measured, at the steps that brought it (PERF.md has every A/
 | Locality by numbering | 23 | test server −3.4%, L2 misses −10%; its one board run was disturbed |
 | Phrases on their rarest term | 59 | one masked compare per phrase: replica −1.049 ms (30 of 31) |
 | Setup without page faults | 15-16, 33, 55, 67-70 | 0.1713 → 0.1619 s (run-058dad4dcdce → run-3682cf4f995c); compact records (step 33): test server setup 16.8 → 11.6 ms; the pool −2.23%; steps 67-70 replica about −3.6 ms |
-| Build | 81, 93 | plain against sample-trained PGO: replica 0.86 to 1.00 ms faster; run-88a51030508d 0.072172 s; PGO trained at full scale against plain (step 93): replica −0.414 ms (seed 1), −0.383 ms (holdout 99) |
+| Build | 81, 93 | plain against sample-trained PGO: replica 0.55 to 0.67 ms faster (0.86 to 1.00 ms with step 81's tail releases); run-88a51030508d 0.072172 s; PGO trained at full scale against plain (step 93): replica −0.414 ms (seed 1), −0.383 ms (holdout 99) |
 
 ### Designs replaced
 
@@ -365,7 +358,7 @@ What each technique measured, at the steps that brought it (PERF.md has every A/
 | LLVM's branch in the probe | an inline-asm `cmov` (step 9) | test server 132 → 120 ms |
 | The 64-document block engine (steps 6-48) | per-document truth tables (step 49) | 0.108491 → 0.097889 s |
 | One thread per P-core (step 14) | two per core | step 14 lost 7%, reverted |
-| PGO trained at the sample scale (steps 5-80) | one plain build (step 81) | replica 0.86 to 1.00 ms faster |
+| PGO trained at the sample scale (steps 5-80) | one plain build (step 81) | replica 0.55 to 0.67 ms faster (0.86 to 1.00 ms with step 81's tail releases) |
 | One plain build (steps 81-92) | PGO trained at full scale (step 93) | replica −0.414 ms (seed 1), −0.383 ms (holdout 99) |
 | A byte loop for the query lines and another for their words | one AVX2 pass over spaces and LFs (step 94) | the parse −0.42 ms; replica −0.316 ms over 10 inputs |
 | simdjson-style branch-free extraction | the branchy loop | replica +1.45 to +1.73 ms, won 1 to 3 of 31 |
@@ -437,13 +430,13 @@ and the perfect hash: `split_lines`, `Vocab`, `Phf`, `Phf::fill`, `hash`, `probe
 53. Output formatted in parallel, states read in place through `answer_of` (`format_part`; no 4.5 MB copy). Exact: each line reads its own states.
 54. Exit right after writing, no frees. Exact: results.txt is complete before the exit.
 55. Slice edges need no special case. Exact: a document outside a thread's slice has no stamps and no row bits there.
-56. A profile-guided build trained at full scale since step 93 (Dockerfile): an instrumented build runs once on a full-scale corpus of generator seed 7 (`b_index.py`), then the profile-use build: −0.414 and −0.383 ms against step 92's plain release build. Steps 81 to 92 built without a profile: on step 81's code the build of steps 5 to 80, trained on a sample-scale run, ran 0.55 to 0.67 ms slower. Items 56 and 57 change speed only: every check runs the Dockerfile's binary.
+56. A profile-guided build trained at full scale since step 93 (Dockerfile): an instrumented build runs once on a full-scale corpus of generator seed 7 (`b_index.py`), then the profile-use build: −0.414 and −0.383 ms against step 92's plain release build (seed 1 and holdout 99), and a second PGO build −0.400 ms (seed 1). PGO builds of one source are not the same binary (two ran 0.419 ms apart), so the board's build is laid out by its own training run. Steps 81 to 92 built without a profile: on step 81's code the build of steps 5 to 80, trained on a sample-scale run, ran 0.55 to 0.67 ms slower. Items 56 and 57 change speed only: every check runs a build of the Dockerfile.
 57. No alignment flags (the replica: `-align-loops=64` +0.24%, `-align-all-functions=6` 0.00%); fat LTO, one codegen unit, `panic = "abort"`, `crt-static`, `target-cpu=native`, `compile_error!` without AVX2, BMI2 or AES.
 58. Exit-code and in-process timing probes on the box (PERF.md, "Box probes since step 47"). Measurement only, never a scored version.
 59. No dependencies: libc calls declared by hand.
 60. One persistent pool of threads behind `par` (`worker`, `JOB`, `GENERATION`, `FINISHED`, `BUSY`): the first call spawns the workers, and each later call publishes a job and waits for every worker to count it done; an assert allows one call at a time. A waiting worker maps the corpus in ahead of the scan, one read per 64 KB (`ahead`). Exact: `par` returns only after every part is done, and no worker uses the job after the call returns (its SAFETY comment).
 61. Workers wait in `umwait` on the generation word (`wait`), woken by a write to its cache line or by the kernel's time limit; without WAITPKG, a polling loop. Exact: a wait ends only when the word shows the next job.
-62. std's start-up skipped (`#![no_main]`, our own C `main`, as in Track A): no stack-guard lookup through /proc/self/maps, and no signal handlers or alternate signal stacks, in the spawned threads either: 66 fewer system calls at 8 CPUs, about 0.12 ms on the replica (PERF.md, step 89). The data paths are joined by `concat`, not `format!`, which keeps the scan's hot functions at their 64-byte offsets. Exact: nothing here recurses deeply or handles a signal; the arguments arrive as before (glibc passes them to std), and a panic still prints its message, then aborts (a panic on the main thread now names it `<unnamed>`).
+62. std's start-up skipped (`#![no_main]`, our own C `main`, as in Track A): no stack-guard lookup through /proc/self/maps, and no signal handlers or alternate signal stacks, in the spawned threads either: 66 fewer system calls at 8 CPUs, about 0.12 ms on the replica (PERF.md, step 89). The data paths are joined by `concat`, not `format!`, which kept the scan's hot functions at their 64-byte offsets in the plain builds of steps 89 to 92; under PGO (step 93) the profile lays out the code, and those offsets vary from build to build. Exact: nothing here recurses deeply or handles a signal; the arguments arrive as before (glibc passes them to std), and a panic still prints its message, then aborts (a panic on the main thread now names it `<unnamed>`).
 
 ## Why the output is exact
 
@@ -570,7 +563,7 @@ the plan is made per input, from a 2.5 MB sample of that input's own documents. 
 | Plan sizes | Past 2^16 BOOL terms or entries, every BOOL query is evaluated per superblock: exact for any query (forced on seed 1: 0.35 s). Past 2^16 lines the program stops |
 | Token lengths | Terms of 13 to 32 bytes go to the long map; longer tokens cannot be terms |
 
-Evidence, on the binary the Dockerfile builds:
+Evidence, on builds of the Dockerfile:
 
 - **Holdout seed 99**, full scale, byte-equal to the reference at every gate since step 33,
   including the submitted code's (PERF.md, "How the final number was verified").
@@ -590,7 +583,7 @@ Evidence, on the binary the Dockerfile builds:
   fresh-seed, repeat, tiny/sample and edge suites again, 1,426 runs each, all exact; steps 67 to 75
   change the setup, the page releases at the end and how `look_up` keeps anchor positions, and
   passed the gate, but of seeds 101-130 only 109 ran again, in step 70's A/B, with the same output
-  as step 69's; steps 77 to 92 ran all 30 again, below), with data generated on the replica by the
+  as step 69's; steps 77 to 92 and 94 ran all 30 again, below), with data generated on the replica by the
   organisers' generator (Python 3.11, which
   reproduces the official sample seed 1 and its reference output byte for byte). Every run was
   byte-exact, with no crash, no nonzero exit and no output on stderr:
@@ -603,13 +596,24 @@ Evidence, on the binary the Dockerfile builds:
     20 CPUs for both users: 840 of 840;
   - copies of seed 101 whose every file is an exact multiple of 4096 bytes, so that a read past
     the end of a file would fault, at 1, 3, 7, 12 and 20 CPUs: 5 of 5.
-- **The submitted code's final gate** (step 92, on the replica, Mon 2 Nov), every output
+- **The submitted code's gate** (step 95, on the replica, Mon 2 Nov): two PGO builds of the
+  Dockerfile, each 14 of 14 checks (full seed 1 at 1, 3, 7 and 12 CPUs; holdout 99 and samples 1
+  to 4 at 12 CPUs and 1), and the gate script's 144 runs on the second: every output byte-equal to
+  the reference. Memory, max of 5 runs, 31.62 and 31.53 MB.
+- **Points on unseen seeds** (step 94's code, two PGO builds, 18 fresh full seeds): 81.97 points
+  on average by the final's rule (std 0.08, worst 81.72, best 82.15), T 65.09 to 66.62 ms, every
+  seed one output on every run, three checked against the organisers' reference. One busy CPU, not
+  the seed, is the risk: 124.5 to 144.3 ms on seed 1 with a busy loop on one of the 12 CPUs
+  (PERF.md, "How the final number was verified").
+- **Step 94's final gate** (on the replica, Mon 2 Nov, one PGO build of the
+  Dockerfile, 8ce12e1e190c), every output
   byte-equal to the reference: fresh full seeds 101-130 at 1, 3, 7 and 12 CPUs (120 of 120 runs);
   tiny and sample seeds 201-210 as root and as uid 65534 at 1, 3, 12 and 20 CPUs (160 of 160);
   holdout 99 at nine CPU counts from 1 to 20 (9 of 9); 20 repeats of seed 101 at 12 and at 20 CPUs
   (40 of 40); 18 board-like edge cases at 1 and 12 CPUs as both users (72 of 72); and the gate's
-  144 runs and 66 hand-made edge runs. Memory, max of 20 runs, 31.62 MB. Steps 77 to 91 passed
-  the same gate, with 30.91 to 32.78 MB (PERF.md, "How the final number was verified").
+  144 runs and 66 hand-made edge runs. Memory, max of 20 runs, 31.65 MB. Steps 77 to 92 passed
+  the same gate, with 30.91 to 32.78 MB, and step 93's build was checked on full seed 1, holdout 99
+  and samples 2 to 4 (PERF.md, "How the final number was verified").
 - **The perfect hash, forced.** The per-region retry ran end to end from forced start seeds: in
   300 runs, 20 placed a region again, and all were exact.
 - **Time and memory on other seeds.** On the 30 fresh seeds step 59 ran 84.73 to 88.18 ms (medians

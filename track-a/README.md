@@ -20,22 +20,33 @@ percentiles need every latency of a group, not a running summary.
 
 ## Where the time goes on the box
 
-The reference runs 32.05 s at 228 MB and S 56. The submitted code is step 77 (S 436): step 74's
-engine in five fewer lines, at its speed on the replica (+0.04% against step 75, which changed
-comments only). Our best board run before this push is step 77's run-0b59d8b4b145: 0.015546 s,
-18.04 MB, S 436, 87.19 points. The fastest is still run-b6e32914afe1, from step 74's code:
-0.015462 s, 18.23 MB, S 441, 87.16 points. Both of step 77's runs lie within the spread of that
-code's runs, so the new best comes from the five lines and the noise, not from speed. PERF.md has
-every step and its runs.
+The reference runs 32.05 s at 228 MB and S 56. The submitted code is step 80 (5fc484e, S 442):
+step 79's code with one more assert, so that a spilled id in a thread's last hour also stops the
+program (replica: noise; no board run yet). Step 79 (bf4f03c, S 441) is step 78's code with the
+inline endpoint lookup also checking the slot after the home slot, −0.70% on 20 fresh seeds and
+about −0.5% on seed 1 on the replica; its four board runs, 0.015925 to 0.018303 s, do not show
+it. Step 78
+(631ec7f, S 437) is step 77's code, which is step 74's engine in five fewer lines, with one assert
+per hour that keeps pass 2's scatter inside its buffer on a malformed latency ("Error handling"),
+at step 77's speed on the replica (−0.05%, noise). Our best board run is step 77's run-0b59d8b4b145: 0.015546 s,
+18.04 MB, S 436, 87.19 points; step 78's best is run-1a7f895d269e: 0.015777 s, 18.35 MB, S 437,
+86.95 points. The fastest is still run-b6e32914afe1, from step 74's code: 0.015462 s, 18.23 MB,
+S 441, 87.16 points. Both of step 77's runs lie within the spread of that code's runs, so its best
+comes from the five lines and the noise, not from speed. PERF.md has every step and its runs.
 
 **Reading the code.** All the code is `src/main.rs`. Read `main`'s phase list (phases 1-6) first,
 then `merge`, `names`, `parse` with `Interner::find`, `id` and `add`, `stats` and `small_ranks`,
 `line_len` and `write`, and `release` and `map`. The unsafe code rests on four facts, each argued
-in its SAFETY comment: PAD zero bytes after the log, the two slices of a pair adjacent, every
-record's id one that was handed out (true for spec input), and a line of at most 213 bytes.
+in its SAFETY comment: PAD zero bytes after the log, the two slices of a pair adjacent, each
+hour's counts summing to its record count (asserted per hour since step 78), and a line of at most
+213 bytes.
 
 Where step 73's 15.6 ms go (replica: the box's CPU and the board's timer; µs from `main`'s start,
-medians of 9 runs; first / median / last thread; PERF.md, "Where step 73's run goes"):
+medians of 9 runs; first / median / last thread; PERF.md, "Where step 73's run goes"). This is
+step 73's code, not the submitted step 80's: the phases were not measured again. On the replica,
+steps 74, 77 and 78 read −0.10% to +0.05% against the code before them (74 against 73, 77 against
+75, 78 against 77), step 75 changed only comments, and step 76's code did not stay, so the total
+has not moved beyond the noise:
 
 | Phase | Ends at (µs) | What bounds it |
 |---|---|---|
@@ -55,8 +66,12 @@ reports only T and the exit code of a failed run (PERF.md, "Box probes"):
 - With 6 threads instead of 12, the same touch takes only 5% longer (run-c08713cbca4a, exit code
   105). So memory sets that floor, not the cores.
 - The parse itself is core-bound: with one thread per core (6 threads) it ends 31% later on the
-  replica (12.62 against 9.63 ms, medians of 15 runs of a build that prints its phase ends), while
-  the touch above took only 5% longer. The rest of the run took 19% longer.
+  replica (12.62 against 9.63 ms, medians of 15 runs of step 60's code in a build that prints its
+  phase ends), while the touch above took only 5% longer. The rest of the run took 19% longer.
+  That rests on this one thread-count experiment: we have no counter profile (`perf stat`
+  instructions, uops, IPC and branch misses per line at 12 and 6 threads) of the submitted
+  build's parse. The one profile of this engine, a `perf record` of step 75's code, put
+  `Interner::id` at 6.8 to 8.5% of the cycles (PERF.md, "Experiments that did not make it").
 
 So the parse ends 1.2 to 1.4 ms above the touch-only floor (9.0 to 9.2 ms on the replica, median
 and last thread, against the box probe's 7.8 ms), and about 5.5 ms of `main` comes after it.
@@ -66,7 +81,12 @@ each, PERF.md):
 - the selections of the groups of more than 64 values: 1.15 ms, of which p50's 0.70;
 - writing the lines: 1.10 ms, of which output page faults and stores 0.76 and formatting 0.35;
 - rank counting for the groups of up to 64 values: 0.75 ms;
-- the scatter of each hour's values: 0.47 ms.
+- the scatter of each hour's values: 0.47 ms;
+- the rest, about 1.6 ms, is not priced. Pass 2 runs from the merge's end at 9,292 µs to the
+  median thread's end at 14,363 µs, about 5.07 ms on step 73's code, and the four parts above,
+  measured on steps 54 to 56's code, add up to 3.47 ms. The rest holds the waits on the name
+  order, on the output gate and on earlier hours' lengths, the building of the groups and
+  `line_len`; no build has skipped those one at a time, so their shares are not known.
 
 Memory is the other axis. The fixed cost is small: the endpoint table, 12 thread stacks, the heap
 and its arenas and the log's page tables come to 1.5 to 2.2 MB (PERF.md, "The peak as a model").
@@ -75,7 +95,7 @@ page cache already, charged to the host. The peak came 2 to 3 ms into pass 2, wh
 of the 48 parts were still alive. Since step 61 the output waits until the records given back make
 room for it (*Gate*, below), and in 7 of 10 replica runs of step 68's code the peak is the start of
 pass 2, when each thread's first scatter faults in its values buffer. The expected highest of five
-peaks is 18.50 MB on the replica for four builds of the submitted source (120 peaks, interleaved
+peaks is 18.50 MB on the replica for four builds of step 78's source (120 peaks, interleaved
 with step 75's builds, which read 18.51 MB), against 19.49 MB for step 60. Each run's peak also
 includes 0 to 3 MB of the kernel's per-CPU charge batches, 2.3 to 3.1 MB at the peak in those 10
 runs (PERF.md, "What we learned about the box").
@@ -84,13 +104,13 @@ runs (PERF.md, "What we learned about the box").
 
 The program has five parts. Each one exists because of one bottleneck.
 
-| Part | Bottleneck it addresses |
-|---|---|
-| Mapped, padded input; slices taken in pairs from a shared counter | 239 MB to read once, with no copy, no memory charge and no end-of-file special case; a thread slowed by a shared CPU |
-| Two slices parsed side by side; a branch-free AVX2 line parse; endpoints found where they lie | Each line's start waits on the previous line's end; branch mispredictions on the method and endpoint length; instructions per line |
-| 4-byte records, hours as runs | Memory per record; a calendar per line; unbounded disorder |
-| Pass 2 by hour: counting sort, rank counting, selection | Cache misses of a global sort; full sorts for three ranks |
-| Output written in place, out of order; no teardown | Serial writes; page faults on one file lock; freeing and unmapping at exit |
+| Part | Bottleneck it addresses | Measured effect (PERF.md step, board runs) |
+|---|---|---|
+| Mapped, padded input; slices taken in pairs from a shared counter | 239 MB to read once, with no copy, no memory charge and no end-of-file special case; a thread slowed by a shared CPU | Step 16's buffered read ran 0.0236 s (run-54e9c5f0e0dd, a possibly disturbed dispatch) against step 15's mapped 0.02188 s (run-8e8d92a5861d); step 51, two pairs of slices per thread instead of four: best run 0.016502 → 0.016307 s (run-d32a7ea98388 → run-cab6a2cefe9b) |
+| Two slices parsed side by side; a branch-free AVX2 line parse; endpoints found where they lie | Each line's start waits on the previous line's end; branch mispredictions on the method and endpoint length; instructions per line | Step 43: best run 0.018636 → 0.018084 s |
+| 4-byte records, hours as runs | Memory per record; a calendar per line; unbounded disorder | Step 8: M 44.66 → 24.3 MB, +3.8 points (run-73fe01d551bc → run-6154ff9e18eb) |
+| Pass 2 by hour: counting sort, rank counting, selection | Cache misses of a global sort; full sorts for three ranks | Step 6, whole hours per thread: 0.0498 → 0.0457 s (run-8d33686a4c41 → run-36b7152f0bc2); step 44, rank counting: best run 0.018084 → 0.016848 s |
+| Output written in place, out of order; no teardown | Serial writes; page faults on one file lock; freeing and unmapping at exit | Step 19, no wait for the previous hour: 0.0227 → 0.019785 s (run-f67608cbf0d2 → run-23cc1c0061e6); step 12, exit right after the write: 0.0367 → 0.03066 s (run-e557e7f64a7c → run-bd4492babdc6) |
 
 **Considered, measured, not kept** (PERF.md, experiments):
 
@@ -226,8 +246,8 @@ One line per technique: what it is, where it is in `src/main.rs`, and why the ou
 31. Endpoint sort by the first 32 key bytes as two big-endian `u128`, then the name, done by the merging thread after the hand-off (`names`) and published in `order`. Exact: byte order; the space after an endpoint is below every endpoint byte, so a proper prefix sorts first; the order is set once, and every hour waits for it before it builds its groups.
 32. All runs sorted by hour, in a vector presized to the parts' starts, and cut into hours with `chunk_by` (`merge`, `same_hour`). Exact: every run of an hour, from any slice, lands in that hour, whatever the disorder, and the order of an hour's runs changes no output byte: each run reads its own escapes, and a group's values are only counted or selected.
 33. Hours queued in blocks of one per thread, largest first: small hours do not pile up behind a big one. Exact: it orders the work; each hour's place in the file comes from the published lengths (42).
-34. Per-hour counting sort with count and 5xx count packed in one `u64`: one add per record. Exact: each group's count is zeroed as it is taken (`std::mem::take`), and every id a record can hold is in the endpoint list, so each hour starts from zeros.
-35. Scatter without bounds checks (SAFETY: the counts are this hour's). Exact: each id's cursor starts at its group's start and ends at the next id's start, at most the hour's record count.
+34. Per-hour counting sort with count and 5xx count packed in one `u64`: one add per record. Exact: each group's count is zeroed as it is taken (`std::mem::take`), and every id a spec line's record can hold is in the endpoint list, so each hour starts from zeros; an assert checks each hour's counts against its record count (step 78).
+35. Scatter without bounds checks (SAFETY: the counts are this hour's, as the assert in 34 checks). Exact: each id's cursor starts at its group's start and ends at the next id's start, at most the hour's record count.
 36. Record pages released per slice once all its runs are placed (`readers`: the merge sets each part's count to its number of runs, and pass 2 counts it down once per placed run): one `madvise` per slice, because each call is a round of TLB shootdowns. Exact: the count reaches zero only when the part's last run has been placed (`AcqRel`), so nothing reads the records after their release.
 37. Percentiles of groups of up to 64 values by counting ranks (`small_ranks`): masked loads into 1, 4 or 8 vectors, one compare per value and vector, and the value at rank r taken as the largest value with at most r values below it. Exact: that is the definition of the value at rank r; the zeros past the end are never counted.
 38. Larger groups: p50, p95 and p99 by nested `select_nth_unstable`, each read right after its own selection (`stats`). Exact: ranks `ceil(p * n / 100)`; the next selection reorders the slice.
@@ -243,7 +263,7 @@ One line per technique: what it is, where it is in `src/main.rs`, and why the ou
 48. Hot loops aligned to 64 bytes (`-align-loops=64`). No measured effect on A in board runs, and never A/B'd on the replica; kept because C's best run uses it and every later step was measured with it (PERF.md, steps 34 and 36).
 49. Fat LTO, one codegen unit, `panic = "abort"` (Cargo.toml).
 50. Static binary (`crt-static`).
-51. `target-cpu=native`, with a `compile_error!` without AVX2.
+51. `target-cpu=native`, with a `compile_error!` without AVX2 or BMI2.
 52. Exit-code timing probes on the box (PERF.md, "Box probes"). Measurement only, never a scored version.
 53. No dependencies: libc calls declared by hand.
 54. Output writes gated on the records given back (`flush`, `given`, `wrote`, `held`): the output takes the records' place instead of stacking on them at the peak. Exact: the gate only delays a write; the last flush is ungated, and each hour's place comes from the published lengths (42).
@@ -588,7 +608,7 @@ stays exact for every seed of the generator.
     every later step was measured with it.
   - *The rest.* Fat LTO, one codegen unit, `panic = "abort"`, a static binary and
     `target-cpu=native` (the board builds this track on the box). A `compile_error!` stops a build
-    without AVX2.
+    without AVX2 or BMI2.
 - **Why exact.** The build changes speed only. Each correctness check runs the binary built by
   this directory's Dockerfile.
 
@@ -622,8 +642,10 @@ from the techniques above:
   values count ranks exactly, ties included; larger groups take three nested
   `select_nth_unstable` calls, each rank read right after its own selection (technique 9).
 - **Counts.** Each hour's per-endpoint counts start at zero: the array starts zeroed, and each hour
-  zeroes every count as it takes the group (`std::mem::take`); every id a record can hold is in the
-  endpoint list, so no count carries over to the next hour (technique 9).
+  zeroes every count as it takes the group (`std::mem::take`); every id a record of a spec line can
+  hold is in the endpoint list, so no count carries over to the next hour, and an assert checks
+  each hour's counts against its record count (technique 9; "Spec edge cases" for a malformed
+  latency).
 - **The output.** Each hour's byte length comes from the same numbers the writer prints, and the
   writer asserts that the hour's lines end exactly at its start. The rate is the integer
   `errors * 1000000 / count`, and the file is cut to the sum of the lengths (technique 10).
@@ -661,7 +683,16 @@ at an assert, never a read outside the mapping (SAFETY in `parse`). These are ch
 - the endpoint length;
 - the 2,047 ids;
 - the room for the records;
+- each hour's counts against its record count, once per hour (step 78);
 - each hour's written length.
+
+A latency of up to 6 bytes that are not all digits is converted as if they were digits: the value
+is wrong, from 2^20 up it spills into the record's 5xx bit, and from 2^21 up into its endpoint id
+(`id << 21 | 5xx << 20 | latency`, index 24). A spill into an id that was never handed out leaves
+a count behind, and the count assert stops that thread's next hour before its scatter can write
+past `values`, as step 77's build did (PERF.md, step 78); since step 80 a second assert, after the
+hour loop, stops one in a thread's last hour. A spill into a handed-out id gives a wrong line with
+exit 0.
 
 ## Robust on unseen seeds
 
@@ -686,62 +717,48 @@ Evidence, all on the binary built by this directory's Dockerfile:
   - tiny and sample seeds 21-24 (step 30) and 21-23 (step 31);
   - 41-43 (steps 38-40, and again for the new parse, step 43), each at 1 and 8 CPUs, against
     `reference/a_ingest.py`.
-- **Malformed input**: 300 mutated logs abort with a message or exit 0, never a segfault (step
-  29, and again for the new parse: 111 exit 0, 189 stop at a tripwire).
-- **Robustness runs on the replica** (Sun 1 Nov, about 17:00 UTC), on the exact Dockerfile build
-  of step 59 (step 60 changes names and formatting only), with data generated on the replica by the organisers' generator (Python 3.11, which
-  reproduces the official sample seed 1 and its reference output byte for byte). Every run was
-  byte-exact, with no crash, no nonzero exit and no output on stderr:
-  - 30 fresh full-scale seeds (101-130) at 12 threads, seeds 101-102 also at 1 and 3 CPUs and
-    seeds 103-104 at 2, 7 and 11: 40 of 40 runs;
-  - 20 sha256-checked repeats per seed at 12 threads, and runs with a busy loop on 1, 2 or 4 of
-    the twelve CPUs (seeds 109, 110 and 113): 640 of 640;
-  - tiny and sample seeds 201-210 at 1, 2, 3, 7, 12 and 20 CPUs, each run as root and as uid
-    65534 (the board's privilege drop) with read-only data, 3 repeats, and full scale at 12 and
-    20 CPUs for both users: 840 of 840;
-  - copies of seed 101 whose every file is an exact multiple of 4096 bytes, so that a read past
-    the end of a file would fault, at 1, 3, 7, 12 and 20 CPUs: 5 of 5.
-- **Step 63**, the exact Dockerfile build: fresh full seeds 101-110 at 12 threads and 101-102 at
-  1 and 3 CPUs, 14 of 14; 20 repeats of each of 10 seeds, 200 of 200; tiny and sample seeds
-  201-205 at 1, 3, 7, 12 and 20 CPUs, as root and as uid 65534, plus full seeds 111-112, 208 of
-  208; the 13 in-spec edge inputs at 1 and 12 CPUs as both users, 52 of 52.
-- **Steps 64 and 65**, the exact Dockerfile builds of their code (step 65 adds only comments to the
-  code that was gated): the same runs as step 63 (14 of 14, 200 of 200, 208 of 208), the 13 in-spec
-  edge inputs (52 of 52) and 250 malformed logs, none of which crashes. Step 66 passed the gate
-  script on its exact Dockerfile build, and its machine code differs from step 65's only outside
-  the hot loops (PERF.md, step 66).
-- **Steps 68 and 69**, each on two exact Dockerfile builds and on a
-  build of the file as committed (comments only after the gate): the gate (the seed-1 hash at 1,
-  3, 7 and 12 CPUs, sample seeds 1-4, holdout seed 99, the empty input, and 250 malformed logs,
-  none of which crashes); the 13 in-spec edge inputs at 1 and 12 CPUs as both users, 52 of 52;
-  fresh full seeds 101-130 at 12 threads and 101-102 also at 1 and 3 CPUs, 34 of 34, with 20
-  repeats of each of the 30 seeds, 600 of 600; and tiny and sample seeds 201-210 at 1, 3, 7, 12
-  and 20 CPUs, as root and as uid 65534, twice each, 400 of 400.
-- **Steps 70 and 71**, each on two exact Dockerfile builds: the same gate (250 malformed logs: 9
-  stop at a tripwire, none crashes), and on the laptop's build the seed-1 hash, sample seeds 1-4,
-  holdout seed 99 and the empty input. Step 71's code also ran on 136 seeds never used before
-  (tiny 301-400, sample 401-430, full 501-506), each against the organisers' reference at 1 to 8
-  CPUs, with repeats and a harness-like container run: 2,224 runs, all byte-identical, no stderr.
-- **Steps 72 to 74**: the same gate on every kept build (250 malformed logs: 9 stop at a
-  tripwire, none crashes).
-- **Steps 76 and 77**, each on two exact Dockerfile builds: the
-  same gate (250 malformed logs: 9 stop at a tripwire, none crashes). Both versions' builds ran 43
-  seeds never used before (tiny 601-620, sample 631-645, full 651-658) on the laptop at 1, 3 and 8
-  CPUs, 129 of 129 runs per build. Step 77's builds also ran 44 more (tiny 681-700, sample
-  661-680, full 701-704) at 2, 4, 6, 7 and 8 CPUs, 220 of 220 per build, and the 20 tiny seeds on
-  the replica at 12 and 20 threads, 40 of 40 per build: 87 new seeds and 698 laptop runs with no
-  mismatch, no nonzero exit and nothing on stderr.
-- **Step 78** (the submitted code), on two PGO builds: the same gate (250 malformed
-  logs: 9 stop at a tripwire, none crashes; the new assert fires on none of them). Two logs built
-  for the assert, `spike` and `steady`, run on one E-core: step 77's build exits 139 (SIGSEGV) on
-  both, step 78's aborts with 134 and the message `requests.log: bad latency`.
+- **Malformed input**: 300 mutated logs abort with a message or exit 0, and none segfaults (step
+  29, and again for the new parse: 111 exit 0, 189 stop at a tripwire). They missed one case, which
+  a code review found in step 77: a latency of up to 6 bytes that are not all digits can spill
+  into an endpoint id that was never handed out, and the next hour's scatter on that thread then
+  wrote past its buffer. Two logs built for it made step 77's build exit 139 (SIGSEGV). Step 78
+  asserts each hour's counts against its record count, so both now stop with exit 134 and
+  `requests.log: bad latency`. The assert bounds the scatter; it does not check latencies ("Spec
+  edge cases").
 - **The id bound, measured.** Every seed has 1,842 endpoints, against 2,047 ids. With step 54's
   code up to 13 ids were lost in 20 runs of a seed; with steps 57 to 59, at most 1 id in 150 runs,
   and the bound is one per thread: at most 1,854 ids at 12 threads.
 - **Time and memory on other seeds.** On the 30 fresh seeds step 59 ran 16.71 to 18.22 ms (medians
   of 7 runs; seed 1: 17.36 ms), with a memory peak of 18.97 to 20.19 MB on seeds 101-110 (max of 5
   runs; seed 1: 19.44 MB).
-- **Not covered:** more than 20 threads (the replica has 20 CPUs).
+- **Points on unseen seeds.** On 20 fresh full seeds (9101-9120), step 78's code scores 86.59 points
+  on average (std 0.31, worst 85.76 on seed 9107) against 86.89 for seed 1 by the same method, and
+  step 79's 86.64 (std 0.32, worst 85.81). Seed 1 is a fast seed; the worst seed's cost is its
+  1-byte root path in 12.4% of its lines, which the inline lookup never hits (PERF.md, "How the
+  final number was verified").
+
+**Each kept step's checks**, on the binary built by this directory's Dockerfile. The gate is the
+seed-1 hash at 1, 3, 7 and 12 CPUs, sample seeds 1-4, holdout seed 99, the empty input and 250
+malformed logs (PERF.md, "How the final number was verified"). Edge inputs are the 13 in-spec
+ones, at 1 and 12 CPUs as root and as uid 65534 (the board's privilege drop). Every run on a valid
+input matched the reference byte for byte:
+
+| Step | Builds | Checks | Runs passed |
+|---|---|---|---|
+| 59 (step 60 changes names and formatting only) | 1, on the replica (Sun 1 Nov, about 17:00 UTC), data from the organisers' generator under Python 3.11, which reproduces sample seed 1 and its reference output byte for byte | Fresh full seeds 101-130 at 12 threads, 101-102 also at 1 and 3 CPUs, 103-104 at 2, 7 and 11; 20 sha256-checked repeats a seed, with a busy loop on 1, 2 or 4 of the 12 CPUs (seeds 109, 110, 113); tiny and sample seeds 201-210 at 1, 2, 3, 7, 12 and 20 CPUs as root and uid 65534 with read-only data, 3 repeats, and full scale at 12 and 20 CPUs for both users; seed 101 with every file an exact multiple of 4096 bytes, so that a read past the end would fault, at 1, 3, 7, 12 and 20 CPUs | 40 of 40, 640 of 640, 840 of 840, 5 of 5 |
+| 63 | 1 | Fresh full seeds 101-110 at 12 threads, 101-102 at 1 and 3 CPUs; 20 repeats of 10 seeds; tiny and sample seeds 201-205 at 1, 3, 7, 12 and 20 CPUs as both users, plus full seeds 111-112; edge inputs | 14 of 14, 200 of 200, 208 of 208, 52 of 52 |
+| 64, 65 (65 adds only comments) | 1 each | Step 63's runs; edge inputs; 250 malformed logs | 14 of 14, 200 of 200, 208 of 208, 52 of 52; no malformed log crashes |
+| 66 | 1 | The gate; machine code differs from step 65's only outside the hot loops (PERF.md, step 66) | Gate passed |
+| 68, 69 | 2 each, and the file as committed (comments only after the gate) | The gate; edge inputs; fresh full seeds 101-130 at 12 threads, 101-102 also at 1 and 3 CPUs, with 20 repeats of each; tiny and sample seeds 201-210 at 1, 3, 7, 12 and 20 CPUs as both users, twice each | Gate passed; 52 of 52, 34 of 34, 600 of 600, 400 of 400 |
+| 70, 71 | 2 each | The gate (250 malformed logs: 9 stop at a tripwire, none crashes), and on the laptop's build the seed-1 hash, sample seeds 1-4, holdout seed 99 and the empty input; step 71 also on 136 new seeds (tiny 301-400, sample 401-430, full 501-506) at 1 to 8 CPUs against the organisers' reference, with repeats and a harness-like container run | Gate passed; 2,224 of 2,224 |
+| 72 to 74 | Every kept build | The gate (250 malformed logs: 9 stop at a tripwire, none crashes) | Gate passed |
+| 76, 77 | 2 each | The gate; 43 new seeds (tiny 601-620, sample 631-645, full 651-658) on the laptop at 1, 3 and 8 CPUs; step 77 also 44 more (tiny 681-700, sample 661-680, full 701-704) at 2, 4, 6, 7 and 8 CPUs, and the 20 tiny seeds on the replica at 12 and 20 threads | Gate passed; 129 of 129 a build; step 77: 220 of 220 and 40 of 40 a build (87 new seeds, 698 laptop runs) |
+| 78 | 2 PGO | The gate (250 malformed logs: 9 stop at a tripwire, none crashes, the new assert fires on none); two logs built for the assert, `spike` and `steady`, on one E-core | Gate passed; step 77's build exits 139 (SIGSEGV) on both, step 78's 134 with `requests.log: bad latency` |
+| 79 | 2 PGO | The gate; the adversarial kit at 12 threads on one build and on the E-cores on the other; the 20 fresh full seeds 9101-9120 of the stability runs, against the organisers' reference | Gate passed; kit passed; 20 of 20 seeds equal to the reference |
+| 80 (submitted) | 2 PGO | The gate (250 malformed logs: 9 stop at a tripwire, none crashes); the adversarial kit; seed 9107 against the reference; a one-line log whose latency `~~~~~~` spills into id 5 | Gate and kit passed; 9107 equal; step 79's build exits 0 on the one-line log, step 80's 134 |
+
+What this does not cover: most malformed latencies give a wrong line with exit 0, as the asserts
+catch only a spill into an id never handed out ("Spec edge cases"); and more than 20 threads, as the replica has 20 CPUs.
 
 ## Error handling
 
@@ -750,7 +767,8 @@ Errors are panics with a message, and the build aborts on panic, so the exit sta
 - an endpoint over 125 bytes, or more than 2,047 endpoint ids;
 - records past their room;
 - an hour whose endpoint counts sum past its record count, from a malformed latency
-  (`requests.log: bad latency`, step 78);
+  (`requests.log: bad latency`, step 78). Other malformed latencies are not detected: they give
+  a wrong line with exit 0 ("Spec edge cases");
 - an hour whose written length differs from its computed one.
 
 Ignored on purpose, as each only costs memory or time and never changes a byte: a failed `prctl`
@@ -782,5 +800,10 @@ hand. All the code is one file, `src/main.rs`.
   one CPU could avoid it: about 6,200 page faults, 3 to 5 ms of single-CPU work, which costs more
   T than the memory is worth. Removing the burst at the start of pass 2, the peak in 7 of those 10
   runs, would lower the mean peak by only 0.15 MB (PERF.md, "What we learned about the box").
-- **Pass 2 during the parse** is ruled out in spec: the disorder is unbounded, so a part not yet
-  parsed may hold lines of any hour, and no hour is complete before the last part is in.
+- **Pass 2 during the parse** is possible exactly only with a fallback: the disorder is unbounded,
+  so a part not yet parsed may hold lines of any hour, and an hour closed early must be redone if a
+  later line falls in it. We built it twice, with pass 2 run in chunks between rounds of the parse,
+  and both lost on the replica: the first cut the peak (17.76 against 19.05 MB) but ran T +2.5% at
+  S 556, net −0.9 points; the second ran T +4.2% with M +1.7 MB at S 522, net −1.5, as the
+  per-thread values buffers, one hour in size, keep the peak (PERF.md, experiments). A version
+  that pays would need a pass 2 without an hour-sized buffer per thread.
