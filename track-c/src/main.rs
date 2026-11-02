@@ -497,13 +497,10 @@ extern "C" fn worker(w: usize) -> usize {
     // Buffers taken from an inbox (see `take`).
     let mut taken = Vec::new();
     // regions.csv first, in REGION_CHUNKS equal parts. Every LF in it is followed
-    // by a digit or the end, so `run_start` cuts it into whole lines. The entries a
-    // listed id may have: one at or past the last is outside spec 2.3, and its index
-    // panics in `fill`.
-    let listed = &s.group_of[..REGION_IDS - 1];
+    // by a digit or the end, so `run_start` cuts it into whole lines.
     while let Some(k) = claim(&s.next_chunk, REGION_CHUNKS) {
         let cut = |k| run_start(lines, 0, k, REGION_CHUNKS);
-        fill(&lines[cut(k)..cut(k + 1)], listed, &s.codes, &s.countries);
+        fill(&lines[cut(k)..cut(k + 1)], s);
         s.ready.fetch_add(1, Release);
     }
     // Every chunk entered, and the faulters' first share in: the pair buffers land in the
@@ -598,7 +595,15 @@ fn finish(s: &Shared, w: usize, taken: &mut Vec<Vec<u64>>, totals: &mut [Totals;
     // SAFETY: `text` is `map`'s: a private mapping that is never written.
     unsafe { drop_pages(&text[body_start..early][part(early - body_start, w, threads)]) };
     (0..threads).for_each(|t| take(s, (w + t) % threads, taken, totals));
-    merge(&mut s.sums.lock().unwrap(), totals);
+    // This thread's totals into the sums: every column adds up, except the min and
+    // the max.
+    for (sum, t) in s.sums.lock().unwrap().iter_mut().zip(totals.iter()) {
+        for k in [COUNT, ID_SUM, AMOUNT_SUM, NAMES_DISTINCT, BYTES] {
+            sum[k] += t[k];
+        }
+        sum[AMOUNT_MIN] = sum[AMOUNT_MIN].min(t[AMOUNT_MIN]);
+        sum[AMOUNT_MAX] = sum[AMOUNT_MAX].max(t[AMOUNT_MAX]);
+    }
     // Each thread counts itself in `done` a second time.
     s.done.fetch_add(1, Release);
     wait(&s.done, 2 * threads);
@@ -617,7 +622,7 @@ fn finish(s: &Shared, w: usize, taken: &mut Vec<Vec<u64>>, totals: &mut [Totals;
         unsafe { drop_pages(&keys[..]) };
         // SAFETY: this thread's table; no thread reads the tables again (above).
         unsafe { drop_pages(&rows[..]) };
-        // SAFETY: no thread reads the join table after `merged` (above).
+        // SAFETY: no thread reads the join table after the second barrier (above).
         unsafe { drop_pages(&s.group_of[share(REGION_IDS)]) };
         // SAFETY: `map`'s private mapping, never written: a dropped page faults back
         // the same bytes.
@@ -629,11 +634,11 @@ fn finish(s: &Shared, w: usize, taken: &mut Vec<Vec<u64>>, totals: &mut [Totals;
 }
 
 /// Enters the `region_id,CCC` LF lines of regions.csv in `lines` (spec 2.3) into
-/// the join table `group_of`: each region id gets its country's group. A
-/// country code seen for the first time gets the next group, by `codes` (indexed
-/// by the code, 0 while not seen) and `countries` (the group keys in group order,
-/// held while a code gets the next number).
-fn fill(lines: &[u8], group_of: &[AtomicU8], codes: &[AtomicU8], countries: &Mutex<Vec<Vec<u8>>>) {
+/// the join table: each region id gets its country's group. A country code seen
+/// for the first time gets the next group, by `s.codes` (indexed by the code, 0
+/// while not seen) and `s.countries` (the group keys in group order, held while a
+/// code gets the next number).
+fn fill(lines: &[u8], s: &Shared) {
     let mut at = 0;
     while at < lines.len() {
         // The region id: the digits up to the comma.
@@ -642,10 +647,10 @@ fn fill(lines: &[u8], group_of: &[AtomicU8], codes: &[AtomicU8], countries: &Mut
             (id, at) = (id * 10 + (digit - b'0') as usize, at + 1);
         }
         let [a, b, c] = [1, 2, 3].map(|i| lines[at + i].wrapping_sub(b'A') as usize);
-        let group = &codes[(a * 26 + b) * 26 + c];
+        let group = &s.codes[(a * 26 + b) * 26 + c];
         // Checked again under the lock: two threads can meet a new code at once.
         if group.load(Relaxed) == 0 {
-            let mut countries = countries.lock().unwrap();
+            let mut countries = s.countries.lock().unwrap();
             if group.load(Relaxed) == 0 {
                 countries.push(lines[at + 1..at + 4].to_vec());
                 // Groups 1..=240 (see WORDS); 0 is `_UNMATCHED`.
@@ -653,20 +658,10 @@ fn fill(lines: &[u8], group_of: &[AtomicU8], codes: &[AtomicU8], countries: &Mut
                 group.store(countries.len() as u8 - 1, Relaxed);
             }
         }
-        group_of[id].store(group.load(Relaxed), Relaxed);
+        // The entries a listed id may have: one at or past the last is outside spec
+        // 2.3, and its index panics here.
+        s.group_of[..REGION_IDS - 1][id].store(group.load(Relaxed), Relaxed);
         at += 5; // past ",CCC" and the LF
-    }
-}
-
-/// Adds a thread's totals to the sums: every column adds up, except the min and
-/// the max.
-fn merge(sums: &mut [Totals; GROUPS], totals: &[Totals; GROUPS]) {
-    for (sum, t) in sums.iter_mut().zip(totals) {
-        for k in [COUNT, ID_SUM, AMOUNT_SUM, NAMES_DISTINCT, BYTES] {
-            sum[k] += t[k];
-        }
-        sum[AMOUNT_MIN] = sum[AMOUNT_MIN].min(t[AMOUNT_MIN]);
-        sum[AMOUNT_MAX] = sum[AMOUNT_MAX].max(t[AMOUNT_MAX]);
     }
 }
 
