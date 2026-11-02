@@ -7,8 +7,9 @@ COPY . .
 # scored. target-cpu=native makes the board build this track on the scoring box.
 # The profile's counters are atomic, so the training run's threads lose no updates
 # (PERF.md, step 28). Builds still differ a little: timing-dependent counts vary.
-# -align-loops=64 starts hot loops on a 64-byte boundary: not slower on this track
-# (PERF.md, steps 34 and 36). crt-static: a static binary, with no dynamic loader.
+# -align-loops=64 starts hot loops on a 64-byte boundary: no measured effect on A's
+# board runs (PERF.md, steps 34 and 36); kept because C's best run uses it.
+# crt-static: a static binary, with no dynamic loader.
 RUN RUSTFLAGS="-C target-cpu=native -C target-feature=+crt-static -C profile-generate=/tmp/pgo -C llvm-args=-instrprof-atomic-counter-update-all" cargo build --release --offline \
  && python3 a_ingest.py --seed 7 --scale sample --out /tmp/train > /dev/null && mkdir /tmp/out && target/release/solution /tmp/train /tmp/out && llvm-profdata merge -o /tmp/pgo.profdata /tmp/pgo \
  && RUSTFLAGS="-C target-cpu=native -C target-feature=+crt-static -C profile-use=/tmp/pgo.profdata -C llvm-args=-align-loops=64" cargo build --release --offline

@@ -43,8 +43,8 @@
 // (panic = "abort").
 #![no_main]
 
-#[cfg(not(target_feature = "avx2"))]
-compile_error!("track-a needs AVX2: build with RUSTFLAGS=\"-C target-cpu=native\"");
+#[cfg(not(all(target_feature = "avx2", target_feature = "bmi2")))]
+compile_error!("track-a needs AVX2 and BMI2: build with RUSTFLAGS=\"-C target-cpu=native\"");
 
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::*};
 use std::{arch::x86_64::*, cell::Cell, fs::File, io::Error, os::fd::AsRawFd, ptr, sync::OnceLock};
@@ -241,8 +241,9 @@ extern "C" fn main(_: i32, _: *const *const u8) -> i32 {
             // computed (`gated`), an hour also waits until the records given back cover
             // the output written so far, its own bytes and `held`. Written as soon as its
             // start was known, the output piled up on the records and the values buffers
-            // 2-3 ms into pass 2, at the memory peak; gated, the highest of 5 runs is
-            // 0.7 to 0.8 MB lower at equal speed. (All the buffers' room: up to 0.4 MB
+            // 2-3 ms into pass 2, at the memory peak; gated, the expected highest of 5
+            // peaks is 0.84 MB lower at equal speed (PERF.md, experiments; 0.99 MB with
+            // step 61's line cuts). (All the buffers' room: up to 0.4 MB
             // lower again, but 0.9% slower, as more hours are left to write at the end.)
             // A heuristic: two threads may pass it at once; it changes when an hour is
             // written, never its bytes.
@@ -305,6 +306,7 @@ extern "C" fn main(_: i32, _: *const *const u8) -> i32 {
                 for (at, &count) in start[1..].iter_mut().zip(&counts) {
                     (*at, sum) = (sum, sum + count as u32);
                 }
+                assert_eq!(sum as usize, size(hour), "requests.log: bad latency");
                 for &Run { begin, part, end } in runs {
                     let parsed = parts[part].wait();
                     let mut escapes = parsed.escapes[begin.escape..].iter();
@@ -315,8 +317,8 @@ extern "C" fn main(_: i32, _: *const *const u8) -> i32 {
                         };
                         let at = &mut start[(record >> ENDPOINT_SHIFT) as usize + 1];
                         // SAFETY: each id's cursor stays below the next id's
-                        // start, which is at most this hour's record count (the
-                        // counts above are this hour's), so at most `largest`, the
+                        // start, at most `sum`, which the assert above holds to
+                        // this hour's record count, so at most `largest`, the
                         // length of `values`.
                         unsafe { *values.get_unchecked_mut(*at as usize) = latency };
                         *at += 1;
@@ -344,6 +346,9 @@ extern "C" fn main(_: i32, _: *const *const u8) -> i32 {
                     let group = &mut values[start[id] as usize..start[id + 1] as usize];
                     // Taken, so `counts` is all zeros again for the next hour: every id
                     // a record can hold is in `endpoints`, which lists every id handed out.
+                    // (An id above `count` comes only from a latency of up to 6 bytes that
+                    // are not all digits, whose value spills into the id bits; its count is
+                    // never taken back, so the assert above stops the next hour.)
                     groups.push(stats(group, (std::mem::take(&mut counts[id]) >> 32) as u32));
                     len += line_len(name, groups.last().unwrap());
                 }
@@ -776,9 +781,8 @@ impl Interner {
     ///
     /// The 8 bytes before `from` and the `len` bytes from it must be readable.
     unsafe fn find(&self, bytes: &[__m256i; 2], from: *const u8, len: usize) -> Option<u32> {
-        // SAFETY: AVX2, BMI2 (`bzhi`) and SSE4.2 are enabled (target-cpu=native: the box's
-        // i5-13500 has all three; the compile_error! guard checks AVX2, which implies
-        // SSE4.2); `from - 8 .. from + len` is readable
+        // SAFETY: AVX2, BMI2 (`bzhi`) and SSE4.2 are enabled (the compile_error! guard
+        // checks AVX2, which implies SSE4.2, and BMI2); `from - 8 .. from + len` is readable
         // (the caller's contract). A published id is below MAX_ENDPOINTS, and its key
         // is written (see Sync); a slot's value >> (ENDPOINT_SHIFT - 7) is its id
         // times the key's 128 bytes, so `known` is that id's key.
