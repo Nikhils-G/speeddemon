@@ -348,7 +348,10 @@ extern "C" fn main(_: i32, _: *const *const u8) -> i32 {
                     // a record can hold is in `endpoints`, which lists every id handed out.
                     // (An id above `count` comes only from a latency of up to 6 bytes that
                     // are not all digits, whose value spills into the id bits; its count is
-                    // never taken back, so the assert above stops the next hour.)
+                    // never taken back, so the assert above stops this thread's next hour,
+                    // or the one after the loop its last. A spill that lands on an id that
+                    // was handed out is not caught: the record joins that id's group, and
+                    // the line is wrong. Such a file breaks the spec.)
                     groups.push(stats(group, (std::mem::take(&mut counts[id]) >> 32) as u32));
                     len += line_len(name, groups.last().unwrap());
                 }
@@ -356,6 +359,9 @@ extern "C" fn main(_: i32, _: *const *const u8) -> i32 {
                 pending.push((hour, len, groups));
                 flush(&mut pending, true);
             }
+            // `counts` is this thread's own, so a spilled id in its last hour is
+            // caught here, as no next hour checks its sum.
+            assert!(counts.iter().all(|&c| c == 0), "requests.log: bad latency");
             drop(values); // not needed while the last hours wait to be written
             // Sleep until the hours before this thread's last one have their
             // lengths, then write the rest, ungated. (A yield loop here spun on CPUs
