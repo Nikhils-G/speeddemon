@@ -20,16 +20,19 @@ names must be counted per country over all records.
 
 ## Where the time goes on the box
 
-The reference runs 14.44 s at 367 MB and S 108. The submitted code (PERF.md step 60, 779a8bf,
-S 593) is step 59 with every page its workers write faulted in by four threads only, so that only
-four CPUs keep the kernel's per-CPU charge stock, which counts in the memory peak ("Memory" below);
-the parse is unchanged. Its first three board runs took 0.017192 to 0.01737 s at 8.73 to 9.16 MB,
-83.48 to 83.74 points (run-a3586e5340b9, run-04d0edce5bc1, run-6fb2a1aac4ae), where step 59's eight
+The reference runs 14.44 s at 367 MB and S 108. The submitted code (PERF.md step 62, 58edfbd,
+S 581) is step 60 in 12 fewer lines (PERF.md steps 61 and 62), and step 60 is step 59 with every
+page its workers write faulted in by four threads only, so that only four CPUs keep the kernel's
+per-CPU charge stock, which counts in the memory peak ("Memory" below); the parse is unchanged. Its
+board run took 0.017297 s at 8.73 MB, 83.80 points (run-92dcddacc633), and step 61's two 0.01733
+and 0.017378 s at 8.82 and 8.69 MB (run-2383bfd9435e, run-fd433f40660f). Step 60's five board runs
+in our log took 0.017192 to 0.01737 s at 8.55 to 9.16 MB, 83.48 to 83.79 points (run-a3586e5340b9,
+run-04d0edce5bc1, run-6fb2a1aac4ae, run-3d775a9cee36, run-fa97d7ddfefc), where step 59's eight
 runs peaked at 9.76 to 10.69 MB. Its hot loops are those
 of steps 57 to 59: step 58 ran 0.0171 to 0.0174 s in 15 of its 19 board runs (fastest
 run-0be3ea3875d4, 0.017071 s, 10.58 MB, 83.69 points; best points run-00bcea1e0afe, 0.017356 s,
 9.66 MB, 83.90), and step 57 ran the fastest Track C time, 0.016978 s (run-c56b067ab64d). Details:
-PERF.md, steps 49-60.
+PERF.md, steps 49-62.
 
 Per record, step 46 executed about 193 instructions in all, parse and deduplication together
 (640.9M instructions for 3.32M records at 12 threads). The single largest stall is the join
@@ -183,8 +186,9 @@ Two names are confused only if they share every compared bit:
   finds its bit already set moves to the lowest CPU of its affinity mask that no thread has
   claimed, and stays there for the rest of the run (`sched_setaffinity`). Only movers are pinned:
   pinning every thread at its start was worse (18 slow runs in 300 against 4), and a move happens
-  in about 3% of runs. The mask is read once (`sched_getaffinity`), so a move never
-  leaves the CPUs the program was given, and a failed call leaves the thread where it is. A normal
+  in about 3% of runs. Each thread reads its own mask there (`sched_getaffinity`), and every
+  thread starts with the process's, so a move never leaves the CPUs the program was given, and a
+  failed call leaves the thread where it is. A normal
   run moves nothing. On the replica, runs over 19.5 ms went from 9 to 2 and from 12 to 6 in two
   sets of 300, and induced stacking from 43.96 to 20.57 ms (PERF.md, step 56).
 - *Takeover.* If an inbox grows past 4 × threads buffers because its thread fell behind, whoever
@@ -207,7 +211,8 @@ main thread's share of the memory and starts the workers with `pthread_create`; 
 says who faults in what. Each thread runs `worker` (for workers 0 to 3, first their share of the
 faulting, `fault_in`; then its share of regions.csv, its pair buffers, `move_off_shared_cpu`, and
 the run loop with the hand-off and the takeover), which ends in `finish` (the flush barrier, the
-input drop, the takes through `take`, the merge, then the write or the teardown). What the threads
+input drop, the takes through `take`, the merge, then the other threads' teardown). The main thread
+runs worker 0 itself; once it returns, `run` writes the output and exits. What the threads
 share is one `Shared` struct, each field with its comment, which `run` sets once in `SHARED`
 before any worker starts.
 
@@ -284,7 +289,7 @@ are exact; the distinct-name count rests on a hash (technique 6 below).
 44. A bit per group in each name's row: distinct names counted when a bit flips. Exact: a (name, country) pair flips its bit once.
 45. Tables sized from the generator's 100,000-name pool with 8 standard deviations of room, at most 5/8 full; more names stop the program. Exact: it stops; it never drops a name.
 46. Input pages dropped after the parse in two parts, one call per thread for each (`drop_pages`): the first two thirds before the last takes, the last third by the non-writers during the write; 23 TLB-shootdown rounds instead of one per block. Exact: `MADV_DONTNEED` on a private file mapping that is never written, so a later read faults the same bytes back in.
-47. Totals summed under one lock as each thread finishes, counted by `merged`; once all are in, thread 0 writes and exits without frees, while the others drop their tables' pages and a share of the join table, of regions.csv and of the input's last third (`drop_pages`). Exact: sums are added, min and max taken; the output is complete before the exit.
+47. Totals summed under one lock as each thread finishes, counted by `merged`; once all are in, worker 0 returns to `run`, which writes and exits without dropping pages, while the others drop their tables' pages and a share of the join table, of regions.csv and of the input's last third (`drop_pages`). Exact: sums are added, min and max taken; the output is complete before the exit.
 48. The main thread is worker 0, and starts the others with `pthread_create` on 256 KB stacks it allocated (`STACK`, technique 8); a thread that finds another of ours on its CPU after the region wait moves to a free CPU of its affinity mask (`move_off_shared_cpu`, `sched_setaffinity`), and a failed call leaves it where it is. Exact: thread placement only.
 49. `#[inline(never)]` on `parse_run` and `add`: edits around them cannot change their register allocation. Exact: code placement only.
 50. Profile-guided build trained on generator seed 7, with atomic profile counters (Dockerfile). Items 50 and 51 change speed only: every check runs the Dockerfile's binary.
@@ -463,7 +468,7 @@ exact. The distinct-name count rests on a hash; its odds are stated in technique
     parsed took 96, and the box's probe read the single release 0.1 ms faster (PERF.md, step 44).
   - *Buffers.* Runs are small (64 per thread), so pairs wait less. Buffers are sized from the run
     statistics and pooled, and 32-bit keys halve the tables.
-  - *Exit.* Thread 0 writes the output and exits without freeing anything. Meanwhile the others
+  - *Exit.* Thread 0 writes the output and exits without dropping any pages. Meanwhile the others
     drop their own name table's pages (about 83 each at 12 threads), a share each of the 1 MB join
     table and of regions.csv's 532 pages, and the input's last third, which the exit would
     otherwise free one by one on one core: about 1% faster on the replica over steps 51 and 52
@@ -582,7 +587,7 @@ Evidence, on the binary the Dockerfile builds:
   rejects.
 - **Robustness runs on the replica** (Sun 1 Nov, about 17:00 UTC), on the exact Dockerfile build
   of step 52 (steps 53, 54 and 56 to 59 change no output path, step 55 only a last record without
-  a terminator, which the generator never writes; all passed the gate; step 60's own runs are
+  a terminator, which the generator never writes; all passed the gate; steps 60 to 62 are
   below), with data generated on the replica by the organisers' generator (Python 3.11, which
   reproduces the official sample seed 1 and its reference output byte for byte). Every run was
   byte-exact, with no crash, no nonzero exit and no output on stderr:
@@ -595,11 +600,15 @@ Evidence, on the binary the Dockerfile builds:
     20 CPUs for both users: 840 of 840;
   - copies of seed 101 whose every file is an exact multiple of 4096 bytes, so that a read past
     the end of a file would fault, at 1, 3, 7, 12 and 20 CPUs: 5 of 5.
-- **The submitted code, step 60** (Mon 2 Nov, the replica's build of the Dockerfile), which
+- **Step 60** (Mon 2 Nov, the replica's build of the Dockerfile), which
   changes how the threads start, wait and fault: fresh full seeds 101-130 at 1, 3 and 8 CPUs (one,
   three and four faulters), as root and as uid 65534: 180 of 180 runs exit 0 with the reference's
   output and nothing on stderr; and with a busy loop on CPU 1, 2 or 5, 15 runs each, every output
   exact.
+- **The submitted code, step 62**, and step 61 before it, are step 60 in 12 fewer lines, with the
+  output now written by `run` instead of `finish`. Both passed the gate on two builds each: the
+  seed-1 hash at 1, 3, 7 and 12 CPUs, and every mutant's exit code unchanged (PERF.md, steps 61
+  and 62).
 - **Room for the names, measured.** The generator writes at most 100,529 distinct names (100,515
   to 100,524 measured). The fullest partition held at most 8,650 of its 10,240 rows (84.5%) at 12
   threads, 61.4% at one thread and 51.4% at 20. A table that filled up would stop the program,
