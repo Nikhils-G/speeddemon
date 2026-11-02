@@ -402,28 +402,30 @@ impl<'a> Scan<'a> {
             let padding = _mm256_set1_epi32(plan.entries.len() as i32 - 1);
             _mm256_storeu_si256(evals.add(n).cast(), padding);
         }
-        // Word 4i + k of the entries is word k of entry i (see DocEntry).
-        let (words, stamps) = (entries.cast::<i32>(), lastdoc.cast::<i32>().cast_const());
+        let stamps = lastdoc.cast::<i32>().cast_const();
         let mut nh = 0;
         for b in (0..n).step_by(8) {
             // SAFETY: AVX2 and BMI2 are enabled for the whole build. evals[b..b + 8]
             // (b < n) were written above: lanes below n by the ranges' stores (a
             // store's spare lanes are overwritten by the next), the rest by the
-            // padding store, so every index i is below entries.len(). The words 4i to
-            // 4i + 3 gathered are inside entries (16 bytes each, see DocEntry), and
-            // 4i + 3 fits the gathers' signed 32-bit offsets (at most 6 entries per
-            // query, at most 2^16 queries, asserted in main, and 8 padding entries:
-            // 4i + 3 < 2^21). Entry terms are BOOL terms or 0, below count + 1, and
-            // lastdoc has count + 5 bytes, so the 4 bytes gathered from each stamp are
-            // inside it. nh <= b < n, so the 8 lanes stored at hits[nh..] are inside
-            // hits, as long as evals.
+            // padding store, so every index is below entries.len(): each 16-byte load
+            // is one aligned entry (DocEntry). Entry terms are BOOL terms or 0, below
+            // count + 1, and lastdoc has count + 5 bytes, so the 4 bytes gathered from
+            // each stamp are inside it. nh <= b < n, so the 8 lanes stored at hits[nh..]
+            // are inside hits, as long as evals.
             unsafe {
-                let idx = _mm256_loadu_si256(evals.add(b).cast());
-                let word = |k| {
-                    let at = _mm256_add_epi32(_mm256_slli_epi32::<2>(idx), _mm256_set1_epi32(k));
-                    _mm256_i32gather_epi32::<4>(words, at)
+                // Entries j and j + 4 in one vector, then transposed: lane j of word k
+                // is word k of entry j. 8 loads and 8 shuffles instead of 4 gathers of
+                // 8 lanes (replica: 0.4-0.7 ms faster).
+                let entry = |j| _mm_load_si128(entries.add(*evals.add(b + j) as usize).cast());
+                let pair = |j| {
+                    _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(entry(j)), entry(j + 4))
                 };
-                let (w01, w23, w4a) = (word(0), word(1), word(2));
+                let (p0, p1, p2, p3) = (pair(0), pair(1), pair(2), pair(3));
+                let (t0, t1) = (_mm256_unpacklo_epi32(p0, p1), _mm256_unpackhi_epi32(p0, p1));
+                let (t2, t3) = (_mm256_unpacklo_epi32(p2, p3), _mm256_unpackhi_epi32(p2, p3));
+                let (w01, w23) = (_mm256_unpacklo_epi64(t0, t2), _mm256_unpackhi_epi64(t0, t2));
+                let (w4a, truth) = (_mm256_unpacklo_epi64(t1, t3), _mm256_unpackhi_epi64(t1, t3));
                 let low = |w| _mm256_and_si256(w, _mm256_set1_epi32(0xFFFF));
                 let high = |w| _mm256_srli_epi32::<16>(w);
                 let terms = [low(w01), high(w01), low(w23), high(w23), low(w4a)];
@@ -438,7 +440,7 @@ impl<'a> Scan<'a> {
                     present = _mm256_sub_epi32(_mm256_add_epi32(present, present), has);
                 }
                 // Bit 31 of a lane: bit `present` of its truth table, whether it matches.
-                let hit = _mm256_slli_epi32::<31>(_mm256_srlv_epi32(word(3), present));
+                let hit = _mm256_slli_epi32::<31>(_mm256_srlv_epi32(truth, present));
                 // The matches' answers to the front.
                 nh += left_pack(high(w4a), hit, hits.add(nh));
             }
