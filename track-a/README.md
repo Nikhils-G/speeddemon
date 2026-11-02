@@ -20,36 +20,32 @@ percentiles need every latency of a group, not a running summary.
 
 ## Where the time goes on the box
 
-The reference runs 32.05 s at 228 MB and S 56. The submitted code (PERF.md step 74, ar-5, 0098691,
-S 441) is step 71 with the first slices sized by start order and one release per pair of slices
-(step 72), std's start-up skipped (step 73) and the Dockerfile's `RUN` on fewer lines (step 74):
-about −1.7% against step 71 on the replica. Its first board run, run-977a4610bb91 (0.015606 s,
-18.23 MB, 87.06 points), is the best Track A run and the fastest Track A time. Step 71 (al-6,
-ccc90a3, S 438) is step 69's engine in 18 fewer lines, cut in steps 70 and 71 at the same speed; its
-second board run, run-89081c753251 (0.015752 s, 18.32 MB, 86.96 points), was the best Track A run
-until step 74. Step 69 (am5-2, abc7b44, S 456) is step 68 with the endpoints' name order sorted
-after the merge's hand-off, while the other threads start pass 2. Its first board run,
-run-a533307c210b (0.018707 s, 18.62 MB, 84.89 points), was a slow run: Track A alone was slow in
-that dispatch, and B set its best time then in the same dispatch (run-567ede8911b8, 0.074086 s). Its
-second, run-b3a4984e4320, took 0.015715 s (18.22 MB, 86.88 points), and its third, run-dcb2c65578ff
-(0.015702 s, 18.24 MB, 86.88 points), was the best Track A run until step 71 and the fastest Track A
-time until step 74. Step 68 (am5-1, 9f2993f, S 452), step 67's engine with the endpoint table in
-static memory, a cheaper cold lookup and the space window 3 bytes later, had them before it:
-run-be74feabcc76, 0.015722 s, 18.44 MB, 86.85 points. Until then, step 64 had the best run
-(run-1bda764d4b1e, 0.016043 s,
-18.67 MB, 86.65 points) and step 63 the fastest time (run-219d1a5f89d0, 0.016017 s, 86.64 points)
-(details: PERF.md, steps 51-74). On the replica of the scoring box (the same CPU, timed by the
-board's own timer; PERF.md, "How we measured"), step 53 ran at a median of 16.856 ms over 201
-pairs and steps 54 to 56, 59 and 60 within 0.3% of it; step 61 measured −0.69% against step 60,
-step 62 the same as step 61, step 63 −1.07% against step 62, steps 64 to 67 the same speed as
-step 63, step 68 −1.18% and −1.19% against step 67, step 69 −0.92% and −0.86% against step 68,
-steps 70 and 71 +0.075% and −0.23% against step 69 (means of four and eight pairings), step 72
-about −0.62% against step 71, step 73 −1.08% against step 72 and step 74 the same as step 73.
+The reference runs 32.05 s at 228 MB and S 56. Our best board run before this push is
+run-b6e32914afe1: 0.015462 s, 18.23 MB, S 441, 87.16 points, from step 74's code. PERF.md has
+every step and its runs.
+
+**Reading the code.** All the code is `src/main.rs`. Read `main`'s phase list (phases 1-6) first,
+then `merge`, `names`, `parse` with `Interner::find`, `id` and `add`, `stats` and `small_ranks`,
+`line_len` and `write`, and `release` and `map`. The unsafe code rests on four facts, each argued
+in its SAFETY comment: PAD zero bytes after the log, the two slices of a pair adjacent, every
+record's id one that was handed out (true for spec input), and a line of at most 213 bytes.
+
+Where step 73's 15.6 ms go (replica: the box's CPU and the board's timer; µs from `main`'s start,
+medians of 9 runs; first / median / last thread; PERF.md, "Where step 73's run goes"):
+
+| Phase | Ends at (µs) | What bounds it |
+|---|---|---|
+| Set-up and 11 spawns | 623; workers start at 295 / 493 / 718 | about 49 µs a spawn on the main thread |
+| Parse (pass 1) | 8,950 / 9,027 / 9,195 | memory bandwidth up to about 7.8 ms, the cores above it (probes below) |
+| Merge (serial) | 9,292 | the sort of the 1,101 runs and the collects |
+| Pass 2: group, percentiles, write | 14,220 / 14,363 / 14,477 | the selections, writing, rank counting, the scatter (below) |
+| Barrier, page-table shares, `set_len`, exit | 14,684 | |
+| Outside `main` | 15,585 from exec to exit | fork, exec, glibc and exit: 0.90 ms; a trivial static binary takes 0.593 ms |
 
 Probes are temporary builds that exit with a measured time as their exit code, because the board
 reports only T and the exit code of a failed run (PERF.md, "Box probes"):
 
-- The parse ends at 10.1 ms (run-500e61325035, exit code 101, 0.1 ms units).
+- Step 43's parse ends at 10.1 ms (run-500e61325035, exit code 101, 0.1 ms units).
 - A build that only touches one byte per 64 of each slice ends at 7.8 ms (run-be516aa463a5, exit
   code 78). That is the floor of reading 239 MB from DRAM and taking its page faults.
 - With 6 threads instead of 12, the same touch takes only 5% longer (run-c08713cbca4a, exit code
@@ -58,13 +54,8 @@ reports only T and the exit code of a failed run (PERF.md, "Box probes"):
   replica (12.62 against 9.63 ms, medians of 15 runs of a build that prints its phase ends), while
   the touch above took only 5% longer. The rest of the run took 19% longer.
 
-So the parse runs about 2.3 ms above the memory floor, and about 6 to 7 ms of T comes after it:
-the merge, pass 2, the write and the exit. The probes measured step 43's parse; steps 44 to 60
-changed pass 2, the writer and cold code, and steps 61 to 63 only shortened the parse loop's
-source, at the same speed on the replica. Step 68 started the space window 3 bytes later and made
-the parse's cold lookup cheaper. Steps 70 and 71 shortened the source of the parse and the lookup
-again, at the same speed. Step 72 made the first pair of slices 5% smaller and gives each pair's
-input back in one call.
+So the parse ends 1.2 to 1.4 ms above the touch-only floor (9.0 to 9.2 ms on the replica, median
+and last thread, against the box probe's 7.8 ms), and about 5.5 ms of `main` comes after it.
 
 Pass 2's parts, on the replica (builds that skip one part, wrong output, timing only; 201 pairs
 each, PERF.md):
@@ -73,15 +64,17 @@ each, PERF.md):
 - rank counting for the groups of up to 64 values: 0.75 ms;
 - the scatter of each hour's values: 0.47 ms.
 
-Memory is the other axis. About 4.7 MB is the container's floor (an empty input). The output
-counts, because `/out` is a tmpfs. The mapped input does not: the harness has it in the page cache
-already, charged to the host. The peak came 2 to 3 ms into pass 2, while records of 32 of the 48
-parts were still alive. Since step 61 the output waits until the records given back make room for
-it (*Gate*, below), and in 7 of 10 replica runs of step 68's code the peak is the start of pass 2,
-when each thread's first scatter faults in its values buffer. The expected highest of five peaks
-is 18.42 and 18.46 MB on the replica for two builds of the submitted source (40 rounds), against
-19.49 MB for step 60. Each run's peak also includes 0 to 3 MB of the kernel's per-CPU charge
-batches, 2.3 to 3.1 MB at the peak in those 10 runs (PERF.md, "What we learned about the box").
+Memory is the other axis. The fixed cost is small: the endpoint table, 12 thread stacks, the heap
+and its arenas and the log's page tables come to 1.5 to 2.2 MB (PERF.md, "The peak as a model").
+The output counts, because `/out` is a tmpfs. The mapped input does not: the harness has it in the
+page cache already, charged to the host. The peak came 2 to 3 ms into pass 2, while records of 32
+of the 48 parts were still alive. Since step 61 the output waits until the records given back make
+room for it (*Gate*, below), and in 7 of 10 replica runs of step 68's code the peak is the start of
+pass 2, when each thread's first scatter faults in its values buffer. The expected highest of five
+peaks is 18.42 and 18.46 MB on the replica for two builds of the submitted source (40 rounds),
+against 19.49 MB for step 60. Each run's peak also includes 0 to 3 MB of the kernel's per-CPU
+charge batches, 2.3 to 3.1 MB at the peak in those 10 runs (PERF.md, "What we learned about the
+box").
 
 ## The design
 
@@ -94,6 +87,21 @@ The program has five parts. Each one exists because of one bottleneck.
 | 4-byte records, hours as runs | Memory per record; a calendar per line; unbounded disorder |
 | Pass 2 by hour: counting sort, rank counting, selection | Cache misses of a global sort; full sorts for three ranks |
 | Output written in place, out of order; no teardown | Serial writes; page faults on one file lock; freeing and unmapping at exit |
+
+**Considered, measured, not kept** (PERF.md, experiments):
+
+| Tried | Measured | Kept instead |
+|---|---|---|
+| The log read through 128 KB buffers | board 0.0236 s (run-54e9c5f0e0dd) against 0.02188 s mapped | mmap (technique 1) |
+| Three cursors | replica −0.25%, within noise, for +9 lines | two slices side by side (technique 3) |
+| Every latency through one digit parser | replica +3.76% (+0.644 ms) | 6 digits converted in place (technique 6) |
+| Radix select; an AVX2 quickselect; sorting groups of 65-128 or 65-256 values | replica +1.67%; 45-85% slower in a microbenchmark; +0.83% and +1.96% | nested `select_nth_unstable` (technique 9) |
+| Selection hints | replica −0.38% for +14 lines: a net loss in points | no hints |
+| One thread per core (6 threads) | −2 MB of peak, +28% T | 12 threads |
+| Every output write deferred to the end of pass 2 | −1.00 MB, +1.90% T | the gate: −0.84 MB at the same speed |
+| `pwrite` from a 64 KB buffer; one writer thread with `write()` | server +1.4 ms; +5.1 ms | the shared output mapping (technique 10) |
+| Spinning on the merge's hand-off | +0.52 to +1.18% | sleeping on the `OnceLock` |
+| `MADV_POPULATE_WRITE` per hour; non-temporal record stores | replica +3.30%; +0.71% | plain page faults and stores |
 
 **Parse (pass 1).**
 - *Input.* The log is mapped, followed by 256 zero bytes, so that fixed-size vector loads near its
@@ -224,7 +232,7 @@ One line per technique: what it is, where it is in `src/main.rs`, and why the ou
 45. Exit without teardown (`process::exit`). Before it, the threads drop the output mapping's page-table entries in parallel after a barrier (`written`, `share`); the pages stay in the file. Exact: the output is complete in the page cache before the exit, and `MADV_DONTNEED` on a shared file mapping drops only page-table entries.
 46. Profile-guided build trained on generator seed 7, not the scored seed (Dockerfile). Items 46 to 51 change speed only: every correctness check runs the binary this Dockerfile builds.
 47. Atomic profile counters: the training run's threads no longer lose counter updates. Builds still differ a little in block order, because some counts depend on timing, so every A/B uses two builds a side.
-48. Hot loops aligned to 64 bytes (`-align-loops=64`). Kept because A is not slower with it and C's best run uses it (PERF.md, steps 34 and 36).
+48. Hot loops aligned to 64 bytes (`-align-loops=64`). No measured effect on A in board runs, and never A/B'd on the replica; kept because C's best run uses it and every later step was measured with it (PERF.md, steps 34 and 36).
 49. Fat LTO, one codegen unit, `panic = "abort"` (Cargo.toml).
 50. Static binary (`crt-static`).
 51. `target-cpu=native`, with a `compile_error!` without AVX2.
@@ -245,6 +253,9 @@ stays exact for every seed of the generator.
   - Then the file is mapped over its start with `MAP_FIXED`.
 
   Every line can then be read with full-width loads.
+- **Measured.** With the log read through 128 KB buffers instead (step 16), the run took 0.0236 s
+  (run-54e9c5f0e0dd, a possibly disturbed dispatch) against 0.02188 s mapped (run-8e8d92a5861d,
+  step 15); step 17 went back to the mapping.
 - **Why exact.** The pad is zeros, and every load is bounded. The SAFETY comment in `parse` adds
   up the offsets: the furthest load ends 242 bytes after a line's start, within the 256-byte pad.
   The dataset is mounted read-only, so the bytes cannot change under the mapping.
@@ -265,6 +276,10 @@ stays exact for every seed of the generator.
     adds most of the endpoints to the table while the others are still being spawned, and its
     first pair took 4.65 ms against 4.23 to 4.43 ms for the others. The 5% cut is the gain (the
     sizing measured −0.275% on the replica); the slope adds nothing measurable (PERF.md, step 72).
+    The slope stays: written without it, in closed form, the formula compiled the worker
+    differently and ran +0.33% against step 72's builds, while one binary that read its schedule
+    from its file name ran the same without the slope as with it (PERF.md, step 72 and
+    experiments).
   - A thread computes the cuts of the slices it takes, so a slowed thread just parses fewer of
     them.
   - Each thread keeps one records array for all its slices.
@@ -309,6 +324,8 @@ stays exact for every seed of the generator.
   `vpmovmskb` was inline asm from step 9 on, because LLVM had turned the intrinsic into a vector
   of booleans and, on CPUs without AVX-512 (the box), built the 64-bit mask one bit at a time. In
   the code of step 53 the plain intrinsic compiles to the same hot loop (PERF.md, step 53).
+- **Measured.** One thread: cycles −27%, branch mispredictions 6.9M → 2.6M; the board 0.0377 →
+  0.0361 s (step 9, run-6154ff9e18eb → run-10fd036ecbb9).
 - **Why exact.** The timestamp is fixed at 27 bytes, the fields are separated by one space, and
   every method has 3 to 7 letters (spec). So bytes 28 to 30 are letters, the method's space is at
   byte 31 to 35, and the window's first two spaces are the method's and the endpoint's. The
@@ -343,6 +360,10 @@ stays exact for every seed of the generator.
     one probe.
   - *Memory.* The table is one zeroed static (`TABLE`), so nothing allocates or clears its 352 KB:
     its pages are mapped as the parse first writes them.
+- **Measured.** Step 43's parse, one thread on the test server: instructions 354M → 253M (−29%),
+  cycles 170M → 119M. The box's parse-end probe went 13.8 → 10.1 ms (run-bbf6e7ffe2bd →
+  run-500e61325035; the 13.8 is probably high, as step 31's code read 11.0), and the best run
+  0.018636 → 0.018084 s (run-e4efcd67f121 → run-2d6a1338fdb0).
 - **Why exact.**
   - *Keys.* A stored key is the endpoint, a space, then zeros, and no endpoint byte is a space or
     zero. So a match of bytes 0..=len (the endpoint and its space) means the same bytes and the same
@@ -382,8 +403,8 @@ stays exact for every seed of the generator.
     to the part's escape list. Up to 6 digits are at most 999,999, below the marker, so the marker
     in a record always means "the next escape", with no compare on the value.
   - *Room.* The records array is sized for the worst case, so the loop has no capacity checks;
-    only touched pages get memory. Without the 6-digit path the parse ran 3.76% slower on the
-    replica (PERF.md, step 49).
+    only touched pages get memory. Without the 6-digit path the run was 3.76% (0.644 ms) slower
+    on the replica (PERF.md, step 49).
 - **Why exact.** Latencies are 32-bit (spec), and 10 digits fit the `u64` that `parse_digits` sums them in.
   Escaped values are read back in the order they were written, run by run, from each run's first
   escape index. A status is 5xx exactly when its first digit is `5`.
@@ -400,6 +421,8 @@ stays exact for every seed of the generator.
   - The merge sorts all runs by hour and cuts them into hours. The order of an hour's runs changes
     no output byte: each run reads its own escapes, and a group's values are only counted or
     selected.
+- **Measured.** Step 8, which brought in hours as runs with the 4-byte records (technique 6):
+  0.0417 → 0.0377 s and M 44.66 → 24.3 MB (run-73fe01d551bc → run-6154ff9e18eb).
 - **Why exact.** The timestamp has a fixed width, so byte order is time order, and the 13 bytes
   are the start of the output's hour label. All timestamps lie in one 72-hour span (spec), so lines
   that share `MM-DDTHH` share the year. A line out of order only starts another run: pass 2 gathers
@@ -439,6 +462,10 @@ stays exact for every seed of the generator.
     values took twice as long in a microbenchmark on the groups' real sizes.
   - *Larger groups.* p50 comes from `select_nth_unstable`, p95 from a selection within the part
     above p50, and p99 within the part above p95.
+- **Measured.** Hour-local grouping (step 6): 0.0498 → 0.0457 s (run-8d33686a4c41 →
+  run-36b7152f0bc2). Rank counting (step 44): 17.37 / 17.58 → 16.94 / 16.81 ms on the test server;
+  on the board its best run, 0.016848 s (run-263496e70d89), was 6.8% under step 43's best, though
+  three of its six runs were slower than that.
 - **Why exact.**
   - *Ranks.* They are `ceil(p * n / 100)`, 1-indexed.
   - *Rank counting.* The r + 1 smallest values are not above the value at rank r, so any larger
@@ -470,6 +497,10 @@ stays exact for every seed of the generator.
     number in digit pairs from the `PAIRS` table while it is 100 or more, then its last one or two
     digits as one pair (a lone digit's leading 0 is overwritten by the space before the number),
     then the endpoint and the hour label. There is no buffer and no copy.
+- **Measured.** Pass 2 not waiting for the previous hour (step 19): 0.0227 → 0.020053 and
+  0.019785 s (run-f67608cbf0d2 → run-a97b2e82d3c7, run-23cc1c0061e6). The shared output mapping
+  instead of a pwrite per hour (step 10): 0.0361 → 0.03528 s (run-10fd036ecbb9 →
+  run-d92454f8ba54).
 - **Why exact.** The length comes from the same numbers the writer prints, and the writer asserts
   that an hour's lines end exactly at the hour's start. The rate is `errors * 1000000 / count` in
   integers. Every hour's bytes are its own range of the file, and the file is cut to the sum of
@@ -530,9 +561,17 @@ stays exact for every seed of the generator.
     insert race, the endpoint sort, the flush) still vary from run to run, so two builds of one
     source can lay out blocks differently (17 to 120 worker instructions in step 65's builds). Every
     replica A/B therefore uses two builds a side.
-  - *Loop alignment* (`-align-loops=64`) is on for A. The one board build without it (PERF.md, step
-    36) ran 0.027124 s, in A's slow mode, so it proves nothing either way; the flag stays because A
-    is not slower with it and C's best run uses it.
+  - *Code layout.* Edits outside the hot loop moved its register allocation, and with it the run
+    time, by 0.2 to 0.6%: splitting the worker into functions read +0.64% and +0.21% on the
+    replica, and a checked `OnceLock::set` changed the parse loop's instructions. So each such
+    choice (the worker as one closure, `repr(C)` `Part`, runs copied at the loop head, the
+    unchecked `let _ =` sets) was checked against the hot loops' machine code or by 201-pair
+    replica A/Bs with two builds a side, and its code comment says why.
+  - *Loop alignment* (`-align-loops=64`) is on for A. A's board runs show no effect. With it:
+    0.019217 s (run-df8ecf640b7e) and 0.019471 s (run-d82e18393e7a). Without it: 0.018935 s
+    (run-6cca232c0f6a) and 0.027124 s (run-8f956a29e3c5, A's slow mode). All are within the box's
+    spread, and the flag was never A/B'd on the replica. It stays because C's best run uses it and
+    every later step was measured with it.
   - *The rest.* Fat LTO, one codegen unit, `panic = "abort"`, a static binary and
     `target-cpu=native` (the board builds this track on the box). A `compile_error!` stops a build
     without AVX2.
@@ -575,8 +614,10 @@ from the techniques above:
   writer asserts that the hour's lines end exactly at its start. The rate is the integer
   `errors * 1000000 / count`, and the file is cut to the sum of the lengths (technique 10).
 - **Evidence.** The seed-1 hash at 1, 3, 7 and 12 CPUs, sample seeds 2-4 and holdout seed 99 at
-  every gate, and the robustness runs on 30 fresh full-scale seeds and in 1,485 more runs ("Robust
-  on unseen seeds").
+  every gate, and the robustness runs ("Robust on unseen seeds"): the 30 fresh full-scale seeds and
+  1,485 more runs ran on step 59's build; step 71's code ran 2,224 runs on 136 new seeds; steps 72
+  to 74 passed the gate (seed 1 at 1, 3, 7 and 12 CPUs, sample seeds 1-4, holdout seed 99, the
+  empty input, 250 malformed logs).
 
 ## Spec edge cases
 
@@ -598,9 +639,10 @@ The spec injects fifteen edge cases into every seed. Each one, and the code that
 
 Trusted from the spec and not checked, since a check would be a branch per line: the 27-byte
 timestamp, the 72-hour span, one space between fields, a method of 3 to 7 letters, the 3-digit
-status, and 1 to 10 latency digits then LF. A line that breaks them gives wrong output or stops at an assert, never a read
-outside the mapping (SAFETY in `parse`). These are checked by an `assert!`, which stops the
-program:
+status, and 1 to 10 latency digits then LF (so a last line without its LF is not read, and a log
+with no LF at all stops with an mmap error). A line that breaks them gives wrong output or stops
+at an assert, never a read outside the mapping (SAFETY in `parse`). These are checked by an
+`assert!`, which stops the program:
 - the endpoint length;
 - the 2,047 ids;
 - the room for the records;
@@ -704,7 +746,7 @@ hand. All the code is one file, `src/main.rs`.
   quickselect or a radix select (PERF.md, experiments). A cheaper exact selection for groups of 65 to a few thousand
   values is still the next thing to try.
 - **The memory peak.** The board read 18.79 to 19.8 MB in six runs of step 56's engine and 18.15
-  to 19.18 MB in the sixteen runs of steps 61 to 66 that report it, and the final scoring takes the largest of five
+  to 19.18 MB in the seventeen runs of steps 61 to 66 that report it, and the final scoring takes the largest of five
   peaks. Step 61's gate moved the output off the peak (about −1 MB). Deferring every write, alone
   or with long runs given back right after their scatter, took 0.2 to 0.5 MB more off but cost
   1.9 to 2.8% (PERF.md, experiments). Up to 3 MB of each peak is the kernel's per-CPU charge
