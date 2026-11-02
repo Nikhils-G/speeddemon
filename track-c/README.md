@@ -3,6 +3,98 @@
 The task, the input files and the exact output format are in the [spec](https://github.com/hackathon-raptors/speed-demon-2026/blob/main/specs/c-join.md).
 The step-by-step history, with the board run that measured each step (steps 4, 6, 10, 11, 13 and 29 have none in our log; the six probe steps report through their exit code), is in [PERF.md](PERF.md).
 
+## Summary
+
+The program joins 3.32M records of hostile CSV (202 MB for seed 1: quoted fields with `""`
+escapes, LFs inside notes, BOMs, mixed CRLF and LF) to their countries through a region table, and
+writes per-country totals and the number of distinct names over all records. The reference takes
+14.44 s and 367 MB. The bottlenecks, in order: instructions and branches per record of the parse;
+the join's one random byte load into a 1 MB region table, the largest stall in the parse loop;
+the distinct-name count, the largest cost in step 34's box probes; and, once the time was down,
+the memory cgroup's per-CPU charge stocks, which the memory peak counts. The design: 12 threads
+each cut their own runs, trusting spec 2.2 behind tripwires; a simdjson-style bitmap parse with
+the three numbers converted in one AVX2 pass; the region entry prefetched as soon as the id is
+known, and the record counted one record later; names hashed with AES into one table per thread,
+the pairs handed over in buffers, so no atomics and no barriers; and only four threads fault in
+memory. The best run, run-93a9a47dc0be, took 0.017161 s at 8.04 MB, 84.43 points: about 840x
+faster than the reference with 46x less memory. On 20 fresh full seeds, step 70's code (the
+submitted code less two cold lines and the vector add) scores 84.02 points on average (std 0.19),
+and its output matched the organisers' reference on all 20.
+
+| | Run | T | M (MB) | S | Points |
+|---|---|---|---|---|---|
+| Reference | | 14.44 s | 367 | 108 | |
+| Best run: step 71's code (ab83410), pushed again as 0ad2490 | run-93a9a47dc0be | 0.017161 s | 8.04 | 550 | 84.43 |
+| Submitted code: step 74 (c55ea87), step 71 with a group's four sums in one 256-bit add | run-4785d0ca4b6a | 0.016778 s, the fastest Track C time, within the board's spread | 9.38 | 552 | 83.99 |
+| 20 fresh full seeds 9101-9120, step 70's code, two PGO builds (replica; PERF.md, "How the final number was verified") | | mean 17.73 ms by the final's rule | median 7.72 (replica; the board reads about 0.33 more) | 552 | mean 84.02, std 0.19, worst 83.49; 20 of 20 equal to the reference |
+
+Steps 71 and 74 change two cold lines and the totals' add against step 70; step 74 measured
+−1.05% (full seed 1) and −1.19% (holdout 99) against step 71 on the replica.
+
+## The design at a glance
+
+| Technique | Bottleneck it addresses | Measured effect |
+|---|---|---|
+| Cuts from spec 2.2, found by each thread | A serial quote-parity pass over 202 MB | Step 25 (trusting 2.2): 0.025101 → 0.022853 s, 561 → 445 lines |
+| simdjson-style bitmaps per record, numbers in one AVX2 pass | Instructions and branches per record on hostile CSV | Step 7: 0.0979 → 0.0553 s; step 15: 0.04093 → 0.02677 s, 506 → 282 instructions per record |
+| Two records in flight per loop; non-temporal prefetch | The random load into the 1 MB region table | Deferred counts −4.72% against counting at once (198 of 201 pairs); without the stream prefetch +0.75% |
+| Region table: one byte per region id | The join itself | Exact compact forms slower: rank table +6.6%, 32-id blocks 16.2 vs 12.8 ms a parse (server); the 256 KB upper bound −6.7% (wrong output, timing only) |
+| Distinct names in one table per thread, buffers handed over | Atomics and cache-line traffic of one shared name table | A shared lock-free table 0.0539 vs 0.0461 s (run-edc1e75d5cee); one table against four per thread −2.13%; buffers handed over, 0.19 vs 1.2 ms a flush copied (server) |
+| Runs claimed one at a time, no barriers | One slow CPU holding up every thread | With one CPU shared with a busy loop, 42 ms with barriers, 25 without (server) |
+| Input released in two calls per thread, small pooled buffers, tables dropped in parallel, exit without frees | Memory peak and the exit's serial unmap | About −1% (steps 51-52) |
+| Memory faulted in by four threads only, on one heap and pre-faulted stacks | The per-CPU charge stock that every faulting CPU adds to the memory peak | Max of 20 runs 10.61 → 8.54-8.69 MB (step 60); whole batches, mean 8.39 → 7.86 MB (step 63); one batch less, modes 7.74/7.97 → 7.47/7.71 MB (step 68) |
+
+"(server)" marks a 16-vCPU test server, not the box.
+
+## Reading the code
+
+Everything is in `src/main.rs`; S counts 543 of its lines (plus 9 of the Dockerfile). Read it in
+this order:
+
+1. `Shared` (line 294): all state the threads share, each field with its comment. `run` sets it
+   once in `SHARED` before any worker starts.
+2. `run` (line 368): maps the files, derives the sizes, allocates the tables, faults in the main
+   thread's share of the memory and starts the workers with `pthread_create`; its doc comment says
+   who faults in what. The main thread runs worker 0 itself; once it returns, `run` writes the
+   output (`write_output`) and exits.
+3. `worker` (line 484): for workers 0 to 3, first their share of the faulting (`fault_in`); then
+   its share of regions.csv (`fill`), its pair buffers, and the run loop with the hand-off and the
+   takeover; it ends in `finish`.
+4. `parse_run` (line 829), the hot loop: two halves of a run at once through `fast_record`
+   (`masks`, `numbers`, `hash_words`); rare records go to `walk_record` and `field`.
+5. `add` (line 707): the name table's probe.
+6. `finish` (line 583): the flush barrier, the input drop (`drop_pages`), the takes through
+   `take`, the `merge`, then the other threads' teardown.
+
+The Index under "Techniques" gives each of the 52 techniques with the function that holds it and
+why it keeps the output exact.
+
+## Is the output exact?
+
+- **Every total** (count, id and amount sums, min, max, name and note bytes) is exact for every
+  input the generator writes (spec 2.2), at any thread count. A wrong cut can stop the program at
+  a tripwire, never change its answer.
+- **`names_distinct` rests on a hash, and can be wrong.** Two different names are counted as one
+  only if their hashes agree on every compared bit: 47.6 bits at 12 threads, 42 on one thread.
+  With the generator's 100,000 names, the birthday bound puts that at about 2.4e-5 per dataset
+  at 12 threads (about 1 in 40,000) and 1.1e-3 on one thread. These are upper bounds: the two
+  names must also occur in the same country.
+- **What a collision would mean.** That country's `names_distinct` would be 1 low, in all five
+  scored runs (the same names meet in the same bucket whatever the timing), so the output hash
+  would fail and the track would score 0. Its expected cost is 2.4e-5 × 84, about 0.002 points.
+  More hash bits cost memory (64-bit keys were 0.56 MB, about 0.25 points of M), and an exact
+  count would need a byte compare of the names on each of 3.32M hits (analysis, not built).
+  That is the trade we chose.
+- **Checked, not proven.** A check with the program's own `add` found no two names taken for one
+  on 73 datasets at every thread count from 1 to 20. At one thread, one pair in full seed 7101
+  sits inside a run of full buckets, where the bucket argument does not cover it; one thread files
+  its pairs in the same order every run, and that output matched the reference. The check tests
+  the argument and the code, not the odds of 2.4e-5.
+- **Limits.** More names than the tables hold, or more than 240 countries, stops the program; it
+  never drops a name.
+
+Details: technique 6, "Distinct names per country" and "Why the output is exact" below.
+
 ## What the program does
 
 It reads `records.csv` (202 MB for seed 1, records of `id,name,note,region_id,amount`) and
@@ -20,26 +112,19 @@ names must be counted per country over all records.
 
 ## Where the time goes on the box
 
-The reference runs 14.44 s at 367 MB and S 108. The submitted code is PERF.md step 74 (c55ea87,
-S 552): step 71's code (ab83410, S 550) with a group's four sums added in one 256-bit add
-(replica −1.05% on full seed 1 and −1.19% on holdout 99, against step 71). Its one board run took
-0.016778 s (run-4785d0ca4b6a), the fastest Track C time, inside the board's spread, at 9.38 MB
-(83.99 points). Steps 72 and 73 had put the name table's key slots on a 32-byte boundary and
-`KEEP` on 64 bytes, then the add on top: the replica read −0.41% and −0.90%, but the box ran them
-about 20% slower (0.020345 to 0.021423 s in three runs, with Track A at its usual speed in two of
-those dispatches), so 0ad2490 put step 71's code back and step 74 is the add alone. On 20 fresh
-full seeds, step 70's code scores 84.02 points on average (std 0.19, worst 83.49; PERF.md, "How
-the final number was verified"). The best Track C points are step 71's code's, from 0ad2490:
-0.017161 s at 8.04 MB, 84.43 points (run-93a9a47dc0be), about 840x faster than the reference,
-with 46x less memory. Steps 69 to 71
-change the inbox takeover bound and cut 11 cold lines; the replica measures them at step 68's
-speed and memory, and the board does not separate them (nine runs, 0.016946 to 0.018938 s, 8.04
-to 10.91 MB; step 71's first two runs took 0.016946 and 0.018937 s, the second 11.7% slower in a
-dispatch where Track A and B ran at their usual speed, and its later three 0.017651, 0.017221 and
-0.017161 s). The time comes from a simdjson-style parse, cuts
-and a record path that trust spec 2.2, and a join and a name count with no shared state (steps
-7-49); the memory from four faulting threads that charge whole 64-page batches (steps 60-63 and
-68). Details: PERF.md.
+The last steps on the board (PERF.md, steps 69 to 74):
+- Steps 69 to 71 change the inbox takeover bound and cut 11 cold lines. The replica measures them
+  at step 68's speed and memory, and the board does not separate them: nine runs, 0.016946 to
+  0.018938 s, 8.04 to 10.91 MB. Step 71's first two runs took 0.016946 and 0.018937 s, the second
+  11.7% slower in a dispatch where Track A and B ran at their usual speed; its later three took
+  0.017651, 0.017221 and 0.017161 s.
+- Steps 72 and 73 put the name table's key slots on a 32-byte boundary and `KEEP` on 64 bytes,
+  then the add on top. The replica read −0.41% and −0.90%, but the box ran them about 20% slower
+  (0.020345 to 0.021423 s in three runs, with Track A at its usual speed in two of those
+  dispatches), so 0ad2490 put step 71's code back and step 74 is the add alone.
+- The time comes from a simdjson-style parse, cuts and a record path that trust spec 2.2, and a
+  join and a name count with no shared state (steps 7-49); the memory from four faulting threads
+  that charge whole 64-page batches (steps 60-63 and 68).
 
 Per record, step 46 executed about 193 instructions in all, parse and deduplication together
 (640.9M instructions for 3.32M records at 12 threads). The single largest stall in the parse
@@ -55,18 +140,7 @@ the region lookup (PERF.md, "Box probes"). So at step 34 the name count, not the
 most time (each probe ran in its own dispatch), and those probes do not tell how step 71's 17 ms
 split.
 
-## The design
-
-| Part | Bottleneck it addresses | Measured effect |
-|---|---|---|
-| Cuts from spec 2.2, found by each thread | A serial quote-parity pass over 202 MB | Step 25 (trusting 2.2): 0.025101 → 0.022853 s, 561 → 445 lines |
-| simdjson-style bitmaps per record, numbers in one AVX2 pass | Instructions and branches per record on hostile CSV | Step 7: 0.0979 → 0.0553 s; step 15: 0.04093 → 0.02677 s, 506 → 282 instructions per record |
-| Two records in flight per loop; non-temporal prefetch | The random load into the 1 MB region table | Deferred counts −4.72% against counting at once (198 of 201 pairs); without the stream prefetch +0.75% |
-| Region table: one byte per region id | The join itself | Exact compact forms slower: rank table +6.6%, 32-id blocks 16.2 vs 12.8 ms a parse (server); the 256 KB upper bound −6.7% (wrong output, timing only) |
-| Distinct names in one table per thread, buffers handed over | Atomics and cache-line traffic of one shared name table | A shared lock-free table 0.0539 vs 0.0461 s (run-edc1e75d5cee); one table against four per thread −2.13%; buffers handed over, 0.19 vs 1.2 ms a flush copied (server) |
-| Runs claimed one at a time, no barriers | One slow CPU holding up every thread | With one CPU shared with a busy loop, 42 ms with barriers, 25 without (server) |
-| Input released in two calls per thread, small pooled buffers, tables dropped in parallel, exit without frees | Memory peak and the exit's serial unmap | About −1% (steps 51-52) |
-| Memory faulted in by four threads only, on one heap and pre-faulted stacks | The per-CPU charge stock that every faulting CPU adds to the memory peak | Max of 20 runs 10.61 → 8.54-8.69 MB (step 60); whole batches, mean 8.39 → 7.86 MB (step 63); one batch less, modes 7.74/7.97 → 7.47/7.71 MB (step 68) |
+## The design in detail
 
 **What decided what stays.** By the board's formula, a code line costs about 0.052% of T or
 0.01 MB of M (S 583 → 561 is +0.125 points). On the replica, in 201 interleaved pairs, an A/A of
@@ -238,16 +312,6 @@ Two names are confused only if they share every compared bit:
   sum (`merge`). Once all have, thread 0 writes the output and exits. The others meanwhile drop
   their own table's pages and a share each of the join table, of regions.csv and of the input's
   last third, which the exit would otherwise free one by one on one core.
-
-**The code's layout.** `run` maps the files, derives the sizes, allocates the tables, faults in the
-main thread's share of the memory and starts the workers with `pthread_create`; its doc comment
-says who faults in what. Each thread runs `worker` (for workers 0 to 3, first their share of the
-faulting, `fault_in`; then its share of regions.csv, its pair buffers, and
-the run loop with the hand-off and the takeover), which ends in `finish` (the flush barrier, the
-input drop, the takes through `take`, the merge, then the other threads' teardown). The main thread
-runs worker 0 itself; once it returns, `run` writes the output and exits. What the threads
-share is one `Shared` struct, each field with its comment, which `run` sets once in `SHARED`
-before any worker starts.
 
 **Memory.** At 12 threads the program's own data is:
 - the region table (1 MB);
@@ -452,27 +516,19 @@ exact. The distinct-name count rests on a hash; its odds are stated in technique
 - **Why exact.**
   - *Equal names.* Equal unescaped names have equal raw bytes (inside quotes `""` maps one to one to
     `"`, and the empty name is empty quoted or not), so they get equal hashes.
-  - *Different names.* They are counted as one only if their hashes agree on all 47.6 compared bits
-    at 12 threads (42 on one thread): about 2.4e-5 per dataset at 12 threads and 1.1e-3 on one, for
-    the generator's 100,000 names. These are upper bounds: two names taken for one change the
-    output only if both occur in the same country, and then only that country's names_distinct, by
-    1. It is not a proof; on the 73 datasets we have, a check with the program's own `add` shows
-    that no two names are taken for one at any thread count from 1 to 20 (design, "Checked on our
-    datasets").
+  - *Different names.* They are counted as one only if their hashes agree on all 47.6 compared
+    bits at 12 threads (42 on one thread). The bound, what a collision would do to the score, and
+    the check on 73 datasets are in "Is the output exact?" at the top and in "Checked on our
+    datasets" above.
   - *The trade.* 47.6 bits is every bit this layout has room for: 18 key bits (32 minus the 14 row
     bits), 11 bucket bits, the 15 bits of groups 241..255 and the partition's 3.6. More bits cost
-    memory. Step 33 went from 64-bit to 32-bit keys for 0.56 MB, about 0.25 points of M at step
-    60's rate (0.82 points for 1.8 MB). A collision's expected cost is its odds times the track's
-    points: 2.4e-5 × 84, about 0.002 points. A collision would not be a rare flake: two names
-    that share a home bucket meet in every run, whatever the timing, so all five scored runs would
-    give the same wrong count, and a wrong output scores the track 0. That is the trade we chose,
-    at those odds. An exact count would need the names' bytes at the
-    tables: an offset in every pair (8 → 12 bytes), one per row, and a byte compare on each of
-    3.32M hits, each a random read (analysis, not built).
-  - *History.* Step 33 moved from 64-bit to 32-bit keys for 0.56 MB (server median), and step 46
-    from four tables per thread to one for 2.13% of time: together, 50 → 47.6 bits at 12 threads.
-    The output matched the reference on every seed tried (PERF.md, "How the final number was
-    verified").
+    memory: step 33's move from 64-bit to 32-bit keys saved 0.56 MB (server median), about 0.25
+    points of M at step 60's rate (0.82 points for 1.8 MB). An exact count would need the names'
+    bytes at the tables: an offset in every pair (8 → 12 bytes), one per row, and a byte compare on
+    each of 3.32M hits, each a random read (analysis, not built).
+  - *History.* With step 33's keys, step 46's move from four tables per thread to one, for 2.13%
+    of time, took 50 → 47.6 bits at 12 threads. The output matched the reference on every seed
+    tried (PERF.md, "How the final number was verified").
   - *Limits.* More names than the tables hold, or more than 240 countries, stops the program.
 
 ### 7. No barriers
@@ -576,7 +632,7 @@ exact. The distinct-name count rests on a hash; its odds are stated in technique
   - *Training data.* `c_join.py` is a byte-identical copy of the organisers' generator, run only at
     build time (there is no /data then). It trains on seed 7 at sample scale, not on the scored
     seed 1, so the profile learns the generator's code paths and not the scored file, and none of
-    it reaches the output (site rule 04). S counts none of it: its 550 lines are 541 of Rust and 9
+    it reaches the output (site rule 04). S counts none of it: its 552 lines are 543 of Rust and 9
     of the Dockerfile.
   - *Measured.* `-align-loops=64` was within the board's spread at step 32 and is kept so that
     unrelated edits move the hot loops less, at no line cost. A static non-PIE binary was 0.33% to
@@ -586,13 +642,9 @@ exact. The distinct-name count rests on a hash; its odds are stated in technique
 
 ## Why the output is exact
 
-Every total (count, id and amount sums, min, max, name and note bytes) is exact for every input
-the generator writes (spec 2.2), at any thread count. `names_distinct` is exact unless two of the
-dataset's names agree on all 47.6 compared hash bits at 12 threads (42 on one thread), with odds
-of about 2.4e-5 per dataset (1.1e-3 on one thread); a check rules that out on all 73 datasets we
-have; a collision would repeat in every run and score the track 0, and the trade against more bits
-is in technique 6. The arguments, gathered from the techniques
-above:
+Every total is exact for every input the generator writes (spec 2.2), at any thread count;
+`names_distinct` rests on a hash, whose bound and its meaning are in "Is the output exact?" at the
+top. The arguments, gathered from the techniques above:
 
 - **Cuts.** Under 2.2 an LF inside quotes is followed by a letter or a quote, and a record
   terminator by the next record's id digit or BOM, so every cut is a record start and the runs
@@ -603,12 +655,11 @@ above:
   amount's digits without its dot are its cents, so sums are exact integers (technique 3).
 - **The join.** Listed region ids are below 1,000,000 (spec 2.3) and fit the table's 1,000,001
   entries; every other id reads 0, `_UNMATCHED` (technique 5).
-- **Distinct names.** Equal names have equal raw bytes and so equal hashes. Two different names
-  are counted as one only if they agree on all 47.6 compared bits at 12 threads (42 on one
-  thread): about 2.4e-5 per dataset (1.1e-3 on one thread). On 73 datasets (full seeds 1,
-  101-130, 211, 212 and 7101 to 7505 in steps of 101, holdout 99, sample seeds 1-4 and
-  401-430), at every thread count from 1 to 20, a check with this file's own `add` found no two
-  names taken for one ("Distinct names per country"). A collision would repeat in every run.
+- **Distinct names.** Equal names have equal raw bytes and so equal hashes; two different names
+  are taken for one only with the odds in "Is the output exact?". On 73 datasets (full seeds 1,
+  101-130, 211, 212 and 7101 to 7505 in steps of 101, holdout 99, sample seeds 1-4 and 401-430),
+  at every thread count from 1 to 20, a check with this file's own `add` found no two names taken
+  for one ("Distinct names per country").
 - **Room for the names.** The generator writes at most 100,529 distinct names, and the tables are
   sized from its 100,000-name pool with 8 standard deviations of room, at most 5/8 full. The
   fullest partition we measured held 84.5% of its rows ("Robust on unseen seeds"); a table that
@@ -693,35 +744,24 @@ Evidence, on the binary the Dockerfile builds:
   three and four faulters), as root and as uid 65534: 180 of 180 runs exit 0 with the reference's
   output and nothing on stderr; and with a busy loop on CPU 1, 2 or 5, 15 runs each, every output
   exact.
-- **Steps 61 and 62** are step 60 in 12 fewer lines, with the output now written by `run` instead
-  of `finish`. Both passed the gate on two builds each: the seed-1 hash at 1, 3, 7 and 12 CPUs, and
-  every mutant's exit code unchanged (PERF.md, steps 61 and 62).
-- **Step 63**, which changes when buffers are drawn and how the heap margin is split, passed the
-  same gate on two builds, and ran with a busy loop on CPU 1, 2 or 5 (15 runs each) and on new
-  full seeds 211 and 212, every output exact (PERF.md, step 63).
-- **Step 64**, which changes only how far ahead the record stream is
-  prefetched, passed the same gate on two builds, with the seed-1 hash at 1 and 12 CPUs (PERF.md,
-  step 64).
-- **Steps 65 to 67**, which remove the CPU move and six attributes and shorten the spin in
-  `wait`, passed the same gate on two builds each, with the seed-1 hash at 1, 3, 7 and 12 CPUs
-  (PERF.md, steps 65 to 67).
-- **Step 68**, which changes five memory constants, passed the same gate on
-  two builds of step 64 with those constants and on its own build, with 0 of 20 runs in a fresh
-  cgroup and 0 of 30 direct runs failing (PERF.md, step 68). Its one behaviour change is outside
-  the spec: a listed region id from 1,000,000 to 1,048,574 now stops the program, where step 67
-  accepted it; spec 2.3 lists ids below 1,000,000.
-- **Steps 69 to 71**, which take an inbox over at 2 × threads
-  buffers and cut eleven cold lines, passed the same gate: on two builds of step 71, on step 70's
-  merge (0 of 10 runs in a fresh cgroup failing) and on two builds of step 70's cuts, with the
-  seed-1 hash at 1, 3, 7 and 12 CPUs; on a local build of each, every mutant's exit code was
-  unchanged and five fresh full seeds (7101, 7202, 7303, 7404 and 7505) were identical to the
-  reference at 1 and 8 CPUs. Step 68's
-  review (4eaa885) changed comments and wrote three subtractions as `wrapping_sub`, with
-  byte-identical `.text` (PERF.md, steps 68 to 71).
-- **Steps 72 to 74 (step 74 is the submitted code; 72 and 73 were reverted)**, which align the
-  name table's key slots and `KEEP` (72) and add a group's four sums in one vector (73, and 74
-  without 72), each passed the gate on its PGO build, with the seed-1 hash at 1, 3, 7 and 12 CPUs
-  (PERF.md, steps 72 to 74).
+- **Steps 61 to 74**, each on its own build or builds of the Dockerfile; "the gate" is the seed-1
+  hash at the CPU counts given, with every mutant's exit code unchanged where stated (PERF.md,
+  each step):
+
+  | Steps | What changed | Checks passed |
+  |---|---|---|
+  | 61-62 | Step 60 in 12 fewer lines; the output written by `run` instead of `finish` | Two builds each; seed-1 hash at 1, 3, 7 and 12 CPUs; every mutant's exit code unchanged |
+  | 63 | When buffers are drawn, how the heap margin is split | The same gate on two builds; a busy loop on CPU 1, 2 or 5 (15 runs each) and new full seeds 211 and 212, every output exact |
+  | 64 | Only how far ahead the record stream is prefetched | The same gate on two builds, seed-1 hash at 1 and 12 CPUs |
+  | 65-67 | The CPU move and six attributes removed, the spin in `wait` shortened | The same gate on two builds each, seed-1 hash at 1, 3, 7 and 12 CPUs |
+  | 68 | Five memory constants | The same gate on two builds of step 64 with those constants and on its own build; 0 of 20 runs in a fresh cgroup and 0 of 30 direct runs failing |
+  | 69-71 | An inbox taken over at 2 × threads buffers; eleven cold lines cut | Two builds of step 71, step 70's merge (0 of 10 runs in a fresh cgroup failing) and two builds of step 70's cuts, seed-1 hash at 1, 3, 7 and 12 CPUs; on a local build of each, every mutant's exit code unchanged and five fresh full seeds (7101, 7202, 7303, 7404 and 7505) identical to the reference at 1 and 8 CPUs |
+  | 72-74 | The name table's key slots and `KEEP` aligned (72); a group's four sums added in one vector (73, and 74 without 72). Step 74 is the submitted code; 72 and 73 were reverted | Each on its PGO build, seed-1 hash at 1, 3, 7 and 12 CPUs |
+
+  Step 68's one behaviour change is outside the spec: a listed region id from 1,000,000 to
+  1,048,574 now stops the program, where step 67 accepted it; spec 2.3 lists ids below 1,000,000.
+  Step 68's review (4eaa885) changed comments and wrote three subtractions as `wrapping_sub`, with
+  byte-identical `.text`.
 - **Points on unseen seeds.** Step 70's code, two PGO builds, 20 fresh full seeds (9101-9120): 84.02
   points on average (std 0.19, worst 83.49 on seed 9104), every output equal to the organisers'
   reference. The worst seeds are bursts of slow runs on the shared box, not different inputs
