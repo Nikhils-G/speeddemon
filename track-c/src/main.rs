@@ -125,16 +125,32 @@ unsafe extern "C" {
     fn sched_getcpu() -> i32;
     fn sched_getaffinity(pid: i32, size: usize, mask: *mut u64) -> i32;
     fn sched_setaffinity(pid: i32, size: usize, mask: *const u64) -> i32;
+    fn pthread_attr_init(attr: &mut [u64; 8]) -> i32;
+    fn pthread_attr_setstack(attr: &mut [u64; 8], stack: *mut u8, size: usize) -> i32;
+    fn pthread_create(thread: &mut u64, attr: &[u64; 8], f: Entry, w: usize) -> i32;
 }
+/// A thread's entry point, as pthread_create calls it: `worker`, with its number.
+type Entry = extern "C" fn(usize) -> usize;
 
 // Their constants, from the Linux and glibc headers.
 const PROT_READ: i32 = 1;
 const MAP_PRIVATE: i32 = 2;
 const MADV_DONTNEED: i32 = 4;
+const MADV_POPULATE_WRITE: i32 = 23;
 const M_TOP_PAD: i32 = -2;
+const M_ARENA_MAX: i32 = -8;
 const PR_SET_THP_DISABLE: i32 = 41;
 /// x86-64's base page size: madvise takes page-aligned bounds.
 const PAGE: usize = 4096;
+/// Threads that fault in the memory every thread writes, a share each (see `run`).
+const FAULTERS: usize = 4;
+/// A worker's stack, and its top part, which is faulted in before the worker starts (a
+/// worker uses about 20 KB of it).
+const STACK: usize = 256 << 10;
+const STACK_USED: usize = 24 << 10;
+/// The heap past what `run` allocates, faulted in for the workers' allocations (nearly
+/// all of them pair buffers: 1.03 to 1.17 MB in all, measured on full seed 1).
+const MARGIN: usize = 1280 << 10;
 
 /// Maps a whole file read-only for the rest of the process. It is never unmapped:
 /// the process exits right after using it, and exit unmaps everything.
@@ -171,6 +187,23 @@ unsafe fn drop_pages<T>(items: *const [T]) {
     unsafe { madvise(start as *mut u8, end.saturating_sub(start), MADV_DONTNEED) };
 }
 
+/// Faults in the pages of `len` bytes of private anonymous memory at `at` on this
+/// thread's CPU, leaving their bytes as they are (zeros where no page was yet).
+fn populate(at: usize, len: usize) {
+    let start = at / PAGE * PAGE;
+    // SAFETY: MADV_POPULATE_WRITE writes no byte. Best effort: on a failure the pages
+    // fault in later, wherever they are first touched.
+    unsafe { madvise(start as *mut u8, at + len - start, MADV_POPULATE_WRITE) };
+}
+
+/// Reads a byte of each 2 MB of `bytes`, and its last one, so that the page tables
+/// that map them are made on this thread's CPU.
+fn touch(bytes: &[u8]) {
+    for byte in bytes.iter().step_by(512 * PAGE).chain(bytes.last()) {
+        std::hint::black_box(*byte);
+    }
+}
+
 /// Spins for a while, then yields the core between checks, until `count` reaches
 /// `n`. The waits (for regions.csv, for the last runs, and for every thread's
 /// totals) are short, and waking a dozen sleeping threads would take a good part
@@ -202,8 +235,12 @@ fn main() {
     // fragmented the host is (13 to 24 MB between runs).
     // SAFETY: a system call that touches no memory of ours; a failure keeps the default.
     unsafe { prctl(PR_SET_THP_DISABLE, 1u64, 0u64, 0u64, 0u64) };
+    // M_ARENA_MAX, 1: every thread allocates from the heap of this one, whose part past
+    // `run`'s own allocations is faulted in for them (see `run`).
+    // SAFETY: a libc call that touches no memory of ours; a failure keeps the default.
+    unsafe { mallopt(M_ARENA_MAX, 1) };
     let dir = |k: usize, or: &str| std::env::args().nth(k).unwrap_or(or.into());
-    run(&dir(1, "/data"), &dir(2, "/out"))
+    run(&dir(1, "/data"), dir(2, "/out").leak())
 }
 
 /// What the worker threads share: the input and the sizes `run` derives from it,
@@ -252,14 +289,39 @@ struct Shared<'a> {
     /// The threads' totals, summed as each one finishes (kept one per thread, with
     /// the Vec's regrowth: 0.2 MB more).
     sums: Mutex<[Totals; GROUPS]>,
+    /// The heap's top as the workers start, and how many faulters have faulted in their
+    /// share of the input's page tables and of the heap past it, and made their name
+    /// tables (see `fault_in`).
+    heap: usize,
+    faulted: AtomicUsize,
+    made: AtomicUsize,
 }
+
+/// What the workers share, made once by `run`.
+static SHARED: std::sync::OnceLock<Shared<'static>> = std::sync::OnceLock::new();
 
 /// Builds the join table from regions.csv, then parses and aggregates every run,
 /// and writes the output. One set of threads does all of it, this one included, as
 /// worker 0, which writes the output and exits the process.
-fn run(data_dir: &str, out_dir: &str) -> ! {
+///
+/// The memory every worker writes is faulted in by this thread and the faulters only:
+/// a page fault charges the run's memory cgroup through its CPU's charge stock, which
+/// takes 64 pages at a time and keeps the rest, up to 63 pages (252 KB) per CPU, for
+/// the next faults on that CPU. Those stocked pages count in the memory peak. With
+/// every thread faulting (step 59), they were 1.9 to 2.6 MB of its 9.6 to 10.1 MB on
+/// the replica; this way, only the CPUs that fault keep one.
+/// - Here: the join table, regions.csv's page tables, the start of the heap margin
+///   (for the workers' first, small allocations) and each worker's stack.
+/// - The faulters, a share each: the input's page tables and the heap margin (the pair
+///   buffers), which the parse waits for, then the name tables, each made once it is in.
+/// - The workers then take no page fault that allocates: the input's pages are already
+///   in the page cache and only get mapped. Every thread allocates from this thread's
+///   heap (M_ARENA_MAX, see `main`), and the stacks are this thread's (pthread_create
+///   with a stack, since std::thread cannot take one).
+fn run(data_dir: &str, out_dir: &'static str) -> ! {
     let lines = map(&format!("{data_dir}/regions.csv")).strip_prefix(b"region_id,country\n");
     let lines = lines.expect("regions.csv: the header is not region_id,country");
+    touch(lines);
     let text = map(&format!("{data_dir}/records.csv"));
     // The header is the first line (spec 2.2: a BOM, the header, CRLF).
     let header_end = text.iter().position(|&b| b == b'\n');
@@ -280,14 +342,21 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
     let runs = threads * RUNS_PER_THREAD;
     let mean = text.len() / (runs * 60 * threads);
     let capacity = mean + 2 * mean.isqrt() + 4;
-    // The join table: zeroed by calloc, so the pages fault in on the threads that
-    // fill them (an id's page only if a listed id is on it).
+    // The join table, zeroed, and faulted in on this thread (see above).
     // SAFETY: all zero bits are a valid AtomicU8 (0).
     let group_of: Box<[AtomicU8; REGION_IDS]> = unsafe { Box::new_zeroed().assume_init() };
+    populate(group_of.as_ptr() as usize, REGION_IDS);
+    // Rows of WORDS words for a table's share of names and 4 standard deviations more
+    // (the fullest table we measured held 8,650 rows, against room for 8,780 here, at 12
+    // threads); a table that needs more grows, on its owner's CPU.
+    let rows = (names + 4 * names.isqrt()) * WORDS;
+    let table = || Mutex::new((Vec::with_capacity(slots), Vec::with_capacity(rows)));
+    // The workers' stacks (the faulters are spawned first), before the heap's top is taken.
+    let mut stacks: Vec<u8> = Vec::with_capacity(threads * STACK);
     let mut allowed = 0;
     // SAFETY: a system call that writes the 8 bytes of `allowed`.
     unsafe { sched_getaffinity(0, 8, &mut allowed) };
-    let shared = Shared {
+    let s = SHARED.get_or_init(|| Shared {
         text,
         body_start,
         lines,
@@ -296,7 +365,7 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
         runs,
         slots,
         capacity,
-        group_of: &group_of,
+        group_of: Box::leak(group_of),
         codes: [const { AtomicU8::new(0) }; 26 * 26 * 26],
         countries: Mutex::new(vec![b"_UNMATCHED".to_vec()]),
         next_chunk: AtomicUsize::new(0),
@@ -306,34 +375,61 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
         merged: AtomicUsize::new(0),
         on: AtomicU64::new(0),
         allowed,
-        tables: (0..threads).map(|_| Default::default()).collect(),
+        tables: (0..threads).map(|_| table()).collect(),
         inboxes: (0..threads).map(|_| Default::default()).collect(),
         empties: Mutex::new(Vec::new()),
         sums: Mutex::new([EMPTY; GROUPS]),
-    };
-    let s = &shared;
-    thread::scope(|scope| {
-        // The handles are not needed: worker 0, on this thread, writes the output and
-        // exits the process, so the scope never ends.
-        (1..threads).for_each(|w| drop(scope.spawn(move || worker(s, w))));
-        worker(s, 0);
+        heap: Box::leak(Box::new(0u8)) as *mut u8 as usize,
+        faulted: AtomicUsize::new(0),
+        made: AtomicUsize::new(0),
     });
+    populate(s.heap, MARGIN / 16);
+    for w in 1..threads {
+        // SAFETY: stack w is its own part of `stacks` (worker 0 uses this thread's),
+        // which lives until the process exits; populating writes no byte; the worker
+        // number is `worker`'s argument.
+        unsafe {
+            let (stack, mut attr) = (stacks.as_mut_ptr().add(w * STACK), [0; 8]);
+            populate(stack as usize + STACK - STACK_USED, STACK_USED);
+            pthread_attr_init(&mut attr);
+            pthread_attr_setstack(&mut attr, stack, STACK);
+            assert_eq!(pthread_create(&mut 0, &attr, worker, w), 0);
+        }
+    }
+    worker(0);
     unreachable!("worker 0 exits the process")
 }
 
-/// Worker `w`: its name table, its share of regions.csv, then runs claimed one at a
+/// Faulter f's share, of `faulters`, of the memory every thread writes (see `run`).
+fn fault_in(s: &Shared, f: usize, faulters: usize) {
+    let part = |n: usize| n * f / faulters..n * (f + 1) / faulters;
+    touch(&s.text[part(s.text.len())]);
+    populate(s.heap + MARGIN * f / faulters, MARGIN / faulters + PAGE);
+    s.faulted.fetch_add(1, Release);
+    for table in &s.tables[part(s.threads)] {
+        let (keys, rows) = &mut *table.lock().unwrap();
+        populate(rows.as_ptr() as usize, rows.capacity() * 8);
+        keys.resize(s.slots, 0); // zeroed here, which faults them in: the table is made
+    }
+    s.made.fetch_add(1, Release);
+}
+
+/// Worker `w` (this thread is worker 0; the others start here, from pthread_create):
+/// its share of the faulting (see `run`) and of regions.csv, then runs claimed one at a
 /// time, each one's pairs handed to the threads that own their partitions; then
 /// `finish`.
-fn worker(s: &Shared, w: usize) {
+extern "C" fn worker(w: usize) -> usize {
+    let s = SHARED.get().expect("run sets it before any worker starts");
     let (text, body_start, lines, threads) = (s.text, s.body_start, s.lines, s.threads);
-    let (runs, slots, capacity) = (s.runs, s.slots, s.capacity);
+    let (runs, capacity) = (s.runs, s.capacity);
+    // Workers 0 to `faulters` - 1 fault in a share each.
+    let faulters = FAULTERS.min(threads);
+    if w < faulters {
+        fault_in(s, w, faulters);
+    }
     // The next of `n` items from a shared counter, or None once all are claimed.
     let claim = |next: &AtomicUsize, n: usize| Some(next.fetch_add(1, Relaxed)).filter(|&k| k < n);
     let mut totals = [EMPTY; GROUPS];
-    // This thread's table and pair buffers: made here, so they are in its cache.
-    // Room for a row of WORDS words per name the table can hold (5/8 of its slots).
-    *s.tables[w].lock().unwrap() = (vec![0; slots], Vec::with_capacity(slots / 8 * 5 * WORDS));
-    let mut pairs: Vec<_> = (0..threads).map(|_| Vec::with_capacity(capacity)).collect();
     // Buffers taken from an inbox (see `take`), and empty ones for the next run.
     let (mut taken, mut spare) = (Vec::new(), Vec::new());
     // regions.csv first, in REGION_CHUNKS equal parts. Every LF in it is followed
@@ -347,6 +443,8 @@ fn worker(s: &Shared, w: usize) {
         s.chunks_done.fetch_add(1, Release);
     }
     wait(&s.chunks_done, REGION_CHUNKS);
+    wait(&s.faulted, faulters);
+    let mut pairs: Vec<_> = (0..threads).map(|_| Vec::with_capacity(capacity)).collect();
     move_off_shared_cpu(&s.on, s.allowed);
     // Runs are claimed one at a time, so a thread slowed down parses fewer of
     // them, and no thread waits for another one until the end.
@@ -380,10 +478,13 @@ fn worker(s: &Shared, w: usize) {
                 thread::yield_now();
             }
         }
-        // This thread's table, unless another thread holds it.
+        // This thread's table, unless another thread holds it, once every table is made
+        // (else pairs would pile up in the inboxes, in pages no one has faulted in).
+        wait(&s.made, faulters);
         take(s, w, &mut taken, &mut totals);
     }
-    finish(s, w, &mut taken, &mut totals)
+    finish(s, w, &mut taken, &mut totals);
+    0
 }
 
 /// Thread t's table takes the pairs in its inbox, and gives the buffers back empty:
@@ -396,7 +497,7 @@ fn take(s: &Shared, t: usize, taken: &mut Vec<Vec<u64>>, totals: &mut [Totals; G
     {
         std::mem::swap(taken, &mut s.inboxes[t].lock().unwrap());
         for buffer in taken.iter_mut() {
-            // SAFETY: every table is made by `worker` (its slots a power of two, at
+            // SAFETY: every table is made by `fault_in` (its slots a power of two, at
             // least 16) and changed by nothing but `add`.
             unsafe { add(&mut table, buffer, totals) };
             buffer.clear();
