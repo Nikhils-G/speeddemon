@@ -8,7 +8,7 @@ The step-by-step history, with the board run that measured each step (steps 4, 6
 The program joins 3.32M records of hostile CSV (202 MB for seed 1: quoted fields with `""`
 escapes, LFs inside notes, BOMs, mixed CRLF and LF) to their countries through a region table, and
 writes per-country totals and the number of distinct names over all records. The reference takes
-14.44 s and 367 MB. The bottlenecks, in order: instructions and branches per record of the parse;
+14.44 s and 367 MB. The bottlenecks, in the order we met them: instructions and branches per record of the parse;
 the join's one random byte load into a 1 MB region table, the largest stall in the parse loop;
 the distinct-name count, the largest cost in step 34's box probes; and, once the time was down,
 the memory cgroup's per-CPU charge stocks, which the memory peak counts. The design: 12 threads
@@ -25,11 +25,13 @@ and its output matched the organisers' reference on all 20.
 |---|---|---|---|---|---|
 | Reference | | 14.44 s | 367 | 108 | |
 | Best run: step 71's code (ab83410), pushed again as 0ad2490 | run-93a9a47dc0be | 0.017161 s | 8.04 | 550 | 84.43 |
-| Submitted code: step 74 (c55ea87), step 71 with a group's four sums in one 256-bit add | run-4785d0ca4b6a | 0.016778 s, the fastest Track C time, within the board's spread | 9.38 | 552 | 83.99 |
+| Submitted code: step 74 (c55ea87), step 71 with a group's four sums in one 256-bit add | run-4785d0ca4b6a, run-22d43fe21a46 | 0.016778 s, the fastest Track C time, and 0.016847 s, both within the board's spread | 9.38, 9.98 | 552 | 83.99, 83.68 |
 | 20 fresh full seeds 9101-9120, step 70's code, two PGO builds (replica; PERF.md, "How the final number was verified") | | mean 17.73 ms by the final's rule | median 7.72 (replica; the board reads about 0.33 more) | 552 | mean 84.02, std 0.19, worst 83.49; 20 of 20 equal to the reference |
 
 Steps 71 and 74 change two cold lines and the totals' add against step 70; step 74 measured
-−1.05% (full seed 1) and −1.19% (holdout 99) against step 71 on the replica.
+−1.05% (full seed 1) and −1.19% (holdout 99) against step 71 on the replica. So a typical final
+is about 84.0 to 84.1 points, 0.3 to 0.4 under the best board run; most of that gap is where the
+input file sits in physical memory and the box's load, not the seeds' content.
 
 ## The design at a glance
 

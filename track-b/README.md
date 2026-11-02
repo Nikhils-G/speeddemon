@@ -1,27 +1,94 @@
 # Track B: Index
 
-**Result.** The submitted code is PERF.md's step 95 (8f57770, S 1174): step 94's (285539d, S
-1172), built with PGO trained at full scale since step 93, with the format fetching the threads'
-states four lines ahead (replica −0.36 ms, −0.54%). Its six board runs took 0.066207 to 0.087889 s,
-two of them in B's slow group (PERF.md, "Two groups of B runs"); the fastest, run-27f608a48bc6 (0.066207 s, 81.91 points), is 0.9% over the best run, inside the board's spread. On 18
-fresh full seeds, step 94's code scores 81.97 points on average (std 0.08, worst 81.72, by the
-final's middle-3 rule; PERF.md, "How the final number was verified"). The best Track B run,
-run-dec3de0cc771 (push ae81227, which changed no Track B file), is of step 94's code: 0.065617 s at 31.73 MB for 82.01 points, 859× faster than the
-reference (56.35 s at 2,200 MB). It is 0.43% under step 92's best run, run-2116938ec9fc (0.065903
-s, a plain build), the direction the replica's pairs measured for steps 93 and 94, but inside the
-board's spread: step 92's machine code ran 0.065903 to 0.098793 s in seven runs (step 92's six and
-step 91's one), so steps this small rest on paired runs on the replica. Three ideas carry the speed: no index
-(step 6: 0.355 s at 203 MB → 0.267 s at 38.4 MB), a perfect hash with one branch-free probe per
-token (step 31: 0.1338 → 0.1199 s), and BOOL queries as truth tables evaluated per document
-(step 49: best runs 0.108491 → 0.097889 s).
+**Result.** The submitted code is PERF.md's step 95 (8f57770, S 1174). The best of its eight board
+runs is run-27f608a48bc6: 0.066207 s at 31.52 MB, 81.91 points. The best Track B run,
+run-dec3de0cc771 (0.065617 s at 31.73 MB, 82.01 points, 859× faster than the reference's 56.35 s at
+2,200 MB), is of step 94's code (285539d, S 1172), which step 95 changes by one prefetch in the
+format; it came from push ae81227, which changed no Track B file. The two runs are 0.9% apart,
+within the board's noise, so step 95's gain (−0.36 ms, −0.54%) rests on paired runs on a replica of
+the box. On 18 fresh full-scale seeds, step 94's code scores 81.97 points on average (std 0.07; by
+the final's middle-3-of-5 rule 81.97, std 0.08, worst 81.72).
+
+Three ideas carry the speed: no index (step 6: 0.355 s at 203 MB → 0.267 s at 38.4 MB), a
+perfect hash with one branch-free probe per token (step 31: 0.1338 → 0.1199 s), and BOOL queries
+as truth tables evaluated per document (step 49: best runs 0.108491 → 0.097889 s).
 
 The task, the input files and the exact output format are in the [spec](https://github.com/hackathon-raptors/speed-demon-2026/blob/main/specs/b-index.md).
 The step-by-step history, with a board run for every step that reached the board (all but steps
 25 and 27), is in [PERF.md](PERF.md).
 
+## Build and reproduce
+
+**The build** (`Dockerfile`, one `RUN`). The board builds this track on the scoring box with
+`-C target-cpu=native` (a `compile_error!` stops a build without AVX2, BMI2 or AES-NI),
+`crt-static`, fat LTO, one codegen unit and `panic = "abort"`, and no dependencies. The build is
+profile-guided:
+1. an instrumented build (`-C profile-generate`, with LLVM's atomic counters, so the training
+   run's threads lose no updates);
+2. `b_index.py --seed 7 --scale full`, a byte-identical copy of the organisers' generator, makes a
+   full-size corpus (there is no /data at build time), and the instrumented binary runs on it once;
+3. `llvm-profdata merge`, then the profile-use build. The runtime image holds only the static
+   binary.
+
+**Why full scale and seed 7.** Measured on the replica, paired runs (PERF.md, steps 81 and 93, and
+"Experiments that did not make it"):
+- trained at the sample scale (steps 5 to 80), the build ran 0.55 to 0.67 ms slower than a plain
+  one on step 81's code, so steps 81 to 92 built without a profile;
+- trained at full scale on seed 7, it ran −0.414 ms (seed 1, 25 of 31 pairs) and −0.383 ms
+  (holdout 99, 26 of 31) against step 92's plain build; a second PGO build −0.400 ms (24 of
+  31), of the same code with one comment more;
+- a profile of the timed input itself was no better: seed 1's profile ran 0.32 to 0.73% slower
+  than seed 7's on seed 1 and two fresh seeds, and holdout 99's 0.00 and 0.12% slower on holdout
+  99. Seed 7 is not an input we time on, and fitting the profile to the timed data gains nothing;
+- seeds 7, 8 and 9 merged ran 0.50 to 0.86% slower: that profile, like seed 1's, stops inlining
+  `Scan::end_doc` into `Scan::run`, which every seed-7 build did (7 of 7);
+- the training run made three times was 0.21 to 0.23% faster (five builds against four), about
+  +0.02 points: under our bar for a change, so not taken.
+
+**PGO builds differ.** The training run's counts depend on thread timing, so every build is its own
+binary: two builds of step 94's source differ in 376,583 of 1,493,248 bytes. Two builds of one
+source ran 0.419 ms apart (4 of 31 pairs); another pair +0.31% (seed 1) and −0.28% (holdout 99);
+over 18 fresh seeds two builds differ by −0.09 ms on average (std 0.22), and neither is faster on
+some seeds only. The board's build is another draw. So from step 94 every A/B uses at least
+two builds a side, crossed, and the mean decides.
+
+**The speed claim rests on many builds** (replica, paired median new − old, pairs won of 31):
+
+| Claim | Builds compared | Measured |
+|---|---|---|
+| Step 93: PGO at full scale, against step 92's plain build | 2 PGO builds | seed 1 −0.414 ms (25) and −0.400 ms (24); holdout 99 −0.383 ms (26) |
+| Step 94: the queries split in one AVX2 pass | 4 builds of step 93's source × 2 of step 94's: 24 A/Bs on seed 1, holdout 99 and fresh seeds 101, 103, 105 and 107 | mean about −0.36 ms, 23 of 24 below zero; against the two faster old builds alone about −0.21 ms |
+| Step 95: the format's prefetch | 2 × 2: 16 A/Bs on seed 1, holdout 99 and fresh seeds 118 and 126 | mean −0.356 ms (−0.54%), 15 of 16 below zero; against the faster old build alone −0.274 ms |
+| Points on unseen seeds, step 94's code | 2 PGO builds, 18 fresh full seeds (8201-8210, 9101-9108) | mean 81.97, std 0.068 (T the median of 11 runs); by the final's rule 81.97, std 0.082, worst 81.72, best 82.15; T 65.09 to 66.62 ms; M at most 32.60 MB |
+
+On the board these steps are within noise. Step 92's machine code ran 0.065903 to 0.098793 s in
+seven runs; its best, run-2116938ec9fc (0.065903 s, 82.01 points), came from push 631ec7f, which
+changed no Track B file. Step 94's best run is 0.43% under it, the direction the replica measured,
+and step 95's best is 0.9% over step 94's. One binary's board runs have spread up to 45% in
+disturbed dispatches (PERF.md, "Reading the numbers").
+
+**Checking the output.** With Docker and Python 3, from the repository's root (root README,
+"Checking a track"):
+
+```
+python3 track-b/b_index.py --seed 1 --scale full --out data/b
+python3 check.py b --data data/b --expected f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927
+```
+
+The hash is the spec's for seed 1 at full scale. For any other seed, generate it the same way, run
+the organisers' `reference/b_index.py` on the same files and compare `results.txt` byte for byte.
+Before each push our gate kit did that on the replica, on the exact Dockerfile build. For the
+submitted code, two PGO builds passed 14 of 14 checks each (full seed 1 at 1, 3, 7 and 12 CPUs;
+holdout 99 and samples 1 to 4 at 12 CPUs and at 1), and the second also the gate script's 144
+tiny, fresh and adversarial runs: every output byte-equal to the reference. Step 94's final gate
+added 30 fresh full seeds at four CPU counts (120 of 120) and 18 board-like edge cases as root
+and as uid 65534 (72 of 72). The rest is under "Why the output is exact" and "Robust on unseen
+seeds" below, and in PERF.md, "How the final number was verified".
+
 ## Reading the code
 
-`main` (`src/main.rs`) is the whole run, top to bottom:
+Read the files in this order: `main.rs`, `vocab.rs`, `plan.rs`, `scan.rs`, then `pool.rs` and
+`mmap.rs`. `main` (`src/main.rs`) is the whole run, top to bottom:
 1. `vocab::parse_queries` splits queries.txt on every thread and builds the perfect hash of its
    terms (`Vocab::new`).
 2. `slices` cuts docs.txt into at least 8 slices of whole lines.
@@ -35,9 +102,23 @@ The step-by-step history, with a board run for every step that reached the board
 6. Each slice's first ids are put in line order. `format_part` formats ranges of lines in
    parallel, and the main thread writes results.txt.
 
-`src/pool.rs` is the thread pool behind `par`, and `src/mmap.rs` holds the libc calls declared by
-hand. Every `unsafe` block carries a SAFETY argument and every `unsafe fn` a `# Safety` section.
-Bad input stops with a message (Error handling).
+| File | What it holds | Its `unsafe`, and why it is sound |
+|---|---|---|
+| `main.rs` | `main`; `slices` and `line_after` (cuts at line ends), `parse_id`, `format_part` and `push_decimal` | The C `main` symbol (`#![no_main]`). Each `Scan::run` gets a slice that ends inside the text, and `mmap::PAD` (256 zero bytes) follows the text, which covers the scan's loads past `end`. `mmap::release` only on memory that is not read again before the exit |
+| `vocab.rs` | The query split (`split_lines`), the perfect hash (`Vocab::new`, `Phf`, `hash`, `place`, `find_pilot`), the token key (`key_at`) and `probe`; long terms (`get_long`) | Intrinsics: AVX2, BMI2 and AES-NI are enabled for the whole build, or it does not compile. Loads of 16 or 32 bytes stay inside the file and its pad. Each thread writes only its own regions of the table until the barrier. `probe`'s `cmov` is inline asm on registers only, after one aligned load of a slot |
+| `plan.rs` | Covers (`cover`, `classify`), truth tables (`doc_entry`, `DocEntry`), the term order, the answer numbers (`number`), and `csr`, the counting sort behind every grouping | `csr` is an `unsafe fn`: its closure must give the same pairs on both passes, which each caller's does, since it reads data nothing changes between them; so each slot is written once before the length is set |
+| `scan.rs` | The hot loop: `masks`, `Scan::run`, `look_up`, `end_doc`, `trigger` (8 entries at a time), `end_super`, `Answers`, `count_positions`, `left_pack` | Most of the `unsafe` is here. Raw writes go into capacity reserved for the most a loop can write (32 tokens a window; a document's tokens plus 8), then `set_len`. Table offsets come from `Phf::slot`, below the table's size; stamp and row indices from ids at most the term count. `run`'s `# Safety` contract, `end + 16 <= docs.len()`, is met by the pad |
+| `pool.rs` | `par`, its workers, `wait` (`umonitor`/`umwait`, or a polling loop) and `ahead` | The job's lifetime is erased to keep it in a static. A worker reads it only after the generation is published and holds the read lock while it runs; `par` returns only when every worker has counted the job done, and an assert allows one call at a time. The `umwait` asm writes no memory |
+| `mmap.rs` | The libc calls declared by hand (`mmap`, `madvise`, `prctl`, `mallopt`), `map` (a file plus 256 zero bytes) and `release` | glibc's x86-64 prototypes. The file is mapped over a fresh anonymous reservation, read-only, from a read-only mount. `release` is an `unsafe fn` whose callers never read the pages again |
+
+Every `unsafe` block carries a SAFETY comment, and every `unsafe fn` a `# Safety` section. Bad
+input stops with a message (Error handling). `b_index.py` is the generator's copy for the PGO
+training; it is not part of the program.
+
+Two comments in `main` give a layout reason for a choice: the data paths joined by `concat`, and
+`File::create` given a reference to the path. Both were measured on the plain builds of steps 87
+to 89. Under PGO (step 93 on) the profile lays out the code and those offsets vary from build to
+build, so that reason is not verified for the shipped binary (Index, item 62).
 
 ## The problem
 
@@ -101,7 +182,7 @@ measured", "Box probes since step 47" and "Where the scan's time goes").
 
 There is no index. The queries are read first, the corpus is scanned once in parallel slices of
 whole lines, and every query is answered during that scan, so nothing grows with the corpus. The
-board's M for step 94's four runs was 31.38, 31.73, 31.73 and 31.85 MB, for step 95's six 31.52 to 32.06 MB (step 92's machine code's
+board's M for step 94's four runs was 31.38, 31.73, 31.73 and 31.85 MB, for step 95's eight 31.42 to 32.06 MB (step 92's machine code's
 seven: 31.31 to 31.81 MB), and the replica's max of 20 runs of its gate build 31.65 MB, under the
 44 MB credit; every step's M is in PERF.md's step table.
 malloc's mmap threshold is fixed at 1 MB, with transparent huge pages off (`mmap::set_up_memory`):
@@ -658,14 +739,8 @@ None: the Rust standard library only, with `mmap`, `madvise`, `prctl` and `mallo
 hand (`dependency_count = 0`).
 - *CPU.* The build needs AVX2, BMI2 and AES-NI (`-C target-cpu=native`; the board builds this
   track on the scoring box).
-- *PGO, trained at full scale.* Since step 93 the Dockerfile builds with profile-guided
-  optimisation: an instrumented build with LLVM's atomic profile counters, one training run on a
-  full-scale corpus made by a byte-identical copy of the organisers' generator (`b_index.py`,
-  which stays in the folder and is not counted as code), and the profile-use build. On the
-  replica it ran 0.414 and 0.383 ms faster than the plain build (seed 1 and holdout 99, 25 and
-  26 of 31 pairs). Steps 5 to 80 trained on the sample scale; on step 81's code that build ran
-  0.55 to 0.67 ms slower than a plain one, so steps 81 to 92 built without a profile. PGO builds
-  of one source are not the same binary: two ran 0.419 ms apart (PERF.md, steps 93 and 94).
+- *PGO, trained at full scale* (step 93): "Build and reproduce" above. `b_index.py`, the
+  generator's copy that makes the training corpus, stays in the folder and is not counted as code.
 - *No alignment flags.* B builds without loop or function alignment flags: on the replica they
   were 0 to 0.4% slower.
 

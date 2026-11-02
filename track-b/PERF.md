@@ -4,18 +4,21 @@
 took 1.291 s at 288 MB, S 463, for 44.5 points. The submitted code is step 95 (8f57770, S 1174):
 step 94's code (285539d, S 1172: step 92's with the queries split in one AVX2 pass, built with PGO
 trained on a full-scale corpus since step 93) with the format fetching the threads' states four
-lines ahead (replica −0.36 ms, −0.54%, 15 of 16 A/Bs below zero). Its six board runs took
-0.066207 to 0.087889 s, two of them in B's slow group; the fastest, run-27f608a48bc6 (0.066207 s,
-81.91 points), is 0.9% over the best run and inside the board's spread. The best Track B run, run-dec3de0cc771 (push ae81227, which changed no
-Track B file), is of step 94's code: 0.065617 s at 31.73 MB, 82.01 points, 859× faster than the reference. It
-is 0.43% under step 92's best run, run-2116938ec9fc (1a5a6ba, a plain build, S 1157: 0.065903 s,
-31.72 MB, 82.01 points; 82.013 against 82.008 unrounded). That is the direction the replica
-measured (step 93 −0.38 to −0.41 ms against the plain build, step 94 −0.11 to −0.15 ms against
-step 93), but inside the board's spread: step 92's machine code ran 0.065903 to 0.098793 s in seven
-runs (step 92's six and step 91's one), step 93's one run took 0.067281 s with Track A slow in that
-dispatch, and step 94's other three took 0.119599 s with A and C slow too, 0.079848 s with A slow
-too and 0.087774 s, in B's slow group. The board shows the direction of steps 90 to 94, not their size; their gains rest on the
-replica.
+lines ahead.
+- *Board.* The best Track B run, run-dec3de0cc771 (push ae81227, which changed no Track B file),
+  is of step 94's code: 0.065617 s at 31.73 MB, 82.01 points, 859× faster than the reference.
+  Step 95's eight runs took 0.066207 to 0.087889 s, three of them in B's slow group; the fastest,
+  run-27f608a48bc6 (0.066207 s, 81.91 points), is 0.9% over the best run. The best run is 0.43%
+  under step 92's best, run-2116938ec9fc (push 631ec7f, which changed no Track B file: step 92's
+  plain build of 1a5a6ba, S 1157, 0.065903 s, 31.72 MB, 82.01 points; 82.013 against 82.008
+  unrounded). All of this is within noise: step 92's machine code ran 0.065903 to 0.098793 s in
+  seven runs (step 92's six and step 91's one). The board shows the direction of steps 90 to 94,
+  not their size, and does not separate step 95.
+- *Replica.* Their gains rest on paired runs on a replica of the box, with at least two PGO builds
+  of each source, since PGO builds of one source differ: step 93 −0.414 and −0.383 ms against the
+  plain build (seed 1 and holdout 99), step 94 about −0.36 ms (24 A/Bs, 23 below zero), step 95
+  −0.356 ms (−0.54%, 16 A/Bs, 15 below zero). On 18 fresh full seeds, step 94's code scores 81.97
+  points on average (std 0.07; README, "Build and reproduce").
 
 **Three ideas carry it.**
 - No index: every query is answered in one parallel scan (step 6: 0.355 s at 203 MB → 0.267 s at
@@ -181,7 +184,7 @@ row starts with its checkpoint's name, and an experiment that names a step ran o
 | 92 | 1a5a6ba (later runs from f86d9cc, 631ec7f, 4eaa885, 45920b7 and 4c101fb) | b-merge-1c: review fixes on step 91's code, with its machine code (`.text` byte-identical to step 91's build, objcopy and cmp): comments brought up to date, `csr` an `unsafe fn` with a `# Safety` section and its four callers in `unsafe` blocks under SAFETY lines, clearer names (`n_trig`, `n_anchors`, `n_hits`, `Plan::trig_start`); the final gate passed (memory, max of 20 runs, 31.62 MB). Its first run came with B alone slow, its second in a dispatch where every track ran slow, its fourth with A slow too, its fifth with B alone slow; its third, run-2116938ec9fc, was the best Track B run until step 94, 0.15% under step 90's best, which the board cannot separate | run-ac43df513301, run-8d57cd736770, run-2116938ec9fc, run-0fa478dd6716, run-2176fc6007d9, run-ef68de39b357 | 0.086307, 0.098793, 0.065903, 0.084688, 0.097053, 0.067005 | 31.79, 31.6, 31.72, 31.31, 31.4, 31.47 | 1157 | 79.08, 77.61, 82.01, 79.28, 77.81, 81.83 |
 | 93 | 3c2e860 | b-pgo-full: step 92's source with a profile-guided build again, trained at full scale: the Dockerfile makes a full-size corpus with the generator's copy (`b_index.py --seed 7 --scale full`), runs the instrumented build on it once and builds again with the merged profile (replica, one PGO build against step 92's plain build: seed 1 −0.414 ms, 25 of 31, holdout 99 −0.383 ms, 26 of 31; a second PGO build, of the same code with one comment more, −0.400 ms, 24 of 31, on seed 1). Its one run came in a disturbed dispatch, with Track A at 0.02239 s, and does not show the gain: it is 2.1% over step 92's best run and 0.41% over its 0.067005 s, inside step 92's spread, so the gain rests on the replica's pairs | run-7c5709aed88c | 0.067281 | 32.01 | 1159 | 81.78 |
 | 94 | 285539d (later runs from ab83410, ae81227 and bf4f03c) | b-final: step 93 with b-qparse-1's query split: `split_lines` finds the spaces and LFs of 32 bytes at once (two AVX2 compares and a movemask), and each set bit ends a word, instead of a byte loop for the lines and another for the words, which took 52% of the split's samples with a mispredicted exit per word; a line without terms stops with a message (phase marks, seed 1: the parse 3.282 → 2.862 ms; replica, plain builds, against step 92's: seed 1 −0.363 ms, 28 of 31, holdout 99 −0.272 ms, 24 of 31, all 10 inputs faster, a mean of −0.316 ms; with PGO, two builds against four of step 93's source, crossed, 24 A/Bs: a mean of about −0.36 ms, 23 of 24 below zero, about −0.21 ms against the two faster of the four; memory, max of 20 runs, 31.65 MB). Its first run came in a dispatch where every track ran slow; its second with Track A slow too; its third, from ae81227 (a docs commit; B's code is step 94's), is the best Track B run, 0.43% under step 92's best: the direction the replica measured, inside the board's spread; its fourth, from bf4f03c (a Track A commit), came in B's slow group. Submitted until step 95 | run-cfa7ebe6c104, run-43f6e93d1d38, run-dec3de0cc771, run-95e0dd84708a | 0.119599, 0.079848, 0.065617, 0.087774 | 31.38, 31.73, 31.73, 31.85 | 1172 | 75.50, 79.88, 82.01, 78.85 |
-| 95 | 8f57770 (later runs from 943254b, 905584e, 5fc484e, 0ad2490 and c55ea87, Track B unchanged) | b-under-pgo-1: step 94 with the format fetching, four lines ahead, the 12 threads' states that each output line adds up, random reads from other cores' caches that the format waited on (29% of its samples in perf); +2 lines (replica, two PGO builds a side against two of step 94's, 31 pairs on seed 1, holdout 99 and fresh seeds 118 and 126: a mean of −0.356 ms, −0.54%, 15 of 16 A/Bs below zero; −0.274 ms against the faster of step 94's builds alone; memory, max of 5 runs, 31.62 and 31.53 MB against 31.63). The first came in B's slow group, as step 94's code did in the dispatch before; the second is 1.0% over step 94's best, inside the board's spread; the third 18.8% over it, the fourth 12.2%; the fifth in B's slow group again, with Track A slow too (0.018175 s); the sixth 0.9% over step 94's best, step 95's best | run-5d64d333c4cd, run-fb530d36f965, run-405976f59622, run-704f0f4e23fb, run-525eec51f94f, run-27f608a48bc6 | 0.087889, 0.066258, 0.07793, 0.073618, 0.086961, 0.066207 | 31.57, 31.68, 31.8, 31.69, 32.06, 31.52 | 1174 | 78.83, 81.90, 80.14, 80.76, 78.95, 81.91 |
+| 95 | 8f57770 (later runs from 943254b, 905584e, 5fc484e, 0ad2490, c55ea87, ec20be3 and dfdf6a5, Track B unchanged) | b-under-pgo-1: step 94 with the format fetching, four lines ahead, the 12 threads' states that each output line adds up, random reads from other cores' caches that the format waited on (29% of its samples in perf); +2 lines (replica, two PGO builds a side against two of step 94's, 31 pairs on seed 1, holdout 99 and fresh seeds 118 and 126: a mean of −0.356 ms, −0.54%, 15 of 16 A/Bs below zero; −0.274 ms against the faster of step 94's builds alone; memory, max of 5 runs, 31.62 and 31.53 MB against 31.63). The first came in B's slow group, as step 94's code did in the dispatch before; the second is 1.0% over step 94's best, inside the board's spread; the third 18.8% over it, the fourth 12.2%; the fifth in B's slow group again, with Track A slow too (0.018175 s); the sixth 0.9% over step 94's best, step 95's best | run-5d64d333c4cd, run-fb530d36f965, run-405976f59622, run-704f0f4e23fb, run-525eec51f94f, run-27f608a48bc6, run-fdb384ced7a2, run-5bbe47d29f7c | 0.087889, 0.066258, 0.07793, 0.073618, 0.086961, 0.066207, 0.067218, 0.086799 | 31.57, 31.68, 31.8, 31.69, 32.06, 31.52, 31.82, 31.42 | 1174 | 78.83, 81.90, 80.14, 80.76, 78.95, 81.91, 81.75, 78.97 |
 
 **Code-quality pass (5a0612d, step 47; also pushed as 7f08fe7 and 045a6b5), on the box:**
 run-5892b2f7eb00 0.144406 s (a slow dispatch), run-eb924b66b4aa 0.115198 s (runs.log 09:47Z) and
@@ -1735,6 +1738,7 @@ What lost, by family:
 | `parse_queries` and `get_long` returning tuples (step 91 work) | No line saved: rustfmt splits a tuple of over 60 characters |
 | Transparent huge pages left on for B (step 92 work; `mmap::set_up_memory` turns them off) | Replica +0.17% (10 of 31), memory unchanged at 31.66 MB: no huge page engaged, as built; a second build of it +6.23%, its hot code at other offsets |
 | LLVM flags on step 93's profile-use build: `-align-loops`, `-unroll-threshold=600`, `-inline-threshold=500` (step 93 work) | Replica against the PGO build without them: +0.08%, +0.86% and +0.21% |
+| Other PGO training data, the Dockerfile only (b-pgo-train-1, step 94's code; A/Bs and round-robins of 4 to 5 builds a side) | A profile of the timed input itself ran 0.32 to 0.73% slower than seed 7's (seed 1's profile on seed 1 and fresh seeds 41 and 42), and 0.00 and 0.12% (holdout 99's on holdout 99). Seeds 7, 8 and 9 merged ran 0.50 to 0.86% slower: like seed 1's profile, it stops inlining `Scan::end_doc` into `Scan::run`, which all 7 seed-7 builds inline. The training run made three times was 0.21 to 0.23% faster (five builds against four, about +0.02 points; the tripled counts compile `Scan::run` 34 bytes longer, the same in every such build): under the bar for a change made only for that. Two one-run builds of the Dockerfile ran +0.31% (seed 1) and −0.28% (holdout 99) apart |
 | The output copied into a shared mapping of results.txt by every thread at its offset, and the releases over 12 threads instead of 11 (b-write, step 92 work) | Replica, at the base hot-code offsets: seed 1 +0.082 ms (13 of 31), holdout 99 +0.143 ms (12 of 31), S +16. The write is not on the critical path: in the phase marks thread 0 ends its write 0.69 ms into the last round, the workers their releases at 1.01 ms (the corpus's page-table entries 0.80 of it). The same program without any write: −0.102 ms (18 of 31) and −0.012 ms (16 of 31), the ceiling of any change to the write |
 | `malloc_trim` on the writing thread after the write: pad 2^30 (no sbrk shrink) and pad 0 (b-write) | Replica +0.235 ms (8 of 31) at a hot-code offset of +32, which alone costs +0.026 ms; pad 0 +0.392 ms (6 of 31) |
 | The scan's tables (stamps, entry lists, rows, phrase marks) kept and given back in the last round instead of freed (b-write) | Replica +0.287 ms (8 of 31): the first ids then fault in fresh pages, and the workers, who end that round, do more |
@@ -2078,23 +2082,25 @@ dispatches, so:
   too), step 91 0.066969 s, step 92, step 91's machine code, 0.086307 s with B alone slow,
   0.098793 s with every track slow, 0.065903 s (the best Track B run until step 94), 0.084688 s
   with A slow too, 0.097053 s with B alone slow and 0.067005 s, step 93 0.067281 s with A slow
-  too, and the submitted step 94 0.119599 s with every track slow, 0.079848 s with A slow too and
-  0.065617 s (the best Track B run). Steps 87 and
+  too, step 94 0.119599 s with every track slow, 0.079848 s with A slow too, 0.065617 s (the best
+  Track B run) and 0.087774 s, and the submitted step 95 0.087889, 0.066258, 0.07793, 0.073618,
+  0.086961, 0.066207, 0.067218 and 0.086799 s. Steps 87 and
   88 have step 86's machine code for the
   scan, and none of steps 86 to 89 is separated from step 85 by its board runs: their gains rest on
   the replica, as do steps 90 to 94. Step 90's best run is 1.59% under step 89's, inside the
   board's spread; step 91's one run is 0.33% and 1.47% over step 90's two fast runs, where the
   replica reads −0.073 ms (about −0.1%) over 16 fresh seeds. Step 92's best run is 0.15% under
   step 90's, and step 94's third run 0.43% under step 92's, the first of four runs of steps 93 and
-  94 to come under it, where the replica reads −0.38 to −0.41 ms and −0.11 to −0.15 ms: the board
-  shows the direction, inside its spread.
+  94 to come under it, where the replica reads −0.38 to −0.41 ms (step 93) and about −0.36 ms over 24 crossed A/Bs
+  (step 94): the board shows the direction, inside its spread. Step 95's best run is 0.9% over
+  step 94's, inside the same spread; its gain rests on the replica.
 - **Two groups of B runs.** Since step 66, B's board runs have fallen into two groups. Of its 62
   runs up to step 92's first, ten took over 0.1 s and one 0.098 s with Track A slow too (disturbed dispatches, and step
   89's third with B alone slow); of the other 51, 38 took 0.066 to 0.083 s and 13, about a
   quarter, took 0.0863 to 0.095 s: step 92's first run (B alone slow), step 66's second and fourth
   runs, step 79's first two (the first with Track A slow in the same dispatch), one run each of steps 70, 73, 76, 78 and 80, step 86's third (every track
-  slow) and step 88's first two (A slow too). The nine runs since ran 0.065617 to 0.119599 s:
-  five from 0.065617 to 0.079848 s, three from 0.084688 to 0.098793 s, and 0.119599 s with every
+  slow) and step 88's first two (A slow too). The 18 runs since ran 0.065617 to 0.119599 s:
+  ten from 0.065617 to 0.079848 s, seven from 0.084688 to 0.098793 s, and 0.119599 s with every
   track slow. The replica shows no such mode. Step 78's gate build, run 60 times back to back on full
   seed 1 at 12 CPUs, took min 71.32 ms, median 71.94 ms and mean 72.13 ms. A single run 20% slower
   would lift the mean by about 0.24 ms, so at most one of the 60 could have been slow. The slow
