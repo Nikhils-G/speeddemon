@@ -1,10 +1,10 @@
 # Track B: Index
 
-**Result.** The submitted code is PERF.md's step 95 (8f57770, S 1174). The best of its eight board
-runs is run-27f608a48bc6: 0.066207 s at 31.52 MB, 81.91 points. The best Track B run,
+**Result.** The submitted code is PERF.md's step 95 (8f57770, S 1174). The best of its nine board
+runs is run-4acf92b53275: 0.066011 s at 32.14 MB, 81.94 points. The best Track B run,
 run-dec3de0cc771 (0.065617 s at 31.73 MB, 82.01 points, 859× faster than the reference's 56.35 s at
 2,200 MB), is of step 94's code (285539d, S 1172), which step 95 changes by one prefetch in the
-format; it came from push ae81227, which changed no Track B file. The two runs are 0.9% apart,
+format; it came from push ae81227, which changed no Track B file. The two runs are 0.6% apart,
 within the board's noise, so step 95's gain (−0.36 ms, −0.54%) rests on paired runs on a replica of
 the box. On 18 fresh full-scale seeds, step 94's code scores 81.97 points on average (std 0.07; by
 the final's middle-3-of-5 rule 81.97, std 0.08, worst 81.72).
@@ -64,7 +64,7 @@ two builds a side, crossed, and the mean decides.
 On the board these steps are within noise. Step 92's machine code ran 0.065903 to 0.098793 s in
 seven runs; its best, run-2116938ec9fc (0.065903 s, 82.01 points), came from push 631ec7f, which
 changed no Track B file. Step 94's best run is 0.43% under it, the direction the replica measured,
-and step 95's best is 0.9% over step 94's. One binary's board runs have spread up to 45% in
+and step 95's best is 0.6% over step 94's. One binary's board runs have spread up to 45% in
 disturbed dispatches (PERF.md, "Reading the numbers").
 
 **Checking the output.** With Docker and Python 3, from the repository's root (root README,

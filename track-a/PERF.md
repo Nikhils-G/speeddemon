@@ -4,8 +4,7 @@
 (5fc484e, S 442): step 79's with one more assert, after pass 2's hour loop, so that a spilled id
 in a thread's last hour also stops the program (replica, seed 1 −0.12% and −0.05%: noise). Its first
 board run took 0.015605 s (run-5211f4666d16, 87.04 points), 1.1% under step 78's best and inside
-the board's spread; the next two took 0.018175 s, with Track B slow too, and 0.018665 s, with B
-and C at their usual speed. Step 79 (bf4f03c, S 441) is step 78's code with the inline endpoint lookup also
+the board's spread; the next five, 0.017806 to 0.021276 s, came in disturbed dispatches. Step 79 (bf4f03c, S 441) is step 78's code with the inline endpoint lookup also
 checking the slot after the home slot, −0.70% on 20 fresh seeds (17 of 20 faster) and about −0.5%
 on seed 1 on the replica; of its four board runs, three came in dispatches where another track ran
 slow too and the fourth, 0.015925 s (run-c2cdd6401dd4, 86.78 points), lies within step 78's normal
@@ -176,7 +175,7 @@ file mean ours, among team SALAAR's runs.
 | 77 | 008c49b (second run from 1a5a6ba, Track A unchanged) | Step 76 without its line-head hunk (replica +0.04% against step 75: equal, in five fewer lines) | run-eb078ed3a0a7, run-0b59d8b4b145 | 0.015816, 0.015546 | 18.73, 18.04 | 436 | 86.84, 87.19 |
 | 78 | 631ec7f (later runs from 4eaa885, 45920b7, 4c101fb, 3c2e860, 285539d, ab83410 and ae81227, Track A unchanged) | Step 77 with one `assert_eq!` per hour that bounds the scatter on a malformed latency; review fixes (replica −0.05% against step 77: equal). Submitted until step 79. Runs 1, 3 and 8 normal, the other five in slow dispatches | run-a6a3de2bdaca, run-7ec1a7779d3f, run-1a7f895d269e, run-34a31f6fe454, run-16fa13a9f87a, run-6865a81880be, run-de92c8943b9f, run-1d4590b7ab6a | 0.015946, 0.017015, 0.015777, 0.020219, 0.02239, 0.020461, 0.017747, 0.015809 | 18.44, 18.59, 18.35, 18.16, 18.48, 18.31, 18.42, 18.27 | 437 | 86.81, 86.07, 86.95, 84.30, 83.11, 84.13, 85.65, 86.94 |
 | 79 | bf4f03c (later runs from 8f57770, 943254b and 905584e, Track A unchanged) | Step 78 with `Interner::find` also checking the slot after the home slot (replica: 20 fresh seeds −0.70%, 17 of 20 faster; seed 1 about −0.5%, 201 pairs a build). Submitted until step 80. The first three runs slow, with B slow too in the first two (0.087774 and 0.087889 s) and C in the third (0.020345 s); the fourth within step 78's normal runs | run-2e49db69e87b, run-696083c574fa, run-16a28cf72358, run-c2cdd6401dd4 | 0.017124, 0.016903, 0.018303, 0.015925 | 18.91, 18.55, 18.58, 18.5 | 441 | 85.90, 86.12, 85.25, 86.78 |
-| 80 | 5fc484e (later runs from 0ad2490 and c55ea87, Track A unchanged) | Step 79 with one `assert!` after pass 2's hour loop that a thread's counts are all taken back, so a spilled id in its last hour stops the program too; +1 line (replica, two PGO builds against step 79's, 201 pairs: seed 1 −0.12% and −0.05%, holdout 99 +0.33% and +0.15%, seed 9107 −0.13% and +0.29%: noise, the code is after the hot loop). **The submitted code**. The first run is 1.1% under step 78's best, inside the board's spread; the second came with Track B slow too (0.086961 s), the third with B and C at their usual speed (0.066207 and 0.016778 s) | run-5211f4666d16, run-3d7e9ccd326b, run-2307ace3495e | 0.015605, 0.018175, 0.018665 | 18.31, 18.51, 18.38 | 442 | 87.04, 85.33, 85.08 |
+| 80 | 5fc484e (later runs from 0ad2490, c55ea87, ec20be3, dfdf6a5 and 7c45267, Track A unchanged) | Step 79 with one `assert!` after pass 2's hour loop that a thread's counts are all taken back, so a spilled id in its last hour stops the program too; +1 line (replica, two PGO builds against step 79's, 201 pairs: seed 1 −0.12% and −0.05%, holdout 99 +0.33% and +0.15%, seed 9107 −0.13% and +0.29%: noise, the code is after the hot loop). **The submitted code**. The first run is 1.1% under step 78's best, inside the board's spread; the second came with Track B slow too (0.086961 s), the third with B and C at their usual speed (0.066207 and 0.016778 s); the last five were in disturbed dispatches | run-5211f4666d16, run-3d7e9ccd326b, run-2307ace3495e, run-229cf6ca54d3, run-bcb2da86c1bf, run-5db9a50d68de | 0.015605, 0.018175, 0.018665, 0.017806, 0.021276, 0.021104 | 18.31, 18.51, 18.38, 18.62, 18.67, 18.91 | 442 | 87.04, 85.33, 85.08, 85.53, 83.59, 83.62 |
 
 **The submitted code is step 80 (a-short-assert, 5fc484e), S 442**: step 79 with one cold
 assert after pass 2's hour loop, `assert!(counts.iter().all(|&c| c == 0), "requests.log: bad
@@ -188,8 +187,9 @@ joins that id's group and the line is wrong. Replica, two PGO builds against ste
 seed 1 −0.12% and −0.05%, holdout 99 +0.33% and +0.15%, seed 9107 −0.13% and +0.29%, inside the
 ±0.3% noise band; memory, max of 20 runs, 18.67 and 18.64 MB against 18.77 and 18.51. S 441 →
 442. Board: run-5211f4666d16, 0.015605 s, 18.31 MB, 87.04 points, then 0.018175 and 0.018665 s
-(run-3d7e9ccd326b, run-2307ace3495e), the first of those with Track B slow too; the step rests on
-the gate, not on speed. A lookup that also probes the slot `id` hashes a name under 8 bytes to
+(run-3d7e9ccd326b, run-2307ace3495e), the first of those with Track B slow too, and 0.017806,
+0.021276 and 0.021104 s (run-229cf6ca54d3, run-bcb2da86c1bf, run-5db9a50d68de) in disturbed
+dispatches; the step rests on the gate, not on speed. A lookup that also probes the slot `id` hashes a name under 8 bytes to
 (S 443) lost on seed 1 (+0.38% and +0.37%) for −1.7% on seed 9107; it was not kept
 (experiments).
 

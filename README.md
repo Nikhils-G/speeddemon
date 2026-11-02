@@ -6,7 +6,7 @@ Team SALAAR's entry for [Speed Demon 2026](https://speeddemon.dev). All four tra
 |---|---|---|---|---|---|---|---|
 | A: Ingest | run-0b59d8b4b145 | 0.015546 | 18.04 | 436 | 87.19 | 1a5a6ba | [README](track-a/README.md), [PERF.md](track-a/PERF.md) |
 | B: Index | run-dec3de0cc771 | 0.065617 | 31.73 | 1172 | 82.01 | ae81227 | [README](track-b/README.md), [PERF.md](track-b/PERF.md) |
-| C: Join | run-93a9a47dc0be | 0.017161 | 8.04 | 550 | 84.43 | 0ad2490 | [README](track-c/README.md), [PERF.md](track-c/PERF.md) |
+| C: Join | run-11ac398da908 | 0.016899 | 8.00 | 552 | 84.60 | 7c45267 | [README](track-c/README.md), [PERF.md](track-c/PERF.md) |
 | D: Traverse | run-15c21ec71a29 | 0.19878 | 122.87 | 589 | 64.17 | 2bf221c | [README](track-d/README.md), [PERF.md](track-d/PERF.md) |
 
 Commit is the push the board built for that run, not always the commit of the code it ran. A's
@@ -22,8 +22,7 @@ put back.
 A's final code, 5fc484e (S 442), is step 80: step 79's with one more assert, so that a spilled id
 in a thread's last hour also stops the program (noise on our replica of the box). Its first
 board run took 0.015605 s (run-5211f4666d16, 87.04 points), 1.1% under step 78's best and inside
-the board's spread; its next two took 0.018175 s, with Track B slow too, and 0.018665 s, with B
-and C at their usual speed. Step 79, bf4f03c (S 441), is step 78's with the inline endpoint lookup also checking the
+the board's spread; its next five, 0.017806 to 0.021276 s, came in disturbed dispatches. Step 79, bf4f03c (S 441), is step 78's with the inline endpoint lookup also checking the
 slot after the home slot, −0.70% on 20 fresh seeds and about −0.5% on seed 1 on the replica. Its
 four board runs, 0.015925 to 0.018303 s (86.78 points at best), do not show that gain: three came
 in dispatches where another track ran slow too. Step 78, 631ec7f (S 437),
@@ -35,9 +34,9 @@ our replica of the box it runs at step 77's speed, −0.05% over four pairings o
 its newest, run-1d4590b7ab6a, ran 0.015809 s (86.94 points), and five of its eight runs came in
 slow dispatches (track-a/PERF.md, step 78).
 
-B's best run is of step 94's code (285539d, S 1172): step 92's with the queries split in one AVX2 pass, built with PGO trained at full scale. It ran 0.065617 s (run-dec3de0cc771, 82.01 points), 0.43% under step 92's best run (run-2116938ec9fc, 0.065903 s), the direction our replica of the box measured but inside the board's spread. The final B code, 8f57770 (S 1174), is step 95: step 94's with the format fetching the threads' states four lines ahead, −0.36 ms (−0.54%) on the replica over 16 paired A/Bs. Its six board runs took 0.066207 to 0.087889 s; the fastest, run-27f608a48bc6 (0.066207 s, 81.91 points), is 0.9% over the best run, inside the board's spread. On 18 fresh full seeds step 94's code scores 81.97 points on average (std 0.08, worst 81.72).
+B's best run is of step 94's code (285539d, S 1172): step 92's with the queries split in one AVX2 pass, built with PGO trained at full scale. It ran 0.065617 s (run-dec3de0cc771, 82.01 points), 0.43% under step 92's best run (run-2116938ec9fc, 0.065903 s), the direction our replica of the box measured but inside the board's spread. The final B code, 8f57770 (S 1174), is step 95: step 94's with the format fetching the threads' states four lines ahead, −0.36 ms (−0.54%) on the replica over 16 paired A/Bs. Its nine board runs took 0.066011 to 0.087889 s; the fastest, run-4acf92b53275 (0.066011 s, 81.94 points), is 0.6% over the best run, inside the board's spread. On 18 fresh full seeds step 94's code scores 81.97 points on average (std 0.08, worst 81.72).
 
-C's best run is of step 71's code (ab83410, S 550: step 68 with the inbox bound halved and 11 cold lines fewer, at step 68's speed and memory on the replica), from 0ad2490: 0.017161 s, 8.04 MB, 84.43 points (run-93a9a47dc0be), just over step 68's 84.40 (run-38f216bf39eb). Steps 72 and 73 had aligned the name table's key slots and `KEEP` so that no hot load straddles two cache lines (replica −0.41%) and added a group's four sums in one 256-bit add (replica −0.90% against step 72), but their three board runs took 0.020345 to 0.021423 s, about 20% over step 71's code, with Track A at its usual speed in two of those dispatches: the replica and the box disagreed on the aligned layout, and 0ad2490 put step 71's code back. The final C code, c55ea87 (S 552), is step 74: step 71's code with the add alone (replica −1.05% on seed 1 and −1.19% on holdout 99). Its one run took 0.016778 s (run-4785d0ca4b6a), the fastest C time, inside the board's spread, at 9.38 MB (83.99 points). On 20 fresh full seeds step 70's code scores 84.02 points on average (std 0.19, worst 83.49).
+C's best run is of the final C code, c55ea87 (S 552, step 74, below), from push 7c45267: 0.016899 s, 8.00 MB, 84.60 points (run-11ac398da908), above step 71's 84.43 (run-93a9a47dc0be, from 0ad2490: ab83410, S 550, step 68 with the inbox bound halved and 11 cold lines fewer, at step 68's speed and memory on the replica) and step 68's 84.40 (run-38f216bf39eb). Steps 72 and 73 had aligned the name table's key slots and `KEEP` so that no hot load straddles two cache lines (replica −0.41%) and added a group's four sums in one 256-bit add (replica −0.90% against step 72), but their three board runs took 0.020345 to 0.021423 s, about 20% over step 71's code, with Track A at its usual speed in two of those dispatches: the replica and the box disagreed on the aligned layout, and 0ad2490 put step 71's code back. The final C code, c55ea87 (S 552), is step 74: step 71's code with the add alone (replica −1.05% on seed 1 and −1.19% on holdout 99). Its four runs took 0.016778 s (run-4785d0ca4b6a, the fastest C time), 0.016847, 0.016899 (the best run) and 0.019039 s (run-720b875a4f70, in a dispatch where Track A ran 21.3 ms), inside the board's spread; three of them peaked at 9.38 to 10.67 MB (83.99, 83.68 and 82.06 points), over the replica's max of 20 runs (7.91 MB), as the board shows for other teams too. On 20 fresh full seeds step 70's code scores 84.02 points on average (std 0.19, worst 83.49).
 
 ## Checking a track
 
