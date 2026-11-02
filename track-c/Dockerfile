@@ -8,9 +8,8 @@ COPY . .
 # The profile counters are atomic because the training run is threaded (plain
 # counters lose increments); -align-loops=64 makes the hot loops' layout depend
 # less on unrelated code (PERF.md, step 32).
-RUN python3 c_join.py --seed 7 --scale sample --out /tmp/train > /dev/null \
- && RUSTFLAGS="-C target-cpu=native -C target-feature=+crt-static -C profile-generate=/tmp/pgo -C llvm-args=-instrprof-atomic-counter-update-all" cargo build --release --offline \
- && target/release/solution /tmp/train /tmp && llvm-profdata merge -o /tmp/pgo.profdata /tmp/pgo \
+RUN RUSTFLAGS="-C target-cpu=native -C target-feature=+crt-static -C profile-generate=/tmp/pgo -C llvm-args=-instrprof-atomic-counter-update-all" cargo build --release --offline \
+ && python3 c_join.py --seed 7 --scale sample --out /tmp/train > /dev/null && target/release/solution /tmp/train /tmp && llvm-profdata merge -o /tmp/pgo.profdata /tmp/pgo \
  && RUSTFLAGS="-C target-cpu=native -C target-feature=+crt-static -C profile-use=/tmp/pgo.profdata -C llvm-args=-align-loops=64" cargo build --release --offline
 
 FROM debian:13-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
