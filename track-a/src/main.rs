@@ -117,7 +117,7 @@ fn main() {
     // 2. The pool, and what pass 1 needs.
     // Pass 1, parallel: the threads parse slices of the log, cut at line ends, into
     // packed records, with one endpoint table shared by all threads. Cut p is just
-    // after the last LF before byte len * p / slices (0 if there is none; the last
+    // after the last LF before byte at(p), below (0 if there is none; the last
     // cut is the end of the log, which ends with an LF). Cuts never decrease, so the
     // slices hold every line once; two cuts in one line give an empty slice.
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
@@ -132,10 +132,18 @@ fn main() {
     // leave a CPU that something else is using.) A pair is parsed side by side (see
     // `parse`); the count is even, so a pair's second slice always exists.
     let slices = threads * 4;
-    // cut(p) may read the end of slice p - 1 after its pages were released: they
-    // fault back in from the page cache unchanged (see release).
-    let lf = |p| log[..len * p / slices].iter().rposition(|&b| b == b'\n');
-    let cut = |p| lf(p).map_or(0, |i| i + 1);
+    // Slice q's share of the log, in units of half a percent of an even share. The first
+    // round's pairs (one a thread, claimed in start order) shrink by half a percent a
+    // claim: each of the 11 spawns takes about 50 us, so later threads start later. The
+    // first pair is 5% smaller again: its thread adds most of the endpoints to the table
+    // while the spawns are still under way. (Fitted to the parse ends of every thread in
+    // 14 runs on the replica, where the last thread trailed the mean by 190 us.)
+    let w = |q: usize| 200 + threads.saturating_sub(q / 2) - 10 * (q < 2) as usize;
+    let at = |p: usize| len * (0..p).map(w).sum::<usize>() / (0..slices).map(w).sum::<usize>();
+    // Cut p: at(p) less the part line before it. It may read the end of slice p - 1
+    // after its pages were released: they fault back in from the page cache unchanged
+    // (see release).
+    let cut = |p| at(p) - log[..at(p)].rsplit(|&b| b == b'\n').next().unwrap().len();
     // One pool of threads for both passes: each parses slices, then waits for the
     // merge (done by the last thread to finish pass 1, once every part is in) and
     // goes on with pass 2, so no thread is joined or started between the passes.
@@ -357,17 +365,20 @@ fn main() {
 /// into hours, each part's run count, and the output mapped at a size no output
 /// can exceed. The endpoints' name order follows, from `names`.
 fn merge(parts: &[OnceLock<Part>], readers: &[AtomicUsize], output: &File) -> Merged<'static> {
-    // Every part's runs, in order of hour then part. Every part is in (this is the
-    // last thread to finish pass 1), so no `wait` here blocks. Two adjacent starts
-    // of a part make one run, which ends at the second one's first record.
-    let mut runs = Vec::new();
+    // Every part's runs, in order of hour. Every part is in (this is the last thread
+    // to finish pass 1), so no `wait` here blocks. Two adjacent starts of a part make
+    // one run, which ends at the second one's first record. Room for all of them at
+    // once (each part's starts include its end marker, one more than its runs).
+    let mut runs = Vec::with_capacity(parts.iter().map(|p| p.wait().starts.len()).sum());
     for (part, p) in parts.iter().enumerate() {
         let ends = p.wait().starts.windows(2).map(|w| (w[0], w[1].at));
         runs.extend(ends.map(|(begin, end)| Run { begin, part, end }));
         // Each run is one reader of its part: the last one placed gives the part back.
         readers[part].store(p.wait().starts.len() - 1, Relaxed);
     }
-    runs.sort_unstable_by_key(|run| (run.begin.key, run.part));
+    // By hour only: the order of an hour's runs changes no output byte (each run reads
+    // its own escapes; a group's values are counted or selected, in any order).
+    runs.sort_unstable_by_key(|run| run.begin.key);
     // Cut into hours. Leaked: pass 2 reads the runs until the exit.
     let same_hour = |a: &Run, b: &Run| a.begin.key == b.begin.key;
     let hours: Vec<&[Run]> = runs.leak().chunk_by(same_hour).collect();
@@ -513,8 +524,9 @@ type Merged<'a> = (Vec<&'a [Run]>, usize, Vec<OnceLock<usize>>);
 /// # Safety
 ///
 /// The PAD bytes after each slice must be readable: the loads of a line run on past
-/// its end. And the slices must be file-mapped memory that this process never
-/// writes, as their whole pages go back to the kernel at the end (see `release`).
+/// its end. And the slices must be adjacent (the second starts where the first ends)
+/// file-mapped memory that this process never writes, as their whole pages go back to
+/// the kernel at the end (see `release`).
 unsafe fn parse(chunks: [&[u8]; 2], free: &mut &'static mut [u32]) -> [Part; 2] {
     // The loop writes without capacity checks: it moves on at least MIN_LINE bytes
     // per line whatever the bytes are (the endpoint ends at byte 32 or later, then
@@ -611,10 +623,14 @@ unsafe fn parse(chunks: [&[u8]; 2], free: &mut &'static mut [u32]) -> [Part; 2] 
     };
     // One line of each slice in turn until both are done (a done slice just returns false).
     while step(0) | step(1) {}
+    // Both slices go back to the kernel in one call (they are adjacent, the caller's
+    // contract): every call is a round of TLB shootdowns on the other threads' CPUs.
+    let pair =
+        std::ptr::slice_from_raw_parts(chunks[0].as_ptr(), chunks[0].len() + chunks[1].len());
     // SAFETY: the slices go back to the kernel (the caller's contract). Only a later
     // `cut` may read their last bytes again, and those fault back in unchanged (see
     // release).
-    chunks.iter().for_each(|chunk| unsafe { release(*chunk) });
+    unsafe { release(pair) };
     // SAFETY: each slice's records run from its start to its next place.
     let lines = [0, 1].map(|k| unsafe { record[k].offset_from_unsigned(start[k]) });
     let (second, rest) = second.split_at_mut(lines[1]);
