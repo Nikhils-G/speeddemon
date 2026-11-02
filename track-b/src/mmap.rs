@@ -36,7 +36,8 @@ unsafe extern "C" {
 ///   heap, calloc would clear them (8 MB more at 32 MB).
 /// - Freed memory stays in the heaps: a trim (an sbrk shrink) flushes the TLB of
 ///   every CPU the threads ran on, and each step frees tables that the next ones
-///   reuse (Plan::new's drops took 0.25 ms with trims).
+///   reuse. With trims, Plan::new's drops took 0.25 ms; without, a run is 0.2-0.5
+///   ms faster (the replica, plain build) for a peak 1.5 MB higher.
 pub fn set_up_memory() {
     // SAFETY: a plain syscall wrapper; failure only means THP stays on.
     unsafe { prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0) };

@@ -17,8 +17,8 @@ pub struct Scan<'a> {
     /// The current document's stamp.
     stamp: u8,
     /// This document's trigger term occurrences (as info words); then the
-    /// entries of its trigger terms, each term once, as indices, and those of
-    /// them that match (see `trigger`; both as long as the entries).
+    /// entries of its trigger terms, each term once, as indices, and the answers
+    /// of those that match (see `trigger`; both as long as the entries).
     trig: Vec<u32>,
     evals: Vec<u32>,
     hits: Vec<u32>,
@@ -384,7 +384,7 @@ impl<'a> Scan<'a> {
                 // Branch-free: a repeated trigger term is written again and not kept.
                 let fresh = *lastdoc.add(t) == stamp;
                 *lastdoc.add(t) = stamp | DONE;
-                let (from, to) = (*group.add(t), *group.add(t + 1));
+                let (from, to) = (*group.add(t) as u32, *group.add(t + 1) as u32);
                 prefetch(entries, from as usize);
                 // Its entries' indices, 8 per store: the next range overwrites the
                 // spare ones, and a range of over 8 (rare) goes on.
@@ -402,44 +402,50 @@ impl<'a> Scan<'a> {
             let padding = _mm256_set1_epi32(plan.entries.len() as i32 - 1);
             _mm256_storeu_si256(evals.add(n).cast(), padding);
         }
-        // Word 8i + k of the entries is terms[k] of entry i, and 8i + 5 its truth.
+        // Word 4i + k of the entries is word k of entry i (see DocEntry).
         let (words, stamps) = (entries.cast::<i32>(), lastdoc.cast::<i32>().cast_const());
         let mut nh = 0;
         for b in (0..n).step_by(8) {
             // SAFETY: AVX2 and BMI2 are enabled for the whole build. evals[b..b + 8]
             // (b < n) were written above: lanes below n by the ranges' stores (a
             // store's spare lanes are overwritten by the next), the rest by the
-            // padding store, so every index i is below entries.len(). The words 8i to
-            // 8i + 5 gathered are inside entries (32 bytes each, see DocEntry), and
-            // 8i + 5 fits the gathers' signed 32-bit offsets (at most 6 entries per
+            // padding store, so every index i is below entries.len(). The words 4i to
+            // 4i + 3 gathered are inside entries (16 bytes each, see DocEntry), and
+            // 4i + 3 fits the gathers' signed 32-bit offsets (at most 6 entries per
             // query, at most 2^16 queries, asserted in main, and 8 padding entries:
-            // 8i + 5 < 2^22). Entry terms are below count + 2, and lastdoc has 3 bytes
-            // more, so the 4 bytes gathered from each stamp are inside it. nh <= b < n,
-            // so the 8 lanes stored at hits[nh..] are inside hits, as long as evals.
+            // 4i + 3 < 2^21). Entry terms are BOOL terms or 0, below count + 1, and
+            // lastdoc has count + 5 bytes, so the 4 bytes gathered from each stamp are
+            // inside it. nh <= b < n, so the 8 lanes stored at hits[nh..] are inside
+            // hits, as long as evals.
             unsafe {
                 let idx = _mm256_loadu_si256(evals.add(b).cast());
-                let word = |k| _mm256_add_epi32(_mm256_slli_epi32::<3>(idx), _mm256_set1_epi32(k));
+                let word = |k| {
+                    let at = _mm256_add_epi32(_mm256_slli_epi32::<2>(idx), _mm256_set1_epi32(k));
+                    _mm256_i32gather_epi32::<4>(words, at)
+                };
+                let (w01, w23, w4a) = (word(0), word(1), word(2));
+                let low = |w| _mm256_and_si256(w, _mm256_set1_epi32(0xFFFF));
+                let high = |w| _mm256_srli_epi32::<16>(w);
+                let terms = [low(w01), high(w01), low(w23), high(w23), low(w4a)];
                 // Bit k: term k is in this document, from the stamp byte without
                 // DONE (EMPTY's 0x7F is no stamp): has is -1 if so, and the bits
                 // are shifted in from the last term (present * 2 - has).
                 let mut present = _mm256_setzero_si256();
-                for k in (0..MAX_BOOL_TERMS as i32 - 1).rev() {
-                    let terms = _mm256_i32gather_epi32::<4>(words, word(k));
-                    let s = _mm256_i32gather_epi32::<1>(stamps, terms);
+                for &t in terms.iter().rev() {
+                    let s = _mm256_i32gather_epi32::<1>(stamps, t);
                     let s = _mm256_and_si256(s, _mm256_set1_epi32(!DONE as i32));
                     let has = _mm256_cmpeq_epi32(s, _mm256_set1_epi32(stamp as i32));
                     present = _mm256_sub_epi32(_mm256_add_epi32(present, present), has);
                 }
                 // Bit 31 of a lane: bit `present` of its truth table, whether it matches.
-                let truth = _mm256_i32gather_epi32::<4>(words, word(5));
-                let hit = _mm256_slli_epi32::<31>(_mm256_srlv_epi32(truth, present));
-                // The matches' indices to the front.
-                nh += left_pack(idx, hit, hits.add(nh));
+                let hit = _mm256_slli_epi32::<31>(_mm256_srlv_epi32(word(3), present));
+                // The matches' answers to the front.
+                nh += left_pack(high(w4a), hit, hits.add(nh));
             }
         }
-        for &e in &self.hits[..nh] {
+        for &answer in &self.hits[..nh] {
             // SAFETY: an entry's answer is an answer number, below state.len().
-            unsafe { self.answers.add_doc(plan.entries[e as usize].answer, doc) };
+            unsafe { self.answers.add_doc(answer, doc) };
         }
     }
 

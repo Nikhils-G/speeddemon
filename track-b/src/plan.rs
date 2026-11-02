@@ -16,41 +16,40 @@ pub struct Entry {
 }
 
 /// A BOOL query as triggered, per document, by one of its cover terms c: the
-/// query's other distinct terms, padded with a term no document has, and its
-/// truth table over their presence (c being present). The table is zero where
-/// a cover term before c is present: that term's entry counts the document.
-/// Eight u32 words in this order, 32 bytes (repr(C, align(32))): `trigger` gathers
-/// word 8i + k of the entries as word k of entry i (the truth table is word 5), so
-/// this layout is part of its bounds argument; 32 bytes also keep each entry in one
-/// cache line. The eighth word, c, is what Plan::new groups the entries by.
+/// query's other distinct terms, padded with term 0, its answer and its truth
+/// table over their presence (c being present). The table is zero where a cover
+/// term before c is present: that term's entry counts the document. Four u32
+/// words, 16 bytes (repr(C, align(16))): `trigger` gathers word 4i + k of the
+/// entries as word k of entry i (terms 0 and 1, terms 2 and 3, term 4 and the
+/// answer, the truth table), so this layout is part of its bounds argument; 16
+/// bytes also keep each entry in one cache line.
 #[derive(Clone, Copy, Default)]
-#[repr(C, align(32))]
+#[repr(C, align(16))]
 pub struct DocEntry {
-    terms: [u32; MAX_BOOL_TERMS - 1],
+    terms: [u16; MAX_BOOL_TERMS - 1],
+    pub answer: u16,
     /// Bit a: whether the query matches when the terms of the set bits of a are
     /// present and the others absent.
     truth: u32,
-    pub answer: u32,
-    cover: u32,
 }
 
 // The layout that `trigger` relies on (see above), checked.
-const _: () = assert!(size_of::<DocEntry>() == 32 && std::mem::offset_of!(DocEntry, truth) == 20);
+const _: () = assert!(size_of::<DocEntry>() == 16 && std::mem::offset_of!(DocEntry, truth) == 12);
 
 /// The entry of the BOOL query `words` triggered by its cover term `c`, with
-/// `earlier` the cover terms before c and `pad` a term no document has.
-fn doc_entry(words: &[u32], c: u32, earlier: &[u32], answer: u32, pad: u32) -> DocEntry {
-    let (mut terms, mut k) = ([pad; MAX_BOOL_TERMS - 1], 0);
+/// `earlier` the cover terms before c.
+fn doc_entry(words: &[u32], c: u32, earlier: &[u32], answer: u32) -> DocEntry {
+    let (mut terms, mut k) = ([0; MAX_BOOL_TERMS - 1], 0);
     for t in words.iter().map(|&w| w & TERM) {
-        if t != c && !terms[..k].contains(&t) {
-            (terms[k], k) = (t, k + 1);
+        if t != c && !terms[..k].contains(&(t as u16)) {
+            (terms[k], k) = (t as u16, k + 1);
         }
     }
     // A term's presence in all 32 assignments at once, bit a for assignment a, so
     // the query is evaluated on all of them in one pass: c, the one word not in
-    // `terms`, is in every document. (The padding terms are never present, so
-    // the table's bits from 2^k on, a copy of the first 2^k, are never read.)
-    let index = |t: u32| terms[..k].iter().position(|&o| o == t);
+    // `terms`, is in every document. (The table's bits from 2^k on are a copy of
+    // the first 2^k, so whether the padding term is present does not matter.)
+    let index = |t: u32| terms[..k].iter().position(|&o| o as u32 == t);
     let present = |t: u32| index(t).map_or(!0, |i| PRESENT[i]);
     let r = words.iter().fold(0, |r, &w| {
         let p = present(w & TERM);
@@ -62,9 +61,8 @@ fn doc_entry(words: &[u32], c: u32, earlier: &[u32], answer: u32, pad: u32) -> D
     });
     DocEntry {
         terms,
+        answer: answer as u16,
         truth: earlier.iter().fold(r, |r, &e| r & !present(e)),
-        answer,
-        cover: c,
     }
 }
 
@@ -89,7 +87,7 @@ pub struct Phrase {
 pub struct Plan {
     /// BOOL entries triggered by term t: `entries[group[t]..group[t + 1]]`; then 8
     /// padding entries that never match (truth 0), for `trigger`'s spare lanes.
-    pub group: Vec<u32>,
+    pub group: Vec<u16>,
     pub entries: Vec<DocEntry>,
     /// BOOL entries evaluated in every superblock, on rows of `Scan::wide`.
     pub always: Vec<Entry>,
@@ -109,12 +107,23 @@ pub struct Plan {
 impl Plan {
     /// `sample_df` counts the documents of each term in a sample of `sampled`
     /// documents (at least 1). The per-line work runs on one thread per part of
-    /// the queries.
+    /// the queries. DocEntry and `group` keep term ids, answers and entry indices in
+    /// 16 bits: the spec's queries have about 53,000 BOOL terms, 50,000 lines and
+    /// 36,000 entries. Past 2^16 of any of them, every BOOL query is evaluated in
+    /// every superblock instead (slower, never wrong).
     pub fn new(queries: Queries, sample_df: &[u32], sampled: u32) -> Self {
+        let plan = |force| Self::with(&queries, sample_df, sampled, force);
+        plan(false).unwrap_or_else(|| plan(true).unwrap())
+    }
+
+    /// The plan, if it fits DocEntry and `group` (see `new`), or with `force` every
+    /// BOOL query evaluated in every superblock.
+    fn with(queries: &Queries, sample_df: &[u32], sampled: u32, force: bool) -> Option<Self> {
         let parts = queries.len();
         // The expected share of 64-document blocks that contain t: the cost of
-        // triggering on it.
-        let cost = |t: u32| 1.0 - (1.0 - sample_df[t as usize] as f64 / sampled as f64).powi(64);
+        // triggering on it (plus 1 with `force`: every cover then costs over ALWAYS).
+        let share = |t: u32| sample_df[t as usize] as f64 / sampled as f64;
+        let cost = |t: u32| force as u8 as f64 + 1.0 - (1.0 - share(t)).powi(64);
         // Per old id: bit 0 for a BOOL term, bit 1 for a term of an `always` query.
         let kind: Vec<AtomicU8> = (0..sample_df.len()).map(|_| AtomicU8::new(0)).collect();
         // Whether each line is a BOOL query evaluated in every superblock.
@@ -148,11 +157,9 @@ impl Plan {
         // 8 entries after the last that never match (truth 0), in a group of their
         // own: `trigger` writes up to 7 indices past a range, and pads its last 8
         // with the last of them.
-        let mut padding = DocEntry::default();
-        padding.cover = bool_terms as u32;
-        by_trigger.push(vec![padding; 8]);
+        by_trigger.push(vec![(bool_terms as u32, DocEntry::default()); 8]);
         let by_anchor: Vec<_> = out.iter_mut().map(|o| take(&mut o.phrases)).collect();
-        let entry_pairs = || by_trigger.iter().flatten().map(|&e| (e.cover, e));
+        let entry_pairs = || by_trigger.iter().flatten().copied();
         let anchor = |p: &Phrase| (p.terms[p.offset as usize], *p);
         let anchor_pairs = || by_anchor.iter().flatten().map(anchor);
         let always: Vec<_> = out.iter().flat_map(|o| o.always.iter().copied()).collect();
@@ -171,7 +178,14 @@ impl Plan {
                 _ = anchors.set(csr(anchor_pairs, order.len()));
             }
         });
-        (plan.group, plan.entries) = entries.into_inner().unwrap();
+        let (group, entries) = entries.into_inner().unwrap();
+        // With `force` there are only the padding entries, with terms 0.
+        let fits = bool_terms <= 1 << 16 && lines <= 1 << 16 && entries.len() < 1 << 16;
+        if !fits && !force {
+            return None;
+        }
+        // In 16 bits, so that `trigger` reads half the lines.
+        (plan.group, plan.entries) = (group.iter().map(|&g| g as u16).collect(), entries);
         (plan.anchor, plan.anchored) = anchors.into_inner().unwrap();
         let mut always = always.into_inner().unwrap();
         plan.number_answers(&mut always, lines);
@@ -185,7 +199,7 @@ impl Plan {
         let info = par(parts, &|p| ids(p).iter().map(word).collect::<Vec<_>>());
         plan.info = info.concat();
         (plan.always, plan.rows) = (always, rows);
-        plan
+        Some(plan)
     }
 
     /// Numbers the answers in the order the scan visits them: the `always` ones
@@ -203,7 +217,11 @@ impl Plan {
             *line = self.answer_of[*line as usize];
         };
         always.iter_mut().for_each(|e| number(&mut e.answer));
-        self.entries.iter_mut().for_each(|e| number(&mut e.answer));
+        for e in &mut self.entries {
+            let mut answer = e.answer as u32;
+            number(&mut answer);
+            e.answer = answer as u16;
+        }
         self.anchored.iter_mut().for_each(|a| number(&mut a.answer));
     }
 }
@@ -212,7 +230,8 @@ impl Plan {
 /// BOOL entries, one per cover term, its phrases and its `always` entries.
 #[derive(Default)]
 struct Records {
-    triggered: Vec<DocEntry>,
+    /// Each with its cover term.
+    triggered: Vec<(u32, DocEntry)>,
     phrases: Vec<Phrase>,
     always: Vec<Entry>,
 }
@@ -229,8 +248,6 @@ fn records(
     cost: impl Fn(u32) -> f64,
     always_lines: &[bool],
 ) -> Records {
-    // Entries are padded with the term after the sink, in no document.
-    let pad = rank.len() as u32 + 1;
     let mut triggered = Vec::with_capacity(MAX_BOOL_TERMS * spans.len());
     let (mut phrases, mut always) = (Vec::with_capacity(spans.len()), Vec::new());
     let renumber = |&word: &u32| rank[(word & TERM) as usize] | word & !TERM;
@@ -261,7 +278,7 @@ fn records(
         }
         let (cover, n, _) = cover(words, &cost);
         for (i, &c) in cover[..n].iter().enumerate() {
-            triggered.push(doc_entry(words, c, &cover[..i], answer, pad));
+            triggered.push((c, doc_entry(words, c, &cover[..i], answer)));
         }
     }
     Records {
