@@ -85,19 +85,19 @@ const REGION_CHUNKS: usize = 64;
 /// records that start at least this far before the end; the walker takes the rest.
 const FAST_MARGIN: usize = 256;
 
-/// A group's columns, amounts in cents: the 4 summed ones first, so that `parse_run`
-/// adds them at once. name_bytes and note_bytes share one, `BYTES`, as
+/// A group's columns, in the order of the output line (spec section 4), amounts in
+/// cents. name_bytes and note_bytes share the last one, `BYTES`, as
 /// name_bytes << 32 | note_bytes: each is below 2^31 (spec section 3).
 type Totals = [i64; 7];
 const COUNT: usize = 0;
 const ID_SUM: usize = 1;
 const AMOUNT_SUM: usize = 2;
-const BYTES: usize = 3;
-const AMOUNT_MIN: usize = 4;
-const AMOUNT_MAX: usize = 5;
-const NAMES_DISTINCT: usize = 6;
+const AMOUNT_MIN: usize = 3;
+const AMOUNT_MAX: usize = 4;
+const NAMES_DISTINCT: usize = 5;
+const BYTES: usize = 6;
 /// No records yet: the min and the max start at the far ends.
-const EMPTY: Totals = [0, 0, 0, 0, i64::MAX, i64::MIN, 0];
+const EMPTY: Totals = [0, 0, 0, i64::MAX, i64::MIN, 0, 0];
 
 /// One partition's names: an open-addressing table of 32-bit keys (0 = empty) in
 /// buckets of 8 slots, at most 5/8 full so that a lookup is nearly always one
@@ -397,8 +397,7 @@ fn run(data_dir: &str, out: &str) -> ! {
     // threads; 4 deviations took a 69th page per table); a table that needs more grows, on
     // the CPU of the thread that fills it.
     let rows = (names + 3 * names.isqrt()) * WORDS;
-    // 8 key slots more, from which `add` starts at a multiple of 32 bytes.
-    let table = || Mutex::new((Vec::with_capacity(slots + 8), Vec::with_capacity(rows)));
+    let table = || Mutex::new((Vec::with_capacity(slots), Vec::with_capacity(rows)));
     // The workers' stacks, slot w for worker w (slot 0 unused), allocated before the
     // heap's top is taken, so that they do not take the margin.
     let mut stacks: Vec<u8> = Vec::with_capacity(threads * STACK);
@@ -470,7 +469,7 @@ fn fault_in(s: &Shared, f: usize, faulters: usize) {
         // All the rows' reserved room, 8 bytes a word, which `add` writes later.
         populate(rows.as_ptr() as usize, rows.capacity() * 8);
         // Zeroed here, which faults them in: the table is made. (`run` reserved exactly
-        // its slots and 8 more: with_capacity gives the capacity asked for.)
+        // its slots: with_capacity gives the capacity asked for.)
         keys.resize(keys.capacity(), 0);
     }
     s.made.fetch_add(1, Release);
@@ -566,7 +565,7 @@ fn take(s: &Shared, t: usize, taken: &mut Vec<Vec<u64>>, totals: &mut [Totals; G
         std::mem::swap(taken, &mut s.inboxes[t].lock().unwrap());
         for buffer in taken.iter_mut() {
             // SAFETY: every table is made by `fault_in` (its slots a power of two, at
-            // least 16, and 8 more) and changed by nothing but `add`.
+            // least 16) and changed by nothing but `add`.
             unsafe { add(&mut table, buffer, totals) };
             buffer.clear();
         }
@@ -681,7 +680,7 @@ fn write_output(dir: &str, totals: &[Totals; GROUPS], countries: &[Vec<u8>]) {
     // Writing into a String cannot fail, so the `write!` results are unwrapped.
     let mut out = String::new();
     for (key, group) in keys.into_iter().filter(|&(_, g)| totals[g][COUNT] > 0) {
-        let [count, ids, sum, bytes, min, max, names] = totals[group];
+        let [count, ids, sum, min, max, names, bytes] = totals[group];
         write!(out, "{} {count} {ids}", String::from_utf8_lossy(key)).unwrap();
         // Money: cents with a sign and two decimals ("-0.05", "0.00").
         for cents in [sum, min, max] {
@@ -701,22 +700,13 @@ fn write_output(dir: &str, totals: &[Totals; GROUPS], countries: &[Vec<u8>]) {
 ///
 /// # Safety
 /// `table` must have been made empty with a power-of-two number of key slots, at
-/// least 8 (one bucket; `run` sizes every table at 16 or more), plus 8 slots from
-/// which the first ones are skipped to align the others (see below), and changed
-/// since by nothing but `add`: then every key that is not 0 holds the row + 1 of a
-/// row that `seen` has.
+/// least 8 (one bucket; `run` sizes every table at 16 or more), and changed since
+/// by nothing but `add`: then every key that is not 0 holds the row + 1 of a row
+/// that `seen` has.
 #[inline(never)]
 unsafe fn add(table: &mut Table, pairs: &[u64], totals: &mut [Totals; GROUPS]) {
     // Fields as locals: no store through them can change the others.
     let (keys, seen) = table;
-    // The slots from the first one at a multiple of 32 bytes (malloc aligns to 16), so
-    // that no bucket's load straddles two cache lines (perf: 1.5M split loads a run
-    // without it); a slice, so that their address stays in a register (it does not
-    // change size). align_offset may report usize::MAX ("not possible"): `min(8)` then
-    // starts at the 8 spare slots' end, unaligned but in bounds.
-    let start = keys.as_ptr().align_offset(32).min(8);
-    let end = start + keys.len() - 8;
-    let keys = &mut keys[start..end];
     let (buckets, full) = (keys.len() / 8, keys.len() / 8 * 5 * WORDS);
     // A pair is the name's hash with the group in its low byte. Its bits, at 12
     // threads (16,384 slots per table) and, in parentheses, on one (262,144):
@@ -737,6 +727,8 @@ unsafe fn add(table: &mut Table, pairs: &[u64], totals: &mut [Totals; GROUPS]) {
     let rows_mask = keys.len() as u32 - 1;
     // A bucket's 8 keys are 32 bytes: its byte offset in `keys` is masked by this.
     let bucket_bytes = (buckets - 1) * 32;
+    // The keys' address in a register: the slice does not change size.
+    let keys = keys.as_mut_slice();
     // SAFETY: AVX2 is enabled for this build (see the compile_error); no memory.
     let (mask, zero) = unsafe { (_mm256_set1_epi32(!rows_mask as i32), _mm256_setzero_si256()) };
     for &pair in pairs {
@@ -868,15 +860,9 @@ fn parse_run(
         // SAFETY: `record` clamped region_id into the table.
         let group = unsafe { group_of.get_unchecked(region_id as usize) }.load(Relaxed);
         let t = &mut totals[group as usize];
-        // The 4 summed columns in one 256-bit add: left to itself, LLVM added two of them
-        // with one 128-bit add and the other two one at a time.
-        // SAFETY: AVX2 is enabled for this build (see the compile_error); `t` has 7
-        // columns, so 4 are in bounds.
-        unsafe {
-            let p = t.as_mut_ptr().cast();
-            let add = _mm256_set_epi64x(bytes as i64, cents, id as i64, 1);
-            _mm256_storeu_si256(p, _mm256_add_epi64(_mm256_loadu_si256(p), add));
-        }
+        (t[COUNT], t[ID_SUM], t[AMOUNT_SUM]) =
+            (t[COUNT] + 1, t[ID_SUM] + id as i64, t[AMOUNT_SUM] + cents);
+        t[BYTES] += bytes as i64;
         // Branches, not cmov and a store: a new min or max is rare.
         if cents < t[AMOUNT_MIN] {
             t[AMOUNT_MIN] = cents;
@@ -1157,7 +1143,7 @@ unsafe fn hash_words(text: &[u8], s: usize, len: usize) -> u64 {
         let (mut x, mut done) = (_mm_setzero_si128(), 0);
         // A loop with its test at the end (one block for an empty field too).
         while {
-            let keep = KEEP.0.as_ptr().cast::<u8>().add(32 - (len - done).min(32));
+            let keep = KEEP.as_ptr().cast::<u8>().add(32 - (len - done).min(32));
             let v = _mm256_loadu_si256(text.as_ptr().add(s + done).cast());
             let v = _mm256_and_si256(v, _mm256_loadu_si256(keep.cast()));
             let (lo, hi) = (_mm256_castsi256_si128(v), _mm256_extracti128_si256::<1>(v));
@@ -1170,11 +1156,5 @@ unsafe fn hash_words(text: &[u8], s: usize, len: usize) -> u64 {
     }
 }
 
-/// The 32 bytes at `32 - n` keep the first n bytes of 32 (little-endian words). Aligned
-/// to 64 bytes, a cache line, so that no such load straddles two lines (at 24 mod 64,
-/// its place in an earlier layout, about one per record did: perf,
-/// mem_inst_retired.split_loads).
-static KEEP: Line<[u64; 8]> = Line([u64::MAX, u64::MAX, u64::MAX, u64::MAX, 0, 0, 0, 0]);
-/// A value aligned to a cache line (64 bytes).
-#[repr(align(64))]
-struct Line<T>(T);
+/// The 32 bytes at `32 - n` keep the first n bytes of 32 (little-endian words).
+static KEEP: [u64; 8] = [u64::MAX, u64::MAX, u64::MAX, u64::MAX, 0, 0, 0, 0];
