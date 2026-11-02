@@ -1,6 +1,12 @@
 //! Track C (Join): parse the hostile records.csv, join each record to its country
 //! through regions.csv, and write per-country aggregates.
 //!
+//! Reading order: `main` -> `run` (sizes, tables, threads) -> `worker` (claims runs,
+//! hands pairs over) -> `parse_run` (two cursors) -> `fast_record` (SIMD; `walk_record`
+//! takes the rest) -> `add` (distinct names) -> `finish` -> `write_output`. The helpers
+//! above `main` (libc, `map`, `drop_pages`, `populate`, `touch`, `wait`) and `fault_in`
+//! are system plumbing: mapping, page faults and waits.
+//!
 //! The parser relies on spec section 2.2 (what the generator writes, for every seed
 //! and scale), not only on the general grammar of 2.1, and does not check all of it.
 //! Input that breaks 2.2 and moves a record boundary (tested: a lone quote, a lost
@@ -147,6 +153,10 @@ const PR_SET_THP_DISABLE: i32 = 41;
 /// x86-64's base page size: madvise takes page-aligned bounds.
 const PAGE: usize = 4096;
 /// Threads that fault in the memory every thread writes, a share each (see `run`).
+/// Four measured best (PERF.md, experiments, step-60 work): with one or two, the name
+/// tables came late (T +1.56 to +1.82%); with five (the main thread only the join
+/// table, four others the rest), T -0.03% at a max of 9.06 MB, about 0.1 points under
+/// four by the board's formula.
 const FAULTERS: usize = 4;
 /// A worker's stack, and its top part, which is faulted in before the worker starts. A
 /// worker uses at most 18.4 KB, glibc's thread descriptor and TLS at the top included
@@ -609,9 +619,15 @@ fn finish(s: &Shared, w: usize, taken: &mut Vec<Vec<u64>>, totals: &mut [Totals;
         // SAFETY: no thread reads the tables, the join table or regions.csv again
         // (above), and the input is `map`'s.
         unsafe { drop_pages(&keys[..]) };
+        // SAFETY: this thread's table; no thread reads the tables again (above).
         unsafe { drop_pages(&rows[..]) };
+        // SAFETY: no thread reads the join table after `merged` (above).
         unsafe { drop_pages(&s.group_of[share(REGION_IDS)]) };
+        // SAFETY: `map`'s private mapping, never written: a dropped page faults back
+        // the same bytes.
         unsafe { drop_pages(&lines[share(lines.len())]) };
+        // SAFETY: `map`'s private mapping, never written: a dropped page faults back
+        // the same bytes.
         unsafe { drop_pages(&text[early..][share(text.len() - early)]) };
     }
 }
@@ -629,7 +645,7 @@ fn fill(lines: &[u8], group_of: &[AtomicU8], codes: &[AtomicU8], countries: &Mut
         while let Some(&digit @ b'0'..=b'9') = lines.get(at) {
             (id, at) = (id * 10 + (digit - b'0') as usize, at + 1);
         }
-        let [a, b, c] = [1, 2, 3].map(|i| (lines[at + i] - b'A') as usize);
+        let [a, b, c] = [1, 2, 3].map(|i| lines[at + i].wrapping_sub(b'A') as usize);
         let group = &codes[(a * 26 + b) * 26 + c];
         // Checked again under the lock: two threads can meet a new code at once.
         if group.load(Relaxed) == 0 {
@@ -825,8 +841,9 @@ fn parse_run(
     // fast_record reads the 8 bytes before a record: the header comes first.
     assert!(start >= 8, "records.csv: no header line");
     let record = |i: usize| {
-        // A non-temporal prefetch ~12 records ahead: the stream then takes less of
-        // L2, so more of the 1 MB region table stays there.
+        // A non-temporal prefetch ~10 records ahead (640 bytes; full seed 1 averages
+        // 60.8 bytes a record): the stream then takes less of L2, so more of the 1 MB
+        // region table stays there.
         // SAFETY: a prefetch never faults, and wrapping_add keeps the address defined.
         unsafe { _mm_prefetch::<_MM_HINT_NTA>(text.as_ptr().wrapping_add(i + 640).cast()) };
         // SAFETY: fast_end is at most text.len() - FAST_MARGIN, or 0, and i >= 8
@@ -943,7 +960,7 @@ unsafe fn fast_record(text: &[u8], i: usize, fast_end: usize) -> Option<Record> 
     let name_inside = (inside & !(u64::MAX << name_end)).count_ones() as usize;
     let name_bytes = name_inside - name_quoted;
     let name_start = id_end + 1 + name_quoted;
-    let name_len = name_end - name_quoted - name_start;
+    let name_len = name_end.wrapping_sub(name_quoted + name_start);
     // Names are one block for the hash: a longer one (none in the generator's pool)
     // goes to the walker, whose hash takes any length.
     ensure(name_len <= 32)?;
@@ -955,16 +972,20 @@ unsafe fn fast_record(text: &[u8], i: usize, fast_end: usize) -> Option<Record> 
         (e, (inside & !(u64::MAX << e)).count_ones())
     } else {
         // The note runs past the first 64 bytes: the next 64, carrying the quote state.
+        // Bit 63 of `inside`, the quote state at the first window's end, is spread over
+        // all 64 bits by the arithmetic shift.
         // SAFETY: the 64 bytes at i + 64 are inside the text (above).
         let (_, commas2, inside2) = masks(unsafe { &*p.add(64).cast() });
         let inside2 = inside2 ^ ((inside as i64) >> 63) as u64;
         let e = (commas2 & !inside2).trailing_zeros() as usize; // 64 if none
+        // e & 63: a shift by 64 would overflow; e = 64 (no separator) fails the bound
+        // below anyway.
         let inside_to_e = (inside2 & !(u64::MAX << (e & 63))).count_ones();
         (64 + e, inside.count_ones() + inside_to_e)
     };
     ensure(note_end < 128)?;
     let note_quoted = (note_end > name_end + 1) as usize;
-    let note_bytes = inside_to_note as usize - name_inside - note_quoted;
+    let note_bytes = (inside_to_note as usize).wrapping_sub(name_inside + note_quoted);
     // The tail, `region_id,amount`: its first comma and dot, from its 32 bytes.
     // SAFETY: note_end < 128, so the 32 bytes end by i + 160 (above).
     let tail = unsafe { _mm256_loadu_si256(p.add(note_end + 1).cast()) };
