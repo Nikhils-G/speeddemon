@@ -773,9 +773,10 @@ impl Interner {
 
     /// `id << ENDPOINT_SHIFT` of the endpoint of `len` bytes (0 to 62) at `from`,
     /// followed by a space, whose first 64 bytes are `bytes`, if it is in its home
-    /// slot; `None` sends the caller the long way (`id`). Under 8 bytes the last 8
-    /// bytes reach before `from`, into the method, so the slot is almost never the
-    /// home one: the compare is exact all the same, and a miss goes the long way.
+    /// slot or the next; `None` sends the caller the long way (`id`). Under 8 bytes
+    /// the last 8 bytes reach before `from`, into the method, so the slot is almost
+    /// never the home one: the compare is exact all the same, and a miss goes the
+    /// long way.
     ///
     /// # Safety
     ///
@@ -789,14 +790,22 @@ impl Interner {
         unsafe {
             let first = _mm_cvtsi128_si64(_mm256_castsi256_si128(bytes[0])) as u64;
             let last = from.add(len).sub(8).cast::<u64>().read_unaligned();
-            let id = self.slots[Self::home(len, first, last)].load(Acquire);
-            let at = (id >> (ENDPOINT_SHIFT - 7)) as usize;
-            let known = &*self.keys.as_ptr().cast::<u8>().add(at).cast::<Key>();
-            let same = |i: usize| eq_mask(bytes[i], known[i]);
-            // Bytes 0..=len must match: the endpoint and its space, which the stored
-            // key has at its own length.
-            let differ = !(same(0) | same(1) << 32) & _bzhi_u64(!0, len as u32 + 1);
-            (differ == 0).then_some(id)
+            // The slot's id if its key is this endpoint: bytes 0..=len must match, the
+            // endpoint and its space, which the stored key has at its own length.
+            let holds = |slot: usize| {
+                let id = self.slots[slot % SLOTS].load(Acquire);
+                let at = (id >> (ENDPOINT_SHIFT - 7)) as usize;
+                let known = &*self.keys.as_ptr().cast::<u8>().add(at).cast::<Key>();
+                let same = |i: usize| eq_mask(bytes[i], known[i]);
+                let differ = !(same(0) | same(1) << 32) & _bzhi_u64(!0, len as u32 + 1);
+                (differ == 0).then_some(id)
+            };
+            // A key that a collision displaced is most often in the next slot (`id`
+            // probes linearly): on seed 1, 2.0% of the lines find their endpoint there,
+            // which went the long way before. Replica: seed 1 0.5% faster (201 pairs a
+            // build); 20 fresh seeds 0.7% faster on average, 17 of 20.
+            let home = Self::home(len, first, last);
+            holds(home).or_else(|| holds(home + 1))
         }
     }
 
