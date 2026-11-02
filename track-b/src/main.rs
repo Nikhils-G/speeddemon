@@ -39,14 +39,11 @@ mod vocab;
 
 use {plan::*, pool::*, scan::*, vocab::*};
 
-use std::arch::asm;
-use std::arch::x86_64::*;
-use std::cmp::Reverse;
+use std::arch::{asm, x86_64::*};
 use std::mem::{replace, transmute};
-use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicUsize, Ordering::*};
 use std::sync::{Barrier, LazyLock, Mutex, OnceLock, RwLock};
-use std::thread::spawn;
+use std::{cmp::Reverse, thread::spawn};
 
 #[cfg(not(all(target_feature = "avx2", target_feature = "bmi2")))]
 compile_error!("track-b needs AVX2 and BMI2: build with RUSTFLAGS=\"-C target-cpu=native\"");
@@ -149,24 +146,22 @@ extern "C" fn main(_: i32, _: *const *const u8) -> i32 {
     // Per answer, whether the first slice alone has FIRST_IDS ids. Then the later
     // slices' ids are never printed, so their threads skip the answer: most of
     // their logs, as such answers are the frequent ones.
-    let full = OnceLock::new();
+    let full: OnceLock<Vec<bool>> = OnceLock::new();
     let results = par(slices.len(), &|i| {
         let (start, end, first) = slices[i];
-        // Only the answers and the last id are kept: the scan's other tables
-        // are freed here, and the first ids below reuse their memory.
-        let (Answers { state, log, logged }, doc) = {
-            // SAFETY: end <= text.len(), and mmap::PAD (256) bytes follow text.
-            let scan = unsafe { Scan::new(&vocab, Some(&plan), &[]).run(docs, start, end, first) };
-            (scan.answers, scan.doc)
-        };
+        // Only the answers and the last id are kept: the scan's other tables are
+        // freed with the rest of it here, and the first ids below reuse their memory.
+        // SAFETY: end <= text.len(), and mmap::PAD (256) bytes follow text.
+        let Scan { answers, doc, .. } =
+            unsafe { Scan::new(&vocab, Some(&plan), &[]).run(docs, start, end, first) };
+        let Answers { state, log, logged } = answers;
         // The ids go on in the next slice, and stay below MAX_DOCS.
         let next = slices.get(i + 1).map_or(doc + 1, |s| s.2);
         // A slice's ids also fit the first-id log (see MIN_SLICES).
         let ok = slices[0].2 == 0 && next == doc + 1 && doc < MAX_DOCS && doc - first < 1 << 16;
         assert!(ok, "ids 0, 1, ... below 2^20, 2^16 a slice");
         if i == 0 {
-            let is_full = |&s: &u64| s >> SUM_BITS >= FIRST_IDS;
-            full.get_or_init(|| state.iter().map(is_full).collect::<Vec<_>>());
+            full.get_or_init(|| state.iter().map(|&s| s >> SUM_BITS >= FIRST_IDS).collect());
         }
         // The other threads wait here for the first slice's scan.
         let full: &[bool] = full.wait();

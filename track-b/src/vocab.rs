@@ -293,17 +293,17 @@ impl Phf {
         (0..4).any(|_| {
             let (mut taken, mut next) = (vec![false; region.len()], first);
             let mut set = |e: &Key, pilot, v| replace(&mut taken[slot(e, pilot)], v);
-            let failed = order.iter().position(|bucket| {
-                let Some(pilot) = find_pilot(bucket, &mut set) else {
-                    return true;
-                };
+            // A bucket placed with the first pilot that fits, or None when none does.
+            let mut placed = |bucket: &&[Key]| {
+                let pilot = find_pilot(bucket, &mut set)?;
                 self.pilot[(bucket[0].hash & bmask) as usize].store(pilot as u16, Relaxed);
                 for e in *bucket {
                     region[slot(e, pilot)] = key_of(file, *e) | next << 96;
                     next += 1;
                 }
-                false
-            });
+                Some(())
+            };
+            let failed = order.iter().position(|bucket| placed(bucket).is_none());
             failed.inspect(|&i| order[..=i].rotate_right(1)).is_none()
         })
     }

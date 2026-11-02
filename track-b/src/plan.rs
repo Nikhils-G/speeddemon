@@ -181,11 +181,9 @@ impl Plan {
             }),
         });
         let (group, entries, mut numbers) = entries.into_inner().unwrap();
-        // With `force` there are only the padding entries, with terms 0.
+        // With `force` there are only the padding entries, with terms 0. (Without
+        // it, the plan below is finished and dropped when the counts do not fit.)
         let fits = bool_terms <= 1 << 16 && lines <= 1 << 16 && entries.len() < 1 << 16;
-        if !fits && !force {
-            return None;
-        }
         // In 16 bits, so that `trigger` reads half the lines.
         (plan.trig_start, plan.entries) = (group.iter().map(|&g| g as u16).collect(), entries);
         (plan.anchor, plan.anchored) = anchors.into_inner().unwrap();
@@ -209,9 +207,8 @@ impl Plan {
         let word = |id: &mut u32| *id |= flag(*id as usize);
         let range = |p: usize| ranges[p].lock().unwrap().iter_mut().for_each(word);
         par(ranges.len(), &range);
-        drop(ranges);
         plan.info = info;
-        Some(plan)
+        (fits || force).then_some(plan)
     }
 }
 
