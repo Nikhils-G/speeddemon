@@ -23,9 +23,10 @@ percentiles need every latency of a group, not a running summary.
 The reference runs 32.05 s at 228 MB and S 56. The submitted code (PERF.md step 69, am5-2,
 abc7b44, S 456) is step 68 with the endpoints' name order sorted after the merge's hand-off, while
 the other threads start pass 2. Its first board run, run-a533307c210b (0.018707 s, 18.62 MB, 84.89
-points), was a slow run: Track A alone was slow in that dispatch, and B set its best time in the
-same dispatch (run-567ede8911b8, 0.074086 s). Its second, run-b3a4984e4320 (0.015715 s, 18.22 MB,
-86.88 points), is the best Track A run and the fastest Track A time. Step 68 (am5-1, 9f2993f,
+points), was a slow run: Track A alone was slow in that dispatch, and B set its best time then in
+the same dispatch (run-567ede8911b8, 0.074086 s). Its second, run-b3a4984e4320, took 0.015715 s
+(18.22 MB, 86.88 points), and its third, run-dcb2c65578ff (0.015702 s, 18.24 MB, 86.88 points),
+is the best Track A run and the fastest Track A time. Step 68 (am5-1, 9f2993f,
 S 452), step 67's engine with the endpoint table in static memory, a cheaper cold lookup and the
 space window 3 bytes later, had them before it: run-be74feabcc76, 0.015722 s, 18.44 MB, 86.85
 points. Until then, step 64 had the best run (run-1bda764d4b1e, 0.016043 s,

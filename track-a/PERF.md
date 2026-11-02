@@ -4,9 +4,10 @@
 abc7b44, S 456): step 68 with the endpoints' name order sorted after the merge's hand-off, while
 the other threads start pass 2 (replica −0.92% and −0.86% against step 68). Its first board run,
 run-a533307c210b (0.018707 s, 18.62 MB, 84.89 points), was a slow run: Track A alone was slow in
-that dispatch, and B set its best time in the same dispatch (run-567ede8911b8, 0.074086 s). Its
-second, run-b3a4984e4320 (0.015715 s, 18.22 MB, 86.88 points), is the best Track A run and the
-fastest Track A time. Step 68 (am5-1, 9f2993f, S 452) is step 67 with the endpoint table in static
+that dispatch, and B set its best time then in the same dispatch (run-567ede8911b8, 0.074086 s).
+Its second, run-b3a4984e4320, took 0.015715 s (18.22 MB, 86.88 points), and its third,
+run-dcb2c65578ff (0.015702 s, 18.24 MB, 86.88 points), is the best Track A run and the fastest
+Track A time. Step 68 (am5-1, 9f2993f, S 452) is step 67 with the endpoint table in static
 memory, a cheaper cold lookup and the space window 3 bytes later (replica −1.18% and −1.19%); its
 run-be74feabcc76 (0.015722 s, 18.44 MB, 86.85 points) had them until step 69. Steps
 64 to 67 are step 63's engine with a reviewed `main` (the worker defined once, named structs, a
@@ -21,9 +22,9 @@ disorder bound is assumed (step 8); and a pass 2 that counts ranks for small gro
 each hour in place once its start is known (steps 19 and 44). Steps 56 to 66 traded 27 lines
 (0.20 points of S) for an exact id bound, a reviewed `main` with named structs, a lower memory peak
 and a shorter tail, and the best points moved from step 55's run-ea674ef8448a (0.016399 s, S 428,
-86.44) to step 64's, then to step 68's. Every run ID below is in the board's
-history for team SALAAR; "probe" marks a timing build that reports through its exit code ("Box
-probes").
+86.44) to step 64's, then to step 68's and step 69's (run-dcb2c65578ff, 0.015702 s, 86.88).
+Every run ID below is in the board's history for team SALAAR; "probe" marks a timing build that
+reports through its exit code ("Box probes").
 
 | What moved the score most | Step | Board, before → after |
 |---|---|---|
@@ -60,7 +61,7 @@ numbers are left out rather than guessed.
 |---|---|---|---|---|---|---|---|
 | 0 | | The reference, unchanged (the board's calibration figures, not a run of ours) | | 32.05 | 228 | 56 | 0 |
 | 1 | cf9c345 | mmap, a thread per hardware thread, packed u64 records, counting sort by (hour, endpoint), sort per group | run-9042fdf66fed | 0.0796 | 57.03 | 402 | 64.72 |
-| 2 | 060fea1 | AVX2 line parse: vector compares for the endpoint's end, a 32-byte key from the register, SWAR digits | run-4e23aae357cc | 0.0749 | 59.36 | 505 | 64.45* |
+| 2 | 060fea1 | AVX2 line parse: vector compares for the endpoint's end, a 32-byte key from the register, SWAR digits | run-4e23aae357cc | 0.0749 | 59.36 | 505 | 64.46* |
 | 3 | 144561a | Parallel glue: prefix sums, scatter and output in parallel (pwrite into a pre-sized file) | run-92e5d2af56e2 | 0.0510 | 62.2 | 575 | 68.0 |
 | 4 | 64499b4 | Scatter arrays populated in one call (board run not in our log) |  |  |  |  |  |
 | 5 | 42acaa7 | Profile-guided build (training on a generated sample, seed 7) | run-8d33686a4c41 | 0.0498 | 51.6 | 597 | 68.96 |
@@ -98,9 +99,9 @@ numbers are left out rather than guessed.
 | 36 | fcc1dd3 | Dockerfile only: the alignment flag off again, as a board A/B of step 34 | run-8f956a29e3c5 | 0.027124 | 18.55 | 352 | 81.72 |
 | 37 | 16747e3 | 352 → 337 lines in setup and merge; loop alignment back on | run-c0c000c115eb, run-faf8de198217, run-62d04587cf21 | 0.019199, 0.018916, 0.01906 | 18.83, 18.77, — | 337 | 85.55, 85.72, 85.69 |
 | 38 | (aspeed3-1, no board run of its own) | Four slices per thread from a shared counter, one records pair per thread (no board run of its own) | — | — | — | 351 | — |
-| 39 | 067466b (board runs from 5afab2c, 8ee6e49, 6923e1e) | aspeed3-2: records released once per part; the final wait sleeps (first run: slow dispatch) | run-ad77dae6f7a8, run-f864a17b46cc, run-5e361abae820 | 0.020124, 0.019000, 0.018979 | 19.07, —, — | 346 | 84.90, —, 85.56 |
+| 39 | 067466b (board runs from 5afab2c, 8ee6e49, 6923e1e) | aspeed3-2: records released once per part; the final wait sleeps (first run: slow dispatch) | run-ad77dae6f7a8, run-f864a17b46cc, run-5e361abae820 | 0.020124, 0.019000, 0.018979 | 19.07, 18.68, 18.93 | 346 | 84.90, 85.61, 85.56 |
 | 40 | 51f3e80 (board runs from b9237f3, 2c8ba1c, 1877866) | aspeed3-3: after the last write, each thread drops its share of the output's page-table entries | run-b273d14e2d15, run-d71d8b7f9981, run-73354c271737 | 0.018743, 0.018716, 0.018676 | 19.12, 19.15, — | 353 | 85.59, 85.60, 85.61 |
-| 41 | 1806066 (runs from 7f08fe7, aa82492, 045a6b5, 9ce324f and a B sweep push) | Code-quality pass: comments, `unsafe fn` contracts, named constants (M and points of runs 3-4 from `board.py`) | run-414047b8285e, run-06d513a7635c, run-696e1acfaf1a, run-e4efcd67f121, run-38a2fba0decc | 0.020761, 0.018823, 0.020965, 0.018636, 0.021146 | —, —, 18.61, 18.96, 18.39 | 372 | —, —, 84.32, 85.52, 84.28 |
+| 41 | 1806066 (runs from 7f08fe7, aa82492, 045a6b5, 9ce324f and a B sweep push) | Code-quality pass: comments, `unsafe fn` contracts, named constants (M and points of runs 3-4 from `board.py`) | run-414047b8285e, run-06d513a7635c, run-696e1acfaf1a, run-e4efcd67f121, run-38a2fba0decc | 0.020761, 0.018823, 0.020965, 0.018636, 0.021146 | 18.6, 18.68, 18.61, 18.96, 18.39 | 372 | 84.43, 85.48, 84.32, 85.52, 84.28 |
 | 42 | 145795b, 8bcfa4c (probes, removed in 0c3a5e2) | Two parse-end probes: step 41's parse, then step 43's | run-bbf6e7ffe2bd, run-500e61325035 | probe | probe |  |  |
 | 43 | c6eb62d | **A new parse**: two slices side by side, endpoints looked up without a key, digits converted in place | run-2d6a1338fdb0, run-07f44a5540cc | 0.018084, 0.019052 | 18.82, 19.43 | 445 | 85.29, 84.59 |
 | 44 | afa31f5, f019f31, 1feac3a (last run from 81939f6) | Percentiles of groups of up to 64 values by vector rank counting (`small_ranks`) | run-0043d10b380f, run-fe32e261c61b, run-acd1a4f10e47, run-0cb9b6287711, run-263496e70d89, run-d638919e2aa2 | 0.018635, 0.01767, 0.018193, 0.017822, 0.016848, 0.018359 | 19.06, 19.93, 19.42, 19.24, 19.41, 18.59 | 477 | 84.69, 85.07, 84.87, 85.13, 85.70, 84.96 |
@@ -128,7 +129,7 @@ numbers are left out rather than guessed.
 | 66 | a09d036 (later runs from 79fb02b, 14aa7c9, f37f273, 9b2ee21, 41e6cfe and 1eb28f0) | A lines pass in `main`: the six shared counters as one array, the room per thread inline, the hour key in one line, `counts` zeroed as each group is taken instead of a 16 KB fill per hour, the scope returning the total (replica −0.04, +0.29, −0.01 and +0.03% over four pairings: equal) | run-b46ef564c46b, run-ce29fb96c3ac, run-64335e22618d, run-ee262fe95b70, run-dd77010a62f8, run-d5416e8b5c12, run-870c44970b40 | 0.016216, 0.020944, 0.02058, 0.016158, 0.016152, 0.016473, 0.016041 | 18.35, 18.65, —, 18.21, 18.48, —, 18.54 | 455 | 86.51, 83.67, —, 86.59, 86.53, 86.31, 86.59 |
 | 67 | 12e48b1 (later runs from bbce7e9 and 3305ff6) | jc5-a-2: review comments only: the safety arguments, the phases, and the Dockerfile's note on reproducible builds; the token stream is step 66's (first run slow, with B slow in the same dispatch; the second run's T, M and points from `board.py`) | run-0713194d9d4c, run-44c2757557ea, run-574c80fb3ed7 | 0.020705, 0.01611, 0.017024 | 18.48, 18.32, 18.92 | 455 | 83.83, 86.59, 85.85 |
 | 68 | 9f2993f | am5-1: the endpoint table a zeroed static, with no 0.13 ms memset before the first spawn; the cold lookup's hash read from the line and its space mask built from two 64-bit halves; the space window from byte 31 instead of 28, so 6.6% of seed 1's lines end past it instead of 7.6% (replica −1.18% and −1.19% against step 67, 150 and 146 of 201 pairs). The best Track A run and the fastest Track A time until step 69 | run-be74feabcc76 | 0.015722 | 18.44 | 452 | 86.85 |
-| 69 | abc7b44 | am5-2: the endpoints' name order sorted after the merge's hand-off, while the other threads start pass 2, and 4 lines cut at the same speed (replica −0.92% and −0.86% against step 68, 141 and 144 of 201 pairs). **The submitted code**. Its first run was slow, with Track A alone slow in that dispatch; its second is the best Track A run | run-a533307c210b, run-b3a4984e4320 | 0.018707, 0.015715 | 18.62, 18.22 | 456 | 84.89, 86.88 |
+| 69 | abc7b44 (later runs from later pushes, Track A unchanged) | am5-2: the endpoints' name order sorted after the merge's hand-off, while the other threads start pass 2, and 4 lines cut at the same speed (replica −0.92% and −0.86% against step 68, 141 and 144 of 201 pairs). **The submitted code**. Its first run was slow, with Track A alone slow in that dispatch; its third is the best Track A run and the fastest Track A time; its fourth came with B slow too | run-a533307c210b, run-b3a4984e4320, run-dcb2c65578ff, run-19e874ad85e8, run-bee68d630395, run-4dc2beaa9133, run-dedaf3c2c2f6 | 0.018707, 0.015715, 0.015702, 0.018389, 0.015805, 0.01608, 0.016067 | 18.62, 18.22, 18.24, —, 18.7, 18.4, 18.89 | 456 | 84.89, 86.88, 86.88, —, 86.71, 86.59, 86.48 |
 
 **The submitted code is step 69 (am5-2, abc7b44), S 456**: step 68 with the endpoints' name order
 sorted after the merge's hand-off.
@@ -163,14 +164,22 @@ sorted after the merge's hand-off.
   and 18.43 MB (two builds) against 18.39 and 18.44 MB for step 68, equal within the noise. At A's
   exchange rates, about +0.10 points of T and −0.03 of S (452 → 456): net about +0.07.
 - *Board.* Its first run, run-a533307c210b, took 0.018707 s (18.62 MB, 84.89 points): a slow run.
-  Track A alone was slow in that dispatch; B set its best time in the same dispatch
+  Track A alone was slow in that dispatch; B set its best time then, in the same dispatch
   (run-567ede8911b8, 0.074086 s). Its second, run-b3a4984e4320, took 0.015715 s (18.22 MB, 86.88
-  points): the best Track A run and the fastest Track A time.
+  points), and its third, run-dcb2c65578ff, 0.015702 s (18.24 MB, 86.88 points): the best Track A
+  run and the fastest Track A time. Its next four: run-19e874ad85e8, 0.018389 s, with B slow in the
+  same dispatch; run-bee68d630395, 0.015805 s; run-4dc2beaa9133, 0.01608 s; run-dedaf3c2c2f6,
+  0.016067 s. Against step 68's one run (0.015722 s) its best is 0.13% faster and its five normal
+  runs took 0.015702 to 0.01608 s: single board runs do not resolve a 0.9% change, which the
+  replica's 201 pairs measured.
 - *Review (commit 7e77cf3).* A review of the code changed in steps 68 and 69 fixed 13 comments
   (stale or unargued SAFETY notes, the window's bound, MIN_LINE's sum, the hand-off's order) and
   made `names` an `unsafe fn` with a `# Safety` section, since its reads of the table are sound only
   once the parse is over. No other token changed; S stays 456. The gate passed on its build, and
-  it ran −0.07% against step 69 (103 of 201 pairs): the same code.
+  it ran −0.07% against step 69 (103 of 201 pairs): the same code. On the board: run-b0e354a4edde,
+  0.018269 s, with Track A alone slow in that dispatch (B 0.072172 s, C 0.017328 s);
+  run-46929a03f15c, 0.015872 s (18.44 MB, 86.72 points); run-046a471d8749, 0.016132 s (18.3 MB,
+  86.58 points); and run-ba86db8b991b, 0.01579 s (18.39 MB, 86.79 points).
 
 **Step 68 (am5-1, 9f2993f), S 452**: step 67 with three changes, in cold code and in the
 constants of the parse loop.
@@ -515,8 +524,8 @@ dispatches where B's unchanged code ran 0.1209-0.1312 s.
   dispatches, run-3feab32d2b8f (0.026024 s, DISTURBED) and run-69d0c9f98c0e (0.026627 s, SLOW BOX),
   came with the other tracks' unchanged code running slow in the same dispatches. Step 36 built A without the flag again, as a board A/B test: 0.0271 s against 0.0192-0.0195 s for the flagged builds in normal dispatches, so the flag is back on from step 37. A's box times are bimodal (about 0.019 s or 0.022-0.027 s for the same code), which a single run cannot separate from a flag effect.
 - **Step 35 (reverted).** −0.70 ms on the test server, not faster on the box in two runs: see the
-  next section and the experiments table. The second run was in a dispatch our log calls "a bit
-  slow".
+  next section and the experiments table. The second run came in a dispatch where B's unchanged
+  code ran 0.12489 s (run-d97dcca08b7d), against 0.1203 s in the first (run-00e91f7a4d7b).
 - **Step 37** cut setup and merge from 352 to 337 lines at the same speed on the test server
   (21.04 / 21.10 against 21.17 / 21.11 ms, 2 PGO builds each, output on disk for this A/B).
 - **Step 38** found the likely cause of A's bimodal box times. With one fixed slice per thread, the
@@ -896,7 +905,7 @@ The earlier probes behind step 12 used 0.25 ms units; their run IDs are not in o
 
 | Experiment | Result |
 |---|---|
-| apost-1 (f8206db, reverted in 51d3674): the endpoint sort moved from the merge into worker 0 (serial merge 250 → 115 µs on the server); runs gathered as each part comes in; the scratch arrays released with `MADV_DONTNEED` and leaked instead of unmapped (their `munmap` took the mmap write lock during the final writes); after a barrier, every thread drops its share of the output mapping's page-table entries (exit 1.07 → 0.57 ms) | Server: −0.70 ms median (−3.8%), 41 interleaved runs, two PGO builds each; memory unchanged. Box: run-7833033c46e9 0.019312 s and run-4e7cded1b902 0.021607 s (a slightly slow dispatch), against run-6cca232c0f6a 0.018935 s and run-df8ecf640b7e 0.019217 s for the code of steps 33 and 34. Not faster on the box, +8 lines: reverted |
+| apost-1 (f8206db, reverted in 51d3674): the endpoint sort moved from the merge into worker 0 (serial merge 250 → 115 µs on the server); runs gathered as each part comes in; the scratch arrays released with `MADV_DONTNEED` and leaked instead of unmapped (their `munmap` took the mmap write lock during the final writes); after a barrier, every thread drops its share of the output mapping's page-table entries (exit 1.07 → 0.57 ms) | Server: −0.70 ms median (−3.8%), 41 interleaved runs, two PGO builds each; memory unchanged. Box: run-7833033c46e9 0.019312 s and run-4e7cded1b902 0.021607 s (a dispatch where B's unchanged code ran 0.12489 s, against 0.1203 s in the first), against run-6cca232c0f6a 0.018935 s and run-df8ecf640b7e 0.019217 s for the code of steps 33 and 34. Not faster on the box, +8 lines: reverted |
 | Sorting the endpoints on the main thread after publishing the merge (apost-1 work) | Server: pass 2 +0.3 ms; the main thread is a 13th thread and got preempted |
 | Dropping output page-table entries while other threads still wrote (apost-1 work) | Slowed the remaining writes by as much as it saved |
 | Global largest-first hour order (apost-1 work) | Server +0.9 ms: all writes bunch at the end. Blocks of 2 × threads: +0.1 ms |
@@ -962,7 +971,7 @@ The earlier probes behind step 12 used 0.25 ms units; their run IDs are not in o
 | Hours queued in blocks of 1, 4, 6 or 24 instead of one per thread | Memory worse: 19.06-19.51 against 18.84 MB (means of 20 runs) |
 | A per-thread pool that reuses the statistics vectors | Memory worse, 18.93 against 18.63 MB: glibc's arena already reuses the freed chunks |
 | One thread per core (6 threads) | −2 MB of peak, +28% T for the whole run; the parse +31% |
-| The endpoint sort with cached keys; a stable sort of the runs | The first slower (its key vector faults in on the main thread); the second −8 µs |
+| The endpoint sort with cached keys; a stable sort of the runs | The first not faster (its key vector faults in on the main thread); the second −8 µs |
 | The name order built by the first worker that needs it, not by the main thread (step 57 work) | Replica −0.35%: less than the main thread's version gained |
 | The hour's write as its own function; the log's mapping as its own function (step 58 work) | Replica +0.39% (mean of four 201-pair runs) and +0.54% (90 of 201), 3 lines each |
 | Workers spinning (`pause`) on the merge's hand-off instead of sleeping on the futex (step 58 work) | Replica +0.01% and −0.28%: noise, for 6 more lines |
@@ -1019,7 +1028,7 @@ The earlier probes behind step 12 used 0.25 ms units; their run IDs are not in o
   Steps 26–27 cut 177 lines for 1.07 points, about 0.006 points per line.
 - **A copy of the scoring machine settles what the board cannot.** Step 51 was dropped on two
   board runs and restored by the replica's paired runs. Its next two board runs were the best
-  Track A runs. Steps 49 and 52 were settled the same way, at differences of 0.4 to 3.8%.
+  Track A runs then. Steps 49 and 52 were settled the same way, at differences of 0.4 to 3.8%.
 - **Know the noise floor first.** The replica's A/A control (step 51 against itself) read +0.66% at
   31 pairs and −0.24% at 201 pairs. A 31-pair result under about 0.7% is therefore read as "the
   same", as for steps 50 and 52.
@@ -1193,7 +1202,8 @@ The gate is a shell script kept outside the repo (scc would count it as code): f
   0.02058 s, step 67 0.01611 s (run-44c2757557ea), 0.017024 and 0.020705 s, step 68 0.015722 s
   (run-be74feabcc76, 86.85 points, the best Track A run until step 69), and the submitted step 69
   0.018707 s in its first run (run-a533307c210b), with Track A alone slow in that dispatch, and
-  0.015715 s in its second (run-b3a4984e4320, 18.22 MB, 86.88 points, the best Track A run).
+  0.015715 s in its second (run-b3a4984e4320, 18.22 MB, 86.88 points) and 0.015702 s in its third
+  (run-dcb2c65578ff, 18.24 MB, 86.88 points, the best Track A run).
 - **Alternating dispatches**, before the replica: a candidate and the code it would replace were
   pushed in turn, a few minutes apart, so both met the same box state, and a result counted only
   if it repeated. Example (runs.log 08:10Z): step 37, step 39, step 37, step 39, step 37 gave
