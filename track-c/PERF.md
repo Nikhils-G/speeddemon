@@ -1,18 +1,23 @@
 # Track C: performance log
 
-**Result.** Reference 14.44 s, 367 MB, S 108. Submitted code: step 73 (905584e, S 556): step
-71's (ab83410, S 550) with the name table's key slots used from a 32-byte boundary and `KEEP`
-aligned to 64 bytes, so that no hot load straddles two cache lines (step 72, 943254b, S 554:
-replica −0.41%, 146 of 201 pairs), and the four summed columns of a group added in one 256-bit add
-(step 73: replica −0.90% against step 72, 151 of 201). Step 72's one board run, 0.020345 s, came
-with Track A slow too, and step 73's one run, 0.021108 s (run-a173e945b66c, 82.07 points), was 24% over step 68's best in a dispatch where Track B also ran 19% over its best (0.07793 s): both rest on the replica. Best
-run: still step 68's (9514121, S 561), run-38f216bf39eb, 0.016995 s, 8.17 MB, 84.40 points, the
-best Track C points: 850x faster than the reference, with 45x less memory. Steps 69 to 71 (the
+**Result.** Reference 14.44 s, 367 MB, S 108. Submitted code: step 74 (c55ea87, S 552): step
+71's code (ab83410, S 550) with the four summed columns of a group added in one 256-bit add
+(replica against step 71: −1.05%, 170 of 201 pairs, on full seed 1; −1.19%, 178 of 201, on
+holdout 99). Its one board run, run-4785d0ca4b6a, took 0.016778 s, the fastest Track C time, 2.2%
+under the best run's and inside the board's spread, at 9.38 MB (83.99 points), with Track A slow
+in that dispatch (0.018665 s). Best run: step 71's code, pushed again as 0ad2490,
+run-93a9a47dc0be, 0.017161 s, 8.04 MB, S 550, 84.43 points, the best Track C points: about 840x
+faster than the reference, with 46x less memory; Track A and B ran slow in that dispatch
+(0.018175 and 0.086961 s). Steps 72 and 73 (943254b and 905584e: the name table's key slots from a
+32-byte boundary and `KEEP` aligned to 64 bytes, then the add on top) read −0.41% and −0.90% on
+the replica but ran 0.020345, 0.021108 and 0.021423 s on the box, about 20% over step 71's code,
+with Track A at its usual speed (0.015925 and 0.015605 s) in two of those dispatches. 0ad2490 put
+step 71's code back, and step 74 is the add alone. Steps 69 to 71 (the
 inbox takeover bound, 11 cold lines fewer) measured as step 68's speed and memory on the replica,
-and the board does not separate them: eight runs, 0.016946 to 0.018938 s, 8.08 to 10.91 MB. Step
+and the board does not separate them: nine runs, 0.016946 to 0.018938 s, 8.04 to 10.91 MB. Step
 71's first two runs took 0.016946 and 0.018937 s (run-a0a62bc64ea7, run-14481163375d); the second was
-11.7% slower, in a dispatch where Track A and B ran at their usual speed. Its later two took
-0.017651 and 0.017221 s (run-bb1ba5191431, run-a1e0c4753108).
+11.7% slower, in a dispatch where Track A and B ran at their usual speed. Its later three took
+0.017651, 0.017221 and 0.017161 s (run-bb1ba5191431, run-a1e0c4753108, run-93a9a47dc0be).
 - Time comes from three ideas:
   - a simdjson-style parse that reads no field twice (step 7: 0.0979 → 0.0553 s; step 15:
     0.04093 → 0.02677 s, 506 → 282 instructions per record);
@@ -36,7 +41,7 @@ reports through its exit code ("Box probes").
 
 | What moved the score most | Step | Before: run, T, M, S, points | After: run, T, M, S, points |
 |---|---|---|---|
-| Reference → best run | 0 → 68 | The reference: 14.44 s, 367 MB, S 108 | run-38f216bf39eb: 0.016995 s, 8.17 MB, S 561, 84.40 |
+| Reference → best run | 0 → 71 | The reference: 14.44 s, 367 MB, S 108 | run-93a9a47dc0be: 0.017161 s, 8.04 MB, S 550, 84.43 |
 | One name table shared by all threads instead of a serial merge | 2 | Step 1, run-0a002c9fed81: 0.444796 s, 145.12 MB, S 441, 37.24 | run-ce648adbb50f: 0.124558 s, 13.3 MB, S 460, 61.30 |
 | `vpmovmskb` kept opaque to LLVM, with step 6's SIMD bitmaps | 7 | Step 5, run-e999df62b7ec: 0.0979 s, 13.55 MB, S 528, 63.39 | run-e351b1a1c034: 0.0553 s, 16.76 MB, S 691, 67.78 |
 | A per-record fast path | 15 | Step 14b, run-bf0222333138: 0.04093 s, 15.47 MB, S 755, 71.12 | run-db85f475f012: 0.02677 s, 15.99 MB, S 914, 74.96 |
@@ -60,8 +65,9 @@ Lines were priced in points:
 | 69 | 0 (one constant) | A shorter heap tail past the margin; T and the max of 20 runs unchanged | Within the noise |
 | 70 | −9 | The same speed and memory on the replica | +0.053 S |
 | 71 | −2 | The same speed and memory on the replica | +0.012 S |
-| 72 | +4 | The replica's −0.41% of T | +0.045 T, −0.024 S |
-| 73 | +2 | The replica's −0.90% of T against step 72 | +0.098 T, −0.012 S |
+| 72 | +4 | The replica's −0.41% of T; on the box about 20% slower, reverted with step 73 | Expected +0.045 T, −0.024 S |
+| 73 | +2 | The replica's −0.90% of T against step 72 | Expected +0.098 T, −0.012 S |
+| 74 | +2 on step 71 | Step 73's add alone: the replica's −1.05% and −1.19% of T against step 71 | About +0.12 T, −0.012 S |
 
 Every step from the reference to the current version, with the live-board run that measured it.
 Points are the board's 50·log10(K). Reruns of one commit spread about 3%, with outliers of up to
@@ -155,9 +161,10 @@ their own, or their run is not in the log; their numbers are left out rather tha
 | 68 | 9514121 (later runs from 718f0af, 008c49b, 1a5a6ba, f86d9cc, 631ec7f and 4eaa885) | Step 67 with five constants that lower the memory peak by one charge batch, no line changed (`REGION_IDS` 1,000,001, `STACK_USED` 20 KB, rows for 3 standard deviations, an 896 KB `MARGIN`, `MAIN_EXTRA` 68), so that main charges 13 batches instead of 14 (replica: mem.sh modes 7.47/7.71 against 7.74/7.97 MB, T −0.30% to −0.39%); the board does not separate it from step 67. The first run came in a DISTURBED dispatch (Track A 0.018259 s, Track B 0.147443 s), the fifth with A and B slow too (0.020424 and 0.098793 s); the seventh is of 4eaa885, review comments and three `wrapping_sub`s with a byte-identical `.text`. The second is the best Track C points | run-02a3e11c78a6, run-38f216bf39eb, run-137fddfd6960, run-1ccf760146d4, run-0d8969fcc7aa, run-95d412f8e619, run-1aeb0c93304f | 0.017481, 0.016995, 0.01709, 0.017287, 0.021217, 0.017176, 0.017198 | 8.09, 8.17, 8.33, 8.16, 10.49, 8.74, 8.1 | 561 | 84.13, 84.40, 84.25, 84.22, 80.90, 83.99, 84.30 |
 | 69 | 45920b7 | Step 68 with an inbox taken over at 2 × threads buffers instead of 4 ×, so that a lagging owner's inbox holds at most 24 buffers at 12 threads, not 48 (replica: heap use past the margin p98 863 → 774 KB, T −0.08% to +0.07%; against step 68 (c-merge-2), T +0.05%, 95 of 201, and a max of 20 runs of 7.78 against 7.72 MB: no gain). Its run peaked at 10.2 MB with Track B slow in the same dispatch (0.097053 s) | run-887c4d6042f4 | 0.017107 | 10.2 | 561 | 83.36 |
 | 70 | 4c101fb (later runs from 3c2e860 and 285539d) | Step 69 with nine cold lines fewer: two counters (`faulted`, `merged`) and `Shared::slots` gone, the output in one statement, the Dockerfile's RUN line in three lines (replica against step 68: median −0.03% over eight pairings; mem.sh medians 7.48-7.49 MB on both sides). All three runs came in dispatches our log marks disturbed (Track A 0.020219, 0.02239 and 0.020461 s; Track B 0.119599 s in the third) | run-fa4d938c45de, run-e6e4ae7ad1df, run-e984f02ad1c8 | 0.017703, 0.017218, 0.018938 | 8.09, 8.08, 8.43 | 552 | 84.05, 84.36, 83.14 |
-| 71 | ab83410 (later runs from ae81227, bf4f03c and 8f57770) | Step 70 in two fewer cold lines: the empty pair buffers from one closure, and `run`'s run count folded into `mean` (replica against step 70: median +0.07%, inside the ±0.4% build-to-build spread; memory unchanged). Its first run is the fastest Track C time, 0.3% under step 68's best and inside the board's spread, and peaked at 10.91 MB in a dispatch where Track A and B ran slow (0.017747 and 0.079848 s). The second, from ae81227 (docs only, the same code), was 11.7% slower than the first in a dispatch where Track A and B ran at their usual speed (0.015809 and 0.065617 s, B's best points). The later two, from bf4f03c and 8f57770 (Track C unchanged), lie within step 68's runs. Submitted until step 72 | run-a0a62bc64ea7, run-14481163375d, run-bb1ba5191431, run-a1e0c4753108 | 0.016946, 0.018937, 0.017651, 0.017221 | 10.91, 8.87, 9.23, 8.38 | 550 | 83.24, 82.93, 83.52, 84.21 |
-| 72 | 943254b | Step 71 with the name table's key slots used from the first one at a multiple of 32 bytes (8 spare slots; malloc aligns to 16), so that no bucket's 32-byte load straddles two cache lines (perf: 1.5M split loads a run without it), and `KEEP` aligned to 64 bytes; +4 lines (replica, 201 pairs against step 71: −0.41%, 146 of 201; memory, max of 20 runs, 7.80 MB). Its one run came with Track A slow too (0.018303 s), the board does not show the step | run-255af69db8ef | 0.020345 | 7.9 | 554 | 82.63 |
-| 73 | 905584e | Step 72 with a group's four summed columns (count, id sum, amount sum, bytes) first in its totals and added in one 256-bit add, where LLVM had made one 128-bit add and two scalar ones; +2 lines (replica, 201 pairs against step 72: −0.90%, 151 of 201; on step 72's work before the merge, seed 1 −0.84% over four pairings and holdout 99 −0.93%; memory, 20 runs, median 7.48 MB, max 8.95 MB, one spike of a kind the base shows too). **The submitted code**. Its one run was 24% over step 68's best in a dispatch where Track B also ran 19% over its best (0.07793 s) | run-a173e945b66c | 0.021108 | 8.17 | 556 | 82.07 |
+| 71 | ab83410 (later runs from ae81227, bf4f03c, 8f57770 and 0ad2490) | Step 70 in two fewer cold lines: the empty pair buffers from one closure, and `run`'s run count folded into `mean` (replica against step 70: median +0.07%, inside the ±0.4% build-to-build spread; memory unchanged). Its first run is the fastest Track C time, 0.3% under step 68's best and inside the board's spread, and peaked at 10.91 MB in a dispatch where Track A and B ran slow (0.017747 and 0.079848 s). The second, from ae81227 (docs only, the same code), was 11.7% slower than the first in a dispatch where Track A and B ran at their usual speed (0.015809 and 0.065617 s, B's best points). The third and fourth, from bf4f03c and 8f57770 (Track C unchanged), lie within step 68's runs. The fifth, from 0ad2490, which put this code back after steps 72 and 73, is the best Track C points, in a dispatch where Track A and B ran slow (0.018175 and 0.086961 s). Submitted until step 72, and again from 0ad2490 until step 74 | run-a0a62bc64ea7, run-14481163375d, run-bb1ba5191431, run-a1e0c4753108, run-93a9a47dc0be | 0.016946, 0.018937, 0.017651, 0.017221, 0.017161 | 10.91, 8.87, 9.23, 8.38, 8.04 | 550 | 83.24, 82.93, 83.52, 84.21, 84.43 |
+| 72 | 943254b | Step 71 with the name table's key slots used from the first one at a multiple of 32 bytes (8 spare slots; malloc aligns to 16), so that no bucket's 32-byte load straddles two cache lines (perf: 1.5M split loads a run without it), and `KEEP` aligned to 64 bytes; +4 lines (replica, 201 pairs against step 71: −0.41%, 146 of 201; memory, max of 20 runs, 7.80 MB). Its one run came with Track A slow too (0.018303 s); with step 73's two, the box ran it about 20% slower than step 71's code, and it was reverted with step 73 in 0ad2490 | run-255af69db8ef | 0.020345 | 7.9 | 554 | 82.63 |
+| 73 | 905584e | Step 72 with a group's four summed columns (count, id sum, amount sum, bytes) first in its totals and added in one 256-bit add, where LLVM had made one 128-bit add and two scalar ones; +2 lines (replica, 201 pairs against step 72: −0.90%, 151 of 201; on step 72's work before the merge, seed 1 −0.84% over four pairings and holdout 99 −0.93%; memory, 20 runs, median 7.48 MB, max 8.95 MB, one spike of a kind the base shows too). Submitted until 0ad2490. Its first run was 24% over step 68's best in a dispatch where Track B also ran 19% over its best (0.07793 s); the second, from 5fc484e (Track C unchanged), took 0.021423 s with Track A at its usual speed (0.015605 s). Reverted to step 71's code in 0ad2490 (step 71's row) | run-a173e945b66c, run-96722aea1a68 | 0.021108, 0.021423 | 8.17, 8.1 | 556 | 82.07, 81.95 |
+| 74 | c55ea87 | Step 71's code with step 73's add alone (c-vadd-only): a group's four summed columns first in its totals and added in one 256-bit add, without step 72's aligned loads; +2 lines (replica, 201 pairs against step 71: −1.05%, 170 of 201, on full seed 1 and −1.19%, 178 of 201, on holdout 99; memory, 20 runs, median 7.48 MB, max 7.91 MB). **The submitted code**. Its one run is the fastest Track C time, 1.0% under step 71's fastest and inside the board's spread, at 9.38 MB, with Track A slow in that dispatch (0.018665 s) | run-4785d0ca4b6a | 0.016778 | 9.38 | 552 | 83.99 |
 
 Two more runs of step 32's code were in a DISTURBED and a SLOW BOX dispatch: run-87e294d71310
 (0.022429 s) and run-dc9ee4598ca3 (0.021796 s, 11.28 MB).
@@ -169,8 +176,22 @@ dispatch for A and B); run-84ffefa565f7 0.021882 s, 10.77 MB, 81.04, and run-f93
 fall in step 35's range (0.021639 to 0.022423 s), so the pass cost no speed; it cost points
 through S (429 → 469).
 
-**The submitted code is step 73 (c-align-2, 905584e), S 556**, on step 72 (c-hunt-3, 943254b, S
-554): two changes to the hot loop's memory accesses.
+**The submitted code is step 74 (c-vadd-only, c55ea87), S 552**: step 71's code with step 73's
+add alone. A group's totals put the four summed columns first (count, id sum, amount sum and
+bytes), and `parse_run` adds them in one 256-bit add; step 72's aligned loads are not in it (`git
+merge-file` of step 73's work onto step 71, without the aligned-load hunks). Replica, the PGO
+build, 201 pairs against step 71's builds: −1.05% (170 of 201) on full seed 1 and −1.19% (178 of
+201) on holdout 99; memory, 20 runs, median 7.48 MB, max 7.91 MB. The gate passed, with the
+seed-1 hash d8088b1cd42b… at 1, 3, 7 and 12 CPUs. S 550 → 552. Board: run-4785d0ca4b6a, 0.016778
+s, 9.38 MB, 83.99 points, the fastest Track C time, 1.0% under step 71's fastest
+(run-a0a62bc64ea7, 0.016946 s) and 2.2% under the best run's, inside the board's spread, with
+Track A slow in that dispatch (0.018665 s) and Track B at its usual speed (0.066207 s). Its 9.38
+MB peak is over the replica's 20 runs (max 7.91 MB), as single board peaks of steps 66 and 71
+were (10.77 and 10.91 MB). With one run, the step rests on the replica's pairs; that
+run points at step 72's loads, not the add, as the cause of steps 72 and 73's slow runs.
+
+**Steps 72 and 73 (c-hunt-3, 943254b, S 554; c-align-2, 905584e, S 556), reverted in 0ad2490**:
+two changes to the hot loop's memory accesses.
 - *Step 72.* `add` uses a table's key slots from the first one at a multiple of 32 bytes: `run`
   reserves 8 slots more, and `add` takes `keys[start..start + slots]` with `start =
   align_offset(32).min(8)` (malloc aligns to 16, so without it a bucket's 32-byte load could
@@ -185,9 +206,14 @@ through S (429 → 469).
   before the merge, seed 1 −0.84% over four pairings and holdout 99 −0.93%. Memory, 20 runs:
   median 7.48 MB, max 8.95 MB, one spike of a kind the base shows too. S 554 → 556.
 - *Board.* Step 72's run-255af69db8ef, 0.020345 s, 7.9 MB, 82.63 points, with Track A slow too
-  (0.018303 s); step 73's one run, 0.021108 s (run-a173e945b66c, 82.07 points), was 24% over step 68's best in a dispatch where Track B also ran 19% over its best (0.07793 s). Both rest on the replica's pairs.
+  (0.018303 s); step 73's run-a173e945b66c, 0.021108 s, 82.07 points, with Track B 19% over its
+  best (0.07793 s), and run-96722aea1a68 (pushed as 5fc484e), 0.021423 s, 81.95 points. Track A
+  ran at its usual speed in the last two dispatches (0.015925 and 0.015605 s), so the slow runs
+  were C's own: about 20% over step 71's code, which had run 0.016946 to 0.017651 s in three of its
+  four runs before step 72. 0ad2490 put step 71's code back, and its run, run-93a9a47dc0be, took 0.017161 s, 8.04
+  MB, 84.43 points, the best Track C points. Step 74 then took step 73's add alone ("Lessons").
 
-**Step 71 (ccompact-3, ab83410), S 550, submitted until step 72**: step 68 with the inbox takeover
+**Step 71 (ccompact-3, ab83410), S 550, submitted until step 72 and from 0ad2490 until step 74**: step 68 with the inbox takeover
 bound halved (step 69) and eleven lines fewer in cold code (steps 70 and 71), on top of a review
 of step 68's code with its machine code (4eaa885, step 68's row). The parse, the tables and the
 memory constants are step 68's ("What each step taught", steps 69 to 71). Replica, two PGO
@@ -1248,6 +1274,7 @@ The last three run one copy of the code with different constants, so they carry 
 | Only the page of zeros after each mapping, nothing else (steps 70 and 71 work) | replica, 201 pairs | +0.03% (94 of 201): free, so the fold's cost is in its parse, not in the padding |
 | The min and max in `count` as `.min()` and `.max()` instead of two `if`s, −5 lines (steps 70 and 71 work) | replica, two pairings of 201 pairs on full seed 1 | +2.55% (39 of 201) and +2.51% (46 of 201): a cmov and two stores every record, where the branches are almost never taken |
 | Five pairs of independent `let`s as tuple `let`s, −5 lines on top of step 71's two (ccompact-4) | replica, two PGO builds a side, eight pairings of 201 pairs; plain builds' `.text` | The same machine code (`.text` byte-identical), median +0.03%, S +0.042 points. Not pushed, as a review risk: a code review of this track had asked for tuple bindings to be split, and these put unrelated values in one line. The worker's `(totals, taken)` as one tuple `let` also put a second 14 KB copy of the totals on its stack |
+| The name table's key slots used from a 32-byte boundary and `KEEP` aligned to 64 bytes, so that no hot load straddles two cache lines (step 72, 943254b; also inside step 73) | replica, 201 pairs against step 71; board | Replica −0.41% (146 of 201). Board 0.020345, 0.021108 and 0.021423 s (run-255af69db8ef, run-a173e945b66c, run-96722aea1a68), about 20% over step 71's code, with Track A at its usual speed in two of the three dispatches: reverted in 0ad2490 (run-93a9a47dc0be, 0.017161 s) |
 | The profile-guided build trained at full scale (`c_join.py --scale full` in the Dockerfile's training run) instead of on the sample | replica, three pairings of 201 pairs | T +0.16%, +0.28% and +0.27%: no gain (Track A had measured +0.23%) |
 | LLVM flags on the profile-guided build: `-x86-cmov-converter=false`, `-inline-threshold=500`, `-unroll-threshold=600` | replica | Each within the build-to-build spread of PGO builds: no gain |
 | Each thread's own inbox taken before its hand-off, so the buffer pool refills before fresh buffers are allocated (on step 58) | replica | Median 10.14-10.16 MB against 10.15-10.18, max 10.34 and 10.62 against 10.52 and 10.41: no change |
@@ -1347,6 +1374,12 @@ The last three run one copy of the code with different constants, so they carry 
   the replica confirmed the whole change (step 46: −2.13%).
 - **An in-process probe of two code versions is a hint, not a result.** Step 41 read 1.3 ms; the
   replica measured the change end to end at 0.17 ms (step 42).
+- **The replica and the box can disagree on a layout.** Step 72's aligned loads read −0.41% over
+  201 replica pairs, and the box ran them about 20% slower: 0.020345 to 0.021423 s in three runs
+  of steps 72 and 73, with Track A at its usual speed in two of those dispatches, against 0.017161
+  s for the revert's run. The same CPU did not settle a change that rests on where data falls
+  against cache lines. A regression of that size on the board is reverted within one dispatch, as
+  0ad2490 was, and the parts of a step are then pushed apart (step 74, the add alone).
 
 ## What we learned about the box
 
@@ -1491,13 +1524,13 @@ own build, with 0 of 10 failing, and its cuts on two builds (67750ee11c0d… and
 step 71 on two builds of its exact source (d170b81fcd40… and
 c4f9a2f7d275…), with the seed-1 hash at 1, 3, 7 and 12 CPUs and every mutant's exit code
 unchanged. Five fresh full seeds (7101, 7202, 7303, 7404 and 7505) gave the reference's output at
-1 and 8 CPUs on local builds of step 70's cuts and of step 71. Steps 72 and 73, step 73 the
-submitted code, each passed the gate on its PGO build, with the seed-1 hash d8088b1cd42b… at 1,
-3, 7 and 12 CPUs.
+1 and 8 CPUs on local builds of step 70's cuts and of step 71. Steps 72 and 73, reverted
+in 0ad2490, and step 74, the submitted code, each passed the gate on its PGO build, with the
+seed-1 hash d8088b1cd42b… at 1, 3, 7 and 12 CPUs.
 
 **Hidden-seed stability** (replica, Mon 2 Nov, 11:27-12:05 UTC). The final scores seeds we have
-not seen, so step 70's code (285539d's track-c, S 552; steps 71 to 73 change two cold lines, two
-loads' alignment and the totals' add), in two PGO builds made as the Dockerfile makes them, ran 20 fresh full seeds,
+not seen, so step 70's code (285539d's track-c, S 552; steps 71 and 74 change two cold lines and the
+totals' add), in two PGO builds made as the Dockerfile makes them, ran 20 fresh full seeds,
 9101-9120, from the organisers' generator, each generated, measured and deleted. Per seed and
 build: 11 runs (median), 5 consecutive runs (T the mean of the middle 3, as the final) and mem.sh
 5 (max, as the final), with a seed-1 control after every seed. Points use the board's formula with
@@ -1543,8 +1576,8 @@ Two more checks, with programs kept outside the repo (the second on step 49's co
   (odds 1.1e-3), not 44. Run again on Mon 2 Nov on 73 datasets: those six, full seeds 101-130,
   211, 212 and 7101, 7202, 7303, 7404 and 7505, and sample seeds 401-430 (1,460 configurations;
   `add`, `hash_words` and `KEEP` are step 71's line for line, and `field` differs
-  only at the very end of a file; steps 72 and 73 move where `add`'s key slots start, align `KEEP`
-  and add the totals in one vector, but compare the same bits in the same buckets). Its core, condensed, for one thread count (`threads` and `slots`
+  only at the very end of a file; step 74 adds the totals in one vector, and compares the same bits
+  in the same buckets). Its core, condensed, for one thread count (`threads` and `slots`
   as `run` sizes them; `hashes` holds the distinct names' hashes, `fill` the names per bucket):
 
   ```rust
@@ -1612,7 +1645,8 @@ Step 39 also checked `objdump | grep -c vpinsrb` = 0.
   four pairings against step 64, where mem.sh put both modes one batch lower; step 69's bound
   −0.08% to +0.07% over four pairings on step 64's code and +0.05% on step 68's, step 70's cuts a
   median of −0.03% over eight pairings against step 68, and step 71 a median of +0.07% against
-  step 70).
+  step 70; step 72 −0.41% against step 71 and step 73 −0.90% against step 72, both reverted when
+  the box ran them about 20% slower, and step 74 −1.05% and −1.19% against step 71).
 - **Probes** (see "Box probes"): before the replica, in-process A/B probes on the box. A pass is
   run once as a warm-up, then 8 times, ABBA ABBA between the shipped code and the variant, and the
   probe exits with the difference in 0.1 ms units. Both modes see the same box state, so a 0.4 ms
@@ -1635,10 +1669,12 @@ Step 39 also checked `objdump | grep -c vpinsrb` = 0.
   not separate from steps 64 to 67, and steps 69 to 71, 0.016946
   and 0.017107 s, 0.017218 to 0.018938 s in three dispatches our log marks disturbed, and step 71's
   0.018937 s in a dispatch where Track A and B ran at their usual speed, and 0.017651 and 0.017221
-  s, which it does not separate from step 68, step 72 0.020345 s with Track A slow too, and step 73 0.021108 s with Track B 19% over its best. Step 68's run-38f216bf39eb (84.40 points) is the best-points
-  Track C run, ahead of step 70's run-e6e4ae7ad1df (84.36) and step 66's run-434f22246279
-  (84.32), and step 71's run-a0a62bc64ea7 (0.016946 s) the fastest, ahead of step 57's
-  run-c56b067ab64d (0.016978 s). Memory: steps 63 to 71 peaked at 8.08 to 8.45 MB in 20 of their
+  s, which it does not separate from step 68, step 72 0.020345 s with Track A slow too, and step 73 0.021108 s with Track B 19% over its best
+  and 0.021423 s with Track A at its usual speed (both reverted), step 71's code again 0.017161 s,
+  and step 74 0.016778 s. Step 71's run-93a9a47dc0be (84.43 points, from 0ad2490) is the
+  best-points Track C run, ahead of step 68's run-38f216bf39eb (84.40) and step 70's
+  run-e6e4ae7ad1df (84.36), and step 74's run-4785d0ca4b6a (0.016778 s) the fastest, ahead of step
+  71's run-a0a62bc64ea7 (0.016946 s). Memory: steps 63 to 71 peaked at 8.08 to 8.45 MB in 20 of their
   31 runs, against 8.55 to 9.33 MB in 13 of the 15 runs of steps 60 to 62.
 - **Points** in the table are the board's. Point values from replica measurements are estimates
   by the board's formula (M counts on this track), and say so.

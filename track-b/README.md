@@ -2,8 +2,8 @@
 
 **Result.** The submitted code is PERF.md's step 95 (8f57770, S 1174): step 94's (285539d, S
 1172), built with PGO trained at full scale since step 93, with the format fetching the threads'
-states four lines ahead (replica −0.36 ms, −0.54%). Its three board runs took 0.087889 s, a slow run
-(PERF.md, "Two groups of B runs"), 0.07793 s and 0.066258 s (run-fb530d36f965, 81.90 points), inside the board's spread. On 18
+states four lines ahead (replica −0.36 ms, −0.54%). Its six board runs took 0.066207 to 0.087889 s,
+two of them in B's slow group (PERF.md, "Two groups of B runs"); the fastest, run-27f608a48bc6 (0.066207 s, 81.91 points), is 0.9% over the best run, inside the board's spread. On 18
 fresh full seeds, step 94's code scores 81.97 points on average (std 0.08, worst 81.72, by the
 final's middle-3 rule; PERF.md, "How the final number was verified"). The best Track B run,
 run-dec3de0cc771 (push ae81227, which changed no Track B file), is of step 94's code: 0.065617 s at 31.73 MB for 82.01 points, 859× faster than the
@@ -101,7 +101,7 @@ measured", "Box probes since step 47" and "Where the scan's time goes").
 
 There is no index. The queries are read first, the corpus is scanned once in parallel slices of
 whole lines, and every query is answered during that scan, so nothing grows with the corpus. The
-board's M for step 94's four runs was 31.38, 31.73, 31.73 and 31.85 MB, for step 95's three 31.57, 31.68 and 31.8 MB (step 92's machine code's
+board's M for step 94's four runs was 31.38, 31.73, 31.73 and 31.85 MB, for step 95's six 31.52 to 32.06 MB (step 92's machine code's
 seven: 31.31 to 31.81 MB), and the replica's max of 20 runs of its gate build 31.65 MB, under the
 44 MB credit; every step's M is in PERF.md's step table.
 malloc's mmap threshold is fixed at 1 MB, with transparent huge pages off (`mmap::set_up_memory`):

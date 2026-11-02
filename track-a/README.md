@@ -22,7 +22,7 @@ percentiles need every latency of a group, not a running summary.
 
 The reference runs 32.05 s at 228 MB and S 56. The submitted code is step 80 (5fc484e, S 442):
 step 79's code with one more assert, so that a spilled id in a thread's last hour also stops the
-program (replica: noise; no board run yet). Step 79 (bf4f03c, S 441) is step 78's code with the
+program (replica: noise; board 0.015605 s at best, run-5211f4666d16, 87.04 points). Step 79 (bf4f03c, S 441) is step 78's code with the
 inline endpoint lookup also checking the slot after the home slot, −0.70% on 20 fresh seeds and
 about −0.5% on seed 1 on the replica; its four board runs, 0.015925 to 0.018303 s, do not show
 it. Step 78
@@ -789,7 +789,10 @@ hand. All the code is one file, `src/main.rs`.
   values, and their `select_nth_unstable` calls cost about 1.15 ms on the replica (a build that
   skips them, wrong output, ran 6.9% faster). Counting ranks up to 96 or 128 values did not help,
   nor did sorting groups of up to 128 or 256 values, a bracketed sample selection, an AVX2
-  quickselect or a radix select (PERF.md, experiments). A cheaper exact selection for groups of 65 to a few thousand
+  quickselect or a radix select (PERF.md, experiments). Keeping only each percentile's window of
+  values, from a histogram built during the scatter, kept 12.7% of them but ran +16% on one
+  thread's pass-2 core: the histogram pass, one random bucket update per record, costs about what
+  the selection saves. A cheaper exact selection for groups of 65 to a few thousand
   values is still the next thing to try.
 - **The memory peak.** The board read 18.79 to 19.8 MB in six runs of step 56's engine and 18.15
   to 19.18 MB in the seventeen runs of steps 61 to 66 that report it, and the final scoring takes the largest of five
@@ -805,5 +808,7 @@ hand. All the code is one file, `src/main.rs`.
   later line falls in it. We built it twice, with pass 2 run in chunks between rounds of the parse,
   and both lost on the replica: the first cut the peak (17.76 against 19.05 MB) but ran T +2.5% at
   S 556, net −0.9 points; the second ran T +4.2% with M +1.7 MB at S 522, net −1.5, as the
-  per-thread values buffers, one hour in size, keep the peak (PERF.md, experiments). A version
-  that pays would need a pass 2 without an hour-sized buffer per thread.
+  per-thread values buffers, one hour in size, keep the peak (PERF.md, experiments). A third,
+  lean design stopped at its first measurement: the finer slice schedule it needs cost +3.3% to
+  +4.7% by itself, and one finalizer closes an hour in about 0.6 ms while the parse ends one every
+  0.13 ms. A version that pays would need a pass 2 without an hour-sized buffer per thread.

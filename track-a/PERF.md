@@ -2,8 +2,10 @@
 
 **Result.** The reference runs 32.05 s at 228 MB and S 56. The submitted code is step 80
 (5fc484e, S 442): step 79's with one more assert, after pass 2's hour loop, so that a spilled id
-in a thread's last hour also stops the program (replica, seed 1 −0.12% and −0.05%: noise; no
-board run yet). Step 79 (bf4f03c, S 441) is step 78's code with the inline endpoint lookup also
+in a thread's last hour also stops the program (replica, seed 1 −0.12% and −0.05%: noise). Its first
+board run took 0.015605 s (run-5211f4666d16, 87.04 points), 1.1% under step 78's best and inside
+the board's spread; the next two took 0.018175 s, with Track B slow too, and 0.018665 s, with B
+and C at their usual speed. Step 79 (bf4f03c, S 441) is step 78's code with the inline endpoint lookup also
 checking the slot after the home slot, −0.70% on 20 fresh seeds (17 of 20 faster) and about −0.5%
 on seed 1 on the replica; of its four board runs, three came in dispatches where another track ran
 slow too and the fourth, 0.015925 s (run-c2cdd6401dd4, 86.78 points), lies within step 78's normal
@@ -174,7 +176,7 @@ file mean ours, among team SALAAR's runs.
 | 77 | 008c49b (second run from 1a5a6ba, Track A unchanged) | Step 76 without its line-head hunk (replica +0.04% against step 75: equal, in five fewer lines) | run-eb078ed3a0a7, run-0b59d8b4b145 | 0.015816, 0.015546 | 18.73, 18.04 | 436 | 86.84, 87.19 |
 | 78 | 631ec7f (later runs from 4eaa885, 45920b7, 4c101fb, 3c2e860, 285539d, ab83410 and ae81227, Track A unchanged) | Step 77 with one `assert_eq!` per hour that bounds the scatter on a malformed latency; review fixes (replica −0.05% against step 77: equal). Submitted until step 79. Runs 1, 3 and 8 normal, the other five in slow dispatches | run-a6a3de2bdaca, run-7ec1a7779d3f, run-1a7f895d269e, run-34a31f6fe454, run-16fa13a9f87a, run-6865a81880be, run-de92c8943b9f, run-1d4590b7ab6a | 0.015946, 0.017015, 0.015777, 0.020219, 0.02239, 0.020461, 0.017747, 0.015809 | 18.44, 18.59, 18.35, 18.16, 18.48, 18.31, 18.42, 18.27 | 437 | 86.81, 86.07, 86.95, 84.30, 83.11, 84.13, 85.65, 86.94 |
 | 79 | bf4f03c (later runs from 8f57770, 943254b and 905584e, Track A unchanged) | Step 78 with `Interner::find` also checking the slot after the home slot (replica: 20 fresh seeds −0.70%, 17 of 20 faster; seed 1 about −0.5%, 201 pairs a build). Submitted until step 80. The first three runs slow, with B slow too in the first two (0.087774 and 0.087889 s) and C in the third (0.020345 s); the fourth within step 78's normal runs | run-2e49db69e87b, run-696083c574fa, run-16a28cf72358, run-c2cdd6401dd4 | 0.017124, 0.016903, 0.018303, 0.015925 | 18.91, 18.55, 18.58, 18.5 | 441 | 85.90, 86.12, 85.25, 86.78 |
-| 80 | 5fc484e | Step 79 with one `assert!` after pass 2's hour loop that a thread's counts are all taken back, so a spilled id in its last hour stops the program too; +1 line (replica, two PGO builds against step 79's, 201 pairs: seed 1 −0.12% and −0.05%, holdout 99 +0.33% and +0.15%, seed 9107 −0.13% and +0.29%: noise, the code is after the hot loop). **The submitted code**. No board run yet | | | | 442 | |
+| 80 | 5fc484e (later runs from 0ad2490 and c55ea87, Track A unchanged) | Step 79 with one `assert!` after pass 2's hour loop that a thread's counts are all taken back, so a spilled id in its last hour stops the program too; +1 line (replica, two PGO builds against step 79's, 201 pairs: seed 1 −0.12% and −0.05%, holdout 99 +0.33% and +0.15%, seed 9107 −0.13% and +0.29%: noise, the code is after the hot loop). **The submitted code**. The first run is 1.1% under step 78's best, inside the board's spread; the second came with Track B slow too (0.086961 s), the third with B and C at their usual speed (0.066207 and 0.016778 s) | run-5211f4666d16, run-3d7e9ccd326b, run-2307ace3495e | 0.015605, 0.018175, 0.018665 | 18.31, 18.51, 18.38 | 442 | 87.04, 85.33, 85.08 |
 
 **The submitted code is step 80 (a-short-assert, 5fc484e), S 442**: step 79 with one cold
 assert after pass 2's hour loop, `assert!(counts.iter().all(|&c| c == 0), "requests.log: bad
@@ -185,8 +187,11 @@ take-back comment now says that a spill onto an id that was handed out is not ca
 joins that id's group and the line is wrong. Replica, two PGO builds against step 79's, 201 pairs:
 seed 1 −0.12% and −0.05%, holdout 99 +0.33% and +0.15%, seed 9107 −0.13% and +0.29%, inside the
 ±0.3% noise band; memory, max of 20 runs, 18.67 and 18.64 MB against 18.77 and 18.51. S 441 →
-442. A lookup that also probes the slot `id` hashes a name under 8 bytes to (S 443) lost on seed 1
-(+0.38% and +0.37%) for −1.7% on seed 9107; it was not kept.
+442. Board: run-5211f4666d16, 0.015605 s, 18.31 MB, 87.04 points, then 0.018175 and 0.018665 s
+(run-3d7e9ccd326b, run-2307ace3495e), the first of those with Track B slow too; the step rests on
+the gate, not on speed. A lookup that also probes the slot `id` hashes a name under 8 bytes to
+(S 443) lost on seed 1 (+0.38% and +0.37%) for −1.7% on seed 9107; it was not kept
+(experiments).
 
 **Step 79 (stab-a-2, bf4f03c), S 441, submitted until step 80**: step 78 with `Interner::find`, the
 inline endpoint lookup, also checking the slot after the home slot, so that a key displaced by one
@@ -1394,7 +1399,11 @@ What lost, by family (each number is from a row of the table below):
 - Fewer malloc arenas: `M_ARENA_MAX=1`, −0.75 MB and +1.1 ms; set to 2 by `mallopt`, −0.30 MB of
   expected peak for T +0.63%.
 - Hours closed during the parse, so that not every record is held at once: two designs, both
-  exact; the better one ran +2.5% T for 17.76 against 19.05 MB, about −0.9 points net.
+  exact; the better one ran +2.5% T for 17.76 against 19.05 MB, about −0.9 points net. A third,
+  lean design was killed at its first measurement: the finer slice schedule alone cost +3.3% to
+  +4.7%.
+- Cheaper percentiles for the large groups: windows kept from a histogram, +16% on one thread's
+  pass-2 core, as the histogram pass costs about what the selection saves.
 
 | Experiment | Result |
 |---|---|
@@ -1535,6 +1544,9 @@ What lost, by family (each number is from a row of the table below):
 | Hours closed during the parse, so that not every record is held at once: a first design, with an exact fallback for out-of-order lines (a-stream, step 78 work) | Exact, but slower. Its best variant ran +2.5% T, for a highest of 20 peaks of 17.76 MB against 19.05 MB, at S 556: about −0.9 points net. Its bare schedule (variant s1) ran +3.4% T at S 524: about −0.7 points |
 | Hours closed during the parse, a second design (a-stream2, step 78 work): 8 rounds of one pair of slices a thread; the thread that parses a round's last pair closes, under a mutex, every run below the second-highest hour seen so far, and closed hours go to pass 2 between pairs; if a later line falls below a closed hour, the whole run is redone in one round | +4.20 and +4.17% (14 and 25 of 201 won, two PGO builds a side), about 1.7 MB more memory (20 peaks a build: 19.32 to 20.93 MB against 17.64 to 18.95 MB), S 522: about −1.5 points net. The 8 rounds of slices alone cost +3.21%. The peak moves to the end of the parse, where 12 values buffers, the last rounds' records and most of the output coexist: with a values buffer per thread, the output and the buffers alone come within 1 to 1.5 MB of today's peak. Both designs were byte-exact on 210 adversarial and 468 unseen-seed runs |
 | The LLVM flags `-x86-cmov-converter=false`, `-inline-threshold=500` and `-unroll-threshold=600`, each alone on the PGO build (step 78 work) | Each within the spread between PGO builds of one source on the replica: no gain |
+| Only the percentile windows of groups of more than 64 values kept: a log-linear histogram of 240 buckets during pass 2's scatter, then the exact selection on the kept values (a-win, step 78 work) | Not built. A one-thread microbenchmark of seed 1's pass-2 core (72 hours, 5,937 such groups, 1.97M values; every p50, p95 and p99 equal): 19.3 ms against 16.7 (+16%). It keeps 12.7% of the values, but the histogram pass costs 5.1 ms, the windows 1.7, the filtered scatter 1.9 more and the selection 2.6: 11.3 ms against 8.58 for today's selection. The histogram reads and writes one random bucket per record of the hour, not only of the large groups, and 124 buckets left it at 5.0 ms, so the cost is per record, not the buckets' cache footprint. A two-cursor scatter written with `if` compiled to branches and ran 36.6 ms |
+| A lookup that also probes the slot `id` hashes a name under 8 bytes to, after `find` misses its two slots (a-short, step 79 work, S 443) | Replica, two PGO builds against step 79's, 201 pairs: seed 1 +0.38% and +0.37% (87 and 86 of 201 won), holdout 99 +0.17% and +0.19% (within the noise), seed 9107 −1.76% and −1.59%. Only `/` and `/health` are under 8 bytes in the generator's catalogue of 1,842 endpoints, and their popularity ranks are drawn per seed, so a hidden seed sends them about 0.11% of its lines on average (seed 9107's 12.4% is about a 1-in-920 draw): about +0.002 points even if it were free, against about 0.0074 a line |
+| Hours closed during the parse, a third, lean design (a-lead, step 78 work): one engine with a closing window, the same engine with closing off as the fallback, one finalizer buffer, slices in file order | Killed at its first measurement, the finer slice schedule it needs, alone: step 78's code with only the slice count changed, against step 77's build, ran +3.28% with 240 slices of about 1 MB, +3.77% with the log released every 8 pairs, +4.74% also without the records' `madvise`, and +4.59% with step 78's schedule kept for the PGO training run (12 to 17 of 201 won). So the schedule costs 3.3 to 4.7% by itself, not through the releases or the training. The rest could not pay for it: one finalizer needs about 0.6 ms an hour while the parse ends an hour every 0.13 ms, so six or more would run during the parse; at best about 9 large hours still close after it, for a peak of about 15.6 MB (+0.59 points), against −0.36 to −0.50 points of T for the schedule and −0.4 to −0.7 for 50 to 90 more lines: net negative |
 
 ## Lessons
 

@@ -20,17 +20,23 @@ names must be counted per country over all records.
 
 ## Where the time goes on the box
 
-The reference runs 14.44 s at 367 MB and S 108. The submitted code is PERF.md step 73 (905584e,
-S 556): step 71's (ab83410, S 550) with the name table's key slots used from a 32-byte boundary
-and `KEEP` aligned to 64 bytes, so that no hot load straddles two cache lines (step 72, replica
-−0.41%), and a group's four sums added in one 256-bit add (step 73, replica −0.90% against step
-72). Step 72's one board run, 0.020345 s, came with Track A slow too, and step 73's one run, 0.021108 s (run-a173e945b66c, 82.07 points), was 24% over step 68's best in a dispatch where Track B also ran 19% over its best (0.07793 s): both rest on the replica's pairs. On 20 fresh full seeds, step 70's code scores 84.02 points
-on average (std 0.19, worst 83.49; PERF.md, "How the final number was verified"). The best Track C points are still step 68's (9514121, S 561): 0.016995 s at 8.17 MB, 84.40
-points (run-38f216bf39eb), 850x faster than the reference, with 45x less memory. Steps 69 to 71
+The reference runs 14.44 s at 367 MB and S 108. The submitted code is PERF.md step 74 (c55ea87,
+S 552): step 71's code (ab83410, S 550) with a group's four sums added in one 256-bit add
+(replica −1.05% on full seed 1 and −1.19% on holdout 99, against step 71). Its one board run took
+0.016778 s (run-4785d0ca4b6a), the fastest Track C time, inside the board's spread, at 9.38 MB
+(83.99 points). Steps 72 and 73 had put the name table's key slots on a 32-byte boundary and
+`KEEP` on 64 bytes, then the add on top: the replica read −0.41% and −0.90%, but the box ran them
+about 20% slower (0.020345 to 0.021423 s in three runs, with Track A at its usual speed in two of
+those dispatches), so 0ad2490 put step 71's code back and step 74 is the add alone. On 20 fresh
+full seeds, step 70's code scores 84.02 points on average (std 0.19, worst 83.49; PERF.md, "How
+the final number was verified"). The best Track C points are step 71's code's, from 0ad2490:
+0.017161 s at 8.04 MB, 84.43 points (run-93a9a47dc0be), about 840x faster than the reference,
+with 46x less memory. Steps 69 to 71
 change the inbox takeover bound and cut 11 cold lines; the replica measures them at step 68's
-speed and memory, and the board does not separate them (eight runs, 0.016946 to 0.018938 s, 8.08
+speed and memory, and the board does not separate them (nine runs, 0.016946 to 0.018938 s, 8.04
 to 10.91 MB; step 71's first two runs took 0.016946 and 0.018937 s, the second 11.7% slower in a
-dispatch where Track A and B ran at their usual speed, and its later two 0.017651 and 0.017221 s). The time comes from a simdjson-style parse, cuts
+dispatch where Track A and B ran at their usual speed, and its later three 0.017651, 0.017221 and
+0.017161 s). The time comes from a simdjson-style parse, cuts
 and a record path that trust spec 2.2, and a join and a name count with no shared state (steps
 7-49); the memory from four faulting threads that charge whole 64-page batches (steps 60-63 and
 68). Details: PERF.md.
@@ -712,9 +718,10 @@ Evidence, on the binary the Dockerfile builds:
   reference at 1 and 8 CPUs. Step 68's
   review (4eaa885) changed comments and wrote three subtractions as `wrapping_sub`, with
   byte-identical `.text` (PERF.md, steps 68 to 71).
-- **Steps 72 and 73 (step 73 is the submitted code)**, which align the name table's key slots and
-  `KEEP` and add a group's four sums in one vector, each passed the gate on its PGO build, with the
-  seed-1 hash at 1, 3, 7 and 12 CPUs (PERF.md, steps 72 and 73).
+- **Steps 72 to 74 (step 74 is the submitted code; 72 and 73 were reverted)**, which align the
+  name table's key slots and `KEEP` (72) and add a group's four sums in one vector (73, and 74
+  without 72), each passed the gate on its PGO build, with the seed-1 hash at 1, 3, 7 and 12 CPUs
+  (PERF.md, steps 72 to 74).
 - **Points on unseen seeds.** Step 70's code, two PGO builds, 20 fresh full seeds (9101-9120): 84.02
   points on average (std 0.19, worst 83.49 on seed 9104), every output equal to the organisers'
   reference. The worst seeds are bursts of slow runs on the shared box, not different inputs
@@ -819,6 +826,7 @@ box's: those rows were hints for what to build next, not decisions on the scorin
 | The min and max by `.min()` and `.max()`, −5 lines | Replica: +2.55% and +2.51% | Two `if`s, almost never taken |
 | The profile-guided build trained at full scale | Replica: +0.16% to +0.28% | Training on sample seed 7 |
 | `-x86-cmov-converter=false`, `-inline-threshold=500` or `-unroll-threshold=600` | Replica: within the noise of PGO builds | Only the loop alignment (technique 9) |
+| The name table's key slots on a 32-byte boundary and `KEEP` on 64 bytes, so that no hot load straddles two cache lines (step 72) | Replica: −0.41%. Board: 0.020345 to 0.021423 s in three runs, about 20% over step 71's code: reverted | Step 71's layout; the four sums' vector add went in alone (step 74) |
 
 ## With another 24 hours
 
