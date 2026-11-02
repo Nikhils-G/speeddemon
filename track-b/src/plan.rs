@@ -157,8 +157,8 @@ impl Plan {
         let (always, entries, anchors) = (Mutex::new(always), OnceLock::new(), OnceLock::new());
         par(3, &|i| match i {
             0 => {
-                let mut numbers = (vec![u32::MAX; lines], Vec::with_capacity(lines));
                 let (group, mut entries_of) = csr(entry_pairs, bool_terms + 1);
+                let mut numbers = (vec![u32::MAX; lines], Vec::with_capacity(lines));
                 for e in &mut entries_of {
                     e.answer = number(&mut numbers, e.answer as u32) as u16;
                 }
@@ -314,9 +314,9 @@ fn term_order(kind: &[u8], sample_df: &[u32]) -> Vec<u32> {
     // The start of each key's run of new ids, then each term, in id order, takes
     // the next id of its key's run in place of its key: no scatter over the terms
     // (sorting the old ids with `csr` and inverting that order took two, 0.29 ms).
-    let mut start = vec![0; 2 * most as usize + 2];
+    let mut start = vec![0; (2 * most + 2) as usize];
     keys.iter().for_each(|&k| start[k as usize + 1] += 1);
-    (1..start.len()).for_each(|k| start[k] += start[k - 1]);
+    start.iter_mut().fold(0, |sum, s| (*s += sum, *s).1);
     for k in &mut keys {
         let s = &mut start[*k as usize];
         (*k, *s) = (*s, *s + 1);
@@ -355,7 +355,11 @@ pub fn csr<T, I: DoubleEndedIterator<Item = (u32, T)>>(
     let mut start = vec![0u32; keys + 1];
     // for_each, not a for loop: a flat_map then loops over each slice directly.
     pairs().for_each(|(k, _)| start[k as usize] += 1);
-    (1..=keys).for_each(|k| start[k] += start[k - 1]);
+    // The running sum in a register (the tuple's second element reads the sum just
+    // stored): `start[k] += start[k - 1]` loaded it back from memory at every key,
+    // 5 to 7 cycles of store forwarding each (in a phase probe 0.16 and 0.22 ms of
+    // the plan's two groupings, on 53,000 and 76,000 keys).
+    start.iter_mut().fold(0, |sum, s| (*s += sum, *s).1);
     let mut values = Vec::with_capacity(start[keys] as usize);
     pairs().rev().for_each(|(k, value)| {
         start[k as usize] -= 1;

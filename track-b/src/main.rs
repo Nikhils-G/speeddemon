@@ -167,8 +167,7 @@ extern "C" fn main(_: i32, _: *const *const u8) -> i32 {
         // The ids go on in the next slice, and stay below MAX_DOCS.
         let next = slices.get(i + 1).map_or(doc + 1, |s| s.2);
         // A slice's ids also fit the first-id log (see MIN_SLICES).
-        let fits = doc - first < 1 << 16;
-        let ok = slices[0].2 == 0 && next == doc + 1 && doc < MAX_DOCS && fits;
+        let ok = slices[0].2 == 0 && next == doc + 1 && doc < MAX_DOCS && doc - first < 1 << 16;
         assert!(ok, "ids 0, 1, ... below 2^20, 2^16 a slice");
         if i == 0 {
             let is_full = |&s: &u64| s >> SUM_BITS >= FIRST_IDS;
@@ -208,11 +207,13 @@ extern "C" fn main(_: i32, _: *const *const u8) -> i32 {
     });
 
     // Formatted in parallel, one range of lines per thread, then written in order.
-    let file = std::fs::File::create(format!("{out_dir}/results.txt")).expect("results.txt");
+    // A reference to the path, not the String: that code size keeps the scan's hot functions at
+    // their 64-byte offsets (al.sh) now that Scan::new is smaller.
+    let file = std::fs::File::create(&format!("{out_dir}/results.txt")).expect("results.txt");
     let chunks = par(parts, &|p| format_part(&plan, &results, p, parts));
-    // This thread writes them while the workers drop the corpus's pages and give
-    // the big tables back to the kernel, none of which is read any more: the exit,
-    // on one core, then has fewer pages to unmap and free.
+    // This thread writes them while the workers drop the corpus's pages and give the
+    // big tables back to the kernel (not the plan's 0.6 MB of entries: that release did
+    // not pay for its line), none of which is read again: the exit has fewer to free.
     par(parts, &|p| {
         if p == 0 {
             for chunk in &chunks {
@@ -237,8 +238,6 @@ extern "C" fn main(_: i32, _: *const *const u8) -> i32 {
         unsafe { mmap::release(&vocab.table[share(vocab.table.len())]) };
         // SAFETY: as above.
         unsafe { mmap::release(&plan.anchored[share(plan.anchored.len())]) };
-        // SAFETY: as above.
-        unsafe { mmap::release(&plan.entries[share(plan.entries.len())]) };
     });
     // Done: exit without freeing the tables and logs, one free at a time.
     std::process::exit(0)
@@ -299,10 +298,9 @@ fn slices(text: &[u8], parts: usize) -> Vec<(usize, usize, u32)> {
     let cut = |p: usize| line_after(text, text.len() * p / parts);
     let mut cuts: Vec<usize> = (0..=parts).map(cut).collect();
     cuts.dedup();
-    let id = |line: &[u8]| {
-        let tab = line.iter().position(|&b| b == b'\t');
-        parse_id(&line[..tab.expect("docs.txt: a line without a TAB")])
-    };
+    // A line's id: its bytes before the TAB, or before the LF if it has none (such a
+    // line then stops the program: in parse_id, or in the scan, which wants the TAB).
+    let id = |line: &[u8]| parse_id(line.split(|&b| b == b'\t' || b == b'\n').next().unwrap());
     // The number of lines: the last line's id + 1.
     let last = text.rsplit(|&b| b == b'\n').nth(1);
     let lines = last.map_or(0, |line| id(line) + 1);

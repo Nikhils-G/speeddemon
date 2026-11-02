@@ -47,7 +47,10 @@ pub struct Scan<'a> {
 impl<'a> Scan<'a> {
     pub fn new(vocab: &'a Vocab, plan: Option<&'a Plan>, df: &'a [AtomicU32]) -> Self {
         let answers = plan.map_or(0, |p| p.line_of.len());
-        let wide = written_zeros(4 * (plan.map_or(0, |p| p.rows) + 1));
+        // Plain zeroed vectors: here the heaps hand out memory the setup freed, which
+        // calloc clears, so no page is read before it is written (writing the zeros by
+        // hand took the same 10,900 page faults on seed 1, and the same time).
+        let wide = vec![0; 4 * (plan.map_or(0, |p| p.rows) + 1)];
         Scan {
             vocab,
             plan,
@@ -64,7 +67,7 @@ impl<'a> Scan<'a> {
             anchors: Vec::new(),
             doc: 0,
             answers: Answers {
-                state: written_zeros(answers),
+                state: vec![0; answers],
                 // One more: `add` always writes the slot after the logged ids.
                 log: vec![0; answers * FIRST_IDS as usize + 1],
                 logged: 0,
@@ -473,14 +476,6 @@ impl<'a> Scan<'a> {
         // The sink row is never read, so never cleared.
         self.wide[..4 * plan.rows].fill(0);
     }
-}
-
-/// `len` zeros, written now: a lazily zeroed page that is read first faults
-/// again when written, and that fault flushes the TLB of every thread.
-/// `black_box` keeps LLVM from turning the writes into a lazily zeroed
-/// allocation (calloc).
-fn written_zeros(len: usize) -> Vec<u64> {
-    std::iter::repeat_n(std::hint::black_box(0), len).collect()
 }
 
 /// One thread's answers.

@@ -30,9 +30,9 @@ fn split_lines(chunk: &'static [u8], padded: &'static [u8], seed: u64) -> Split 
     for line in chunk.split_inclusive(|&b| b == b'\n') {
         let (start, phrase) = (terms.len(), line[0] == b'P');
         // The words after `BOOL ` or `PHRASE "`, before LF or `"` and LF.
-        let (from, to) = if phrase { (8, 2) } else { (5, 1) };
+        // A BOOL line's first term has OR (see Queries).
+        let (from, to, mut op) = if phrase { (8, 2, 0) } else { (5, 1, OR) };
         let words = &line[from..line.len() - to];
-        let mut op = if phrase { 0 } else { OR };
         for (i, word) in words.split(|&b| b == b' ').enumerate() {
             if phrase || i % 2 == 0 {
                 let at = (word.as_ptr() as usize - padded.as_ptr() as usize) as u32;
@@ -92,7 +92,7 @@ struct Key {
 }
 
 /// Splits the lines in parallel, then builds the perfect hash of their terms and
-/// gives each term its id: the short ones numbered as `place_regions` places
+/// gives each term its id: the short ones numbered as `Phf::fill` places
 /// their keys, the long ones after them (an id is not a slot). `padded` is the
 /// file and mmap::PAD zero bytes.
 pub fn parse_queries(padded: &'static [u8], threads: usize) -> (Queries, Vocab) {
@@ -251,6 +251,38 @@ impl Phf {
         };
         place(h, pilot as u64, self.shift)
     }
+
+    /// Places the buckets of `keys` (a thread's distinct keys, by bucket) in `region`,
+    /// the table's slots from `base`, and writes their keys and ids, numbered from
+    /// `first` (`file` holds the keys' bytes): largest buckets first, each with the
+    /// first pilot whose slots are all free (`find_pilot`). A key can reach few slots
+    /// (find_pilot's candidates move it by one fixed step each), which may all be
+    /// taken: its bucket then goes first in another attempt. (A failed attempt's keys
+    /// left in the table are harmless: a token only looks up the final slot of its
+    /// own term.) False if 4 attempts fail.
+    fn fill(self, keys: &[Key], region: &mut [u128], base: usize, first: u128, file: Long) -> bool {
+        let bmask = self.pilot.len() as u64 - 1;
+        let same_bucket = |a: &Key, b: &Key| (a.hash ^ b.hash) & bmask == 0;
+        let mut order: Vec<_> = keys.chunk_by(same_bucket).collect();
+        order.sort_unstable_by_key(|b| Reverse(b.len()));
+        let slot = |e: &Key, pilot| place(e.hash, pilot, self.shift) - base;
+        (0..4).any(|_| {
+            let (mut taken, mut next) = (vec![false; region.len()], first);
+            let mut set = |e: &Key, pilot, v| replace(&mut taken[slot(e, pilot)], v);
+            let failed = order.iter().position(|bucket| {
+                let Some(pilot) = find_pilot(bucket, &mut set) else {
+                    return true;
+                };
+                self.pilot[(bucket[0].hash & bmask) as usize].store(pilot as u16, Relaxed);
+                for e in *bucket {
+                    region[slot(e, pilot)] = key_of(file, *e) | next << 96;
+                    next += 1;
+                }
+                false
+            });
+            failed.inspect(|&i| order[..=i].rotate_right(1)).is_none()
+        })
+    }
 }
 
 /// The slot of the hash h with the pilot `pilot`: below 2^(64 - shift).
@@ -268,10 +300,9 @@ fn dedup_keys(splits: &[Split], q: usize, bmask: u64) -> Vec<Key> {
     let mine = || splits.iter().flat_map(|s| &s.keys[range(s)]);
     // The buckets of these groups numbered in order from 0: the bucket's bits
     // above the group's, then its group.
-    let bucket =
-        |e: &Key| ((e.hash & bmask) >> 6) as usize * g.len() + (e.hash & 63) as usize - g.start;
+    let bucket = |h: u64| ((h & bmask) >> 6) as usize * g.len() + (h & 63) as usize - g.start;
     let buckets = (bmask as usize + 1) / GROUPS * g.len();
-    let (start, mut keys) = csr(|| mine().map(|e| (bucket(e) as u32, *e)), buckets);
+    let (start, mut keys) = csr(|| mine().map(|e| (bucket(e.hash) as u32, *e)), buckets);
     for b in 0..buckets {
         keys[start[b] as usize..start[b + 1] as usize].sort_unstable_by_key(|e| e.hash);
     }
@@ -293,49 +324,11 @@ fn find_pilot(bucket: &[Key], mut set: impl FnMut(&Key, u64, bool) -> bool) -> O
     })
 }
 
-/// Places the buckets of `keys` (a thread's distinct keys, by bucket) in `region`,
-/// the table's slots from `base`, and writes their keys and ids, numbered from
-/// `first`: largest buckets first, each with the first pilot whose slots are all
-/// free (`find_pilot`). A key can reach few slots (find_pilot's candidates move it
-/// by one fixed step each), which may all be taken: its bucket then goes first in
-/// another attempt. (A failed attempt's keys left in the table are harmless: a
-/// token only looks up the final slot of its own term.) False if 4 attempts fail.
-fn place_regions(
-    keys: &[Key],
-    region: &mut [u128],
-    base: usize,
-    first: u128,
-    phf: Phf,
-    file: Long,
-) -> bool {
-    let bmask = phf.pilot.len() as u64 - 1;
-    let same_bucket = |a: &Key, b: &Key| (a.hash ^ b.hash) & bmask == 0;
-    let mut order: Vec<_> = keys.chunk_by(same_bucket).collect();
-    order.sort_unstable_by_key(|b| Reverse(b.len()));
-    let slot = |e: &Key, pilot| place(e.hash, pilot, phf.shift) - base;
-    (0..4).any(|_| {
-        let (mut taken, mut next) = (vec![false; region.len()], first);
-        let mut set = |e: &Key, pilot, v| replace(&mut taken[slot(e, pilot)], v);
-        let failed = order.iter().position(|bucket| {
-            let Some(pilot) = find_pilot(bucket, &mut set) else {
-                return true;
-            };
-            phf.pilot[(bucket[0].hash & bmask) as usize].store(pilot as u16, Relaxed);
-            for e in *bucket {
-                region[slot(e, pilot)] = key_of(file, *e) | next << 96;
-                next += 1;
-            }
-            false
-        });
-        failed.inspect(|&i| order[..=i].rotate_right(1)).is_none()
-    })
-}
-
 impl Vocab {
     /// The vocabulary of the query terms in `splits`, with attempt `seed`'s hash,
     /// the term words of each split with their ids, and `splits`; or None when
     /// the build needs another seed: two different keys with one hash, or a
-    /// thread whose regions four placements could not fill (`place_regions`).
+    /// thread whose regions four placements could not fill (`Phf::fill`).
     /// Every third seed also doubles the table
     /// (parse_queries says why the seeds end).
     ///
@@ -363,11 +356,11 @@ impl Vocab {
             long.entry(term).or_insert(id);
         }
         // The table is allocated zeroed, so empty slots cost nothing until they
-        // are read. Long term `id` has the slot `slots + id - distinct`.
+        // are read. Long term `id` has the slot `slots + id - distinct`, and the
+        // last slot, that of the id `count`, takes the long tokens of no term.
         let count = distinct + long.len();
         let mut table = vec![0u128; slots + long.len() + 1];
-        (distinct..count).for_each(|id| table[slots + id - distinct] = (id as u128) << 96);
-        table[slots + long.len()] = (count as u128) << 96;
+        (distinct..=count).for_each(|id| table[slots + id - distinct] = (id as u128) << 96);
         let pilot: &[_] = Vec::leak((0..=bmask).map(|_| AtomicU16::new(0)).collect());
         let seed = seed.wrapping_mul(SEEDS);
         let phf = Phf { seed, pilot, shift };
@@ -385,7 +378,7 @@ impl Vocab {
             // SAFETY: table[base..base + len] are thread q's regions, which no other
             // thread touches until the barrier below; base + len <= slots.
             let mine = unsafe { std::slice::from_raw_parts_mut(table.add(base), len) };
-            let placed = place_regions(&groups[q], mine, base, first, phf, file);
+            let placed = phf.fill(&groups[q], mine, base, first, file);
             // The ids need every thread's pilots and slots.
             barrier.wait();
             // The info of a key's slot. A slot that holds another key means that
