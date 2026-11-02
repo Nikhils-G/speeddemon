@@ -37,7 +37,7 @@
 compile_error!("track-a needs AVX2: build with RUSTFLAGS=\"-C target-cpu=native\"");
 
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::*};
-use std::{arch::x86_64::*, fs::File, io::Error, os::fd::AsRawFd, sync::OnceLock, thread};
+use std::{arch::x86_64::*, cell::Cell, fs::File, io::Error, os::fd::AsRawFd, sync::OnceLock};
 
 /// A record is `endpoint id << 21 | error << 20 | latency`: 11 bits of endpoint id,
 /// bit 20 set for a 5xx status, and 20 bits of latency. A latency of 7 or more digits
@@ -120,7 +120,7 @@ fn main() {
     // after the last LF before byte len * p / slices (0 if there is none; the last
     // cut is the end of the log, which ends with an LF). Cuts never decrease, so the
     // slices hold every line once; two cuts in one line give an empty slice.
-    let threads = thread::available_parallelism().map_or(1, |n| n.get());
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
     // Two pairs of slices per thread, taken in file order from a shared counter.
     // With one slice each, the scheduler sometimes put two threads on one CPU and
     // they kept it for the whole parse (4 of 30 runs on the test server, dev build):
@@ -140,11 +140,11 @@ fn main() {
     // merge (done by the last thread to finish pass 1, once every part is in) and
     // goes on with pass 2, so no thread is joined or started between the passes.
     let parts: Vec<OnceLock<Part>> = (0..slices).map(|_| OnceLock::new()).collect();
-    // The merge's hand-off (`Merged`), then the endpoints in byte order of their names
-    // (`Order`), which the merging thread sorts after it.
-    let (merged, order) = (OnceLock::<Merged>::new(), OnceLock::<Order>::new());
-    // How many hours still read each part's records: the hour that brings its
-    // part's count to zero gives the rest of them back.
+    // The merge's hand-off (`Merged`), then (id, name) of every endpoint in byte order
+    // of the names (`names`), which the merging thread sorts after it.
+    let (merged, order) = (OnceLock::<Merged>::new(), OnceLock::new());
+    // How many runs of each part are still to be placed: the run that brings its
+    // part's count to zero gives the part's records back.
     let readers: Vec<AtomicUsize> = parts.iter().map(|_| AtomicUsize::new(0)).collect();
     // Shared counters: the next slice to parse, the next hour of the queue, the threads
     // done with pass 1, the next share of the output's page-table entries to drop, and
@@ -158,7 +158,7 @@ fn main() {
     // (phase 6). The log's address goes as a number: a raw pointer cannot go to another
     // thread.
     let (written, base_addr) = (std::sync::Barrier::new(threads), base as usize);
-    let total = thread::scope(|s| {
+    let total = std::thread::scope(|s| {
         let work = || {
             // 3. Pass 1.
             // This thread's records, each part taking the start of what is left.
@@ -277,8 +277,7 @@ fn main() {
                 for (at, &count) in start[1..].iter_mut().zip(&counts) {
                     (*at, sum) = (sum, sum + count as u32);
                 }
-                let values = &mut values[..sum as usize];
-                for (k, &Run { begin, part, end }) in runs.iter().enumerate() {
+                for &Run { begin, part, end } in runs {
                     let parsed = parts[part].wait();
                     let mut escapes = parsed.escapes[begin.escape..].iter();
                     for &record in &parsed.records[begin.at..end] {
@@ -288,22 +287,22 @@ fn main() {
                         };
                         let at = &mut start[(record >> ENDPOINT_SHIFT) as usize + 1];
                         // SAFETY: each id's cursor stays below the next id's
-                        // start, which is at most values.len(): the counts
-                        // above are this hour's.
+                        // start, which is at most this hour's record count (the
+                        // counts above are this hour's), which fits `values`.
                         unsafe { *values.get_unchecked_mut(*at as usize) = latency };
                         *at += 1;
                     }
-                    // The records are no longer needed once placed: the hour that
-                    // reads a part's last ones gives them all back. Parts are small
-                    // (a 48th of the log), so one call per part is soon enough, and
-                    // every call is a round of TLB shootdowns. Runs of one part are
-                    // adjacent: after its last one, the part has one reader less.
-                    // (A part's escapes are a few KB: no whole page to give back.)
-                    let last = runs.get(k + 1).is_none_or(|next| next.part != part);
-                    if last && readers[part].fetch_sub(1, AcqRel) == 1 {
+                    // The records are no longer needed once placed: the last run of a
+                    // part to be placed gives them all back. Parts are small (a 48th of
+                    // the log), so one call per part is soon enough, and every call is
+                    // a round of TLB shootdowns. (A count per run, not per hour and
+                    // part: seed 1 has 1,101 runs against 134 such pairs, so about 80
+                    // more decrements a thread, at the same speed on the replica. A
+                    // part's escapes are a few KB: no whole page to give back.)
+                    if readers[part].fetch_sub(1, AcqRel) == 1 {
                         given.fetch_add(size_of_val(parsed.records), Relaxed);
-                        // SAFETY: anonymous memory (see `free`) that every hour reading
-                        // it has placed (the AcqRel count orders their loads before this
+                        // SAFETY: anonymous memory (see `free`) that every run of the part
+                        // has placed (the AcqRel count orders their loads before this
                         // call), so nothing reads it again.
                         unsafe { release(parsed.records) };
                     }
@@ -355,7 +354,7 @@ fn main() {
 }
 
 /// The merge between the passes: every part's runs sorted by (hour, part) and cut
-/// into hours, each part's reader count, and the output mapped at a size no output
+/// into hours, each part's run count, and the output mapped at a size no output
 /// can exceed. The endpoints' name order follows, from `names`.
 fn merge(parts: &[OnceLock<Part>], readers: &[AtomicUsize], output: &File) -> Merged<'static> {
     // Every part's runs, in order of hour then part. Every part is in (this is the
@@ -365,13 +364,10 @@ fn merge(parts: &[OnceLock<Part>], readers: &[AtomicUsize], output: &File) -> Me
     for (part, p) in parts.iter().enumerate() {
         let ends = p.wait().starts.windows(2).map(|w| (w[0], w[1].at));
         runs.extend(ends.map(|(begin, end)| Run { begin, part, end }));
+        // Each run is one reader of its part: the last one placed gives the part back.
+        readers[part].store(p.wait().starts.len() - 1, Relaxed);
     }
     runs.sort_unstable_by_key(|run| (run.begin.key, run.part));
-    // The runs of one hour in one part are now adjacent: each such group is one
-    // reader of the part.
-    for runs in runs.chunk_by(|a, b| (a.begin.key, a.part) == (b.begin.key, b.part)) {
-        readers[runs[0].part].fetch_add(1, Relaxed);
-    }
     // Cut into hours. Leaked: pass 2 reads the runs until the exit.
     let same_hour = |a: &Run, b: &Run| a.begin.key == b.begin.key;
     let hours: Vec<&[Run]> = runs.leak().chunk_by(same_hour).collect();
@@ -402,7 +398,7 @@ fn merge(parts: &[OnceLock<Part>], readers: &[AtomicUsize], output: &File) -> Me
 /// Only once the parse is over, as the merging thread calls it (every part is in,
 /// which orders every parse thread's writes before the call): then each id up to
 /// `count` has its name and key written, and nothing writes the table any more.
-unsafe fn names() -> Order<'static> {
+unsafe fn names() -> Vec<(usize, &'static [u8])> {
     // (id, name) of every id handed out (ids start at 1), in byte order of the names:
     // first by the first 32 bytes of the keys as two big-endian numbers, so few
     // comparisons need the names, then by the full bytes on ties. A key has a
@@ -508,9 +504,6 @@ struct Run {
 /// length once known.
 type Merged<'a> = (Vec<&'a [Run]>, usize, Vec<OnceLock<usize>>);
 
-/// (id, name) of every endpoint, in byte order of the names.
-type Order<'a> = Vec<(usize, &'a [u8])>;
-
 /// Parses two slices of the mapped log side by side, one line of each in turn: a
 /// line's end, and so the next line's start, waits on its loads, and the other
 /// slice's line fills the wait. The records go into the start of `free`, which keeps
@@ -559,10 +552,8 @@ unsafe fn parse(chunks: [&[u8]; 2], free: &mut &'static mut [u32]) -> [Part; 2] 
     // go back to the kernel at the end (the caller's contract): their endpoint names
     // were copied (see Interner::add).
     let mut step = |k: usize| unsafe {
-        let line = &mut unparsed[k].start;
-        if *line >= unparsed[k].end {
-            return false;
-        }
+        let (line, end) = (&mut unparsed[k].start, unparsed[k].end);
+        let true = *line < end else { return false }; // slice k is done
         // Lines from one shard arrive in time order, so most lines repeat the
         // previous line's hour. Its bytes "MM-DDTHH" (5..13) decide: every timestamp
         // lies in one 72-hour span (the spec), so lines that share them share the year.
@@ -581,8 +572,7 @@ unsafe fn parse(chunks: [&[u8]; 2], free: &mut &'static mut [u32]) -> [Part; 2] 
         // endpoint: 6.6% of seed 1's lines end past it, against 7.6%. The endpoint
         // starts one byte after the method's space.
         let load = |p: *const u8| _mm256_loadu_si256(p.cast());
-        let spaces = |at: usize| movemask(_mm256_cmpeq_epi8(load(line.add(31 + at)), space));
-        let window = spaces(0) | spaces(32) << 32;
+        let window = eq_mask(load(line.add(31)), space) | eq_mask(load(line.add(63)), space) << 32;
         let first = window.trailing_zeros() as usize;
         let from = line.add(32 + first);
         // The window without its lowest bit: its lowest bit is now the second space
@@ -592,11 +582,8 @@ unsafe fn parse(chunks: [&[u8]; 2], free: &mut &'static mut [u32]) -> [Part; 2] 
         let len = (rest.trailing_zeros() as usize).wrapping_sub(first + 1);
         // Endpoints that end in the window (93% of lines) are looked up inline; the
         // rest, and the inline lookup's misses, go the long way.
-        let found = (rest != 0).then(|| TABLE.find(&[load(from), load(from.add(32))], from, len));
-        let (endpoint, len) = match found {
-            Some((endpoint, true)) => (endpoint, len),
-            _ => TABLE.id(from),
-        };
+        let hit = (rest != 0).then(|| TABLE.find(&[load(from), load(from.add(32))], from, len));
+        let (endpoint, len) = hit.flatten().map_or_else(|| TABLE.id(from), |id| (id, len));
         // The latency: 1 to 10 digits from 5 bytes after the endpoint (its space,
         // the three status digits and a space), to the LF, all within the 16 bytes
         // from there: up to 6 digits (98.8% of lines) are converted where they lie, and
@@ -674,10 +661,11 @@ static DIGITS: ([i8; 72], [i16; 36]) = (
 /// No endpoint byte is a space or zero, so equal keys mean equal endpoints.
 type Key = [__m256i; 4];
 
-/// `vpmovmskb`: bit i of the mask is the top bit of byte i of `v`.
-fn movemask(v: __m256i) -> u64 {
+/// `vpcmpeqb` then `vpmovmskb`: bit i of the mask is set where byte i of `a` equals
+/// byte i of `b`.
+fn eq_mask(a: __m256i, b: __m256i) -> u64 {
     // SAFETY: AVX2 is enabled for this build.
-    unsafe { _mm256_movemask_epi8(v) as u32 as u64 }
+    unsafe { _mm256_movemask_epi8(_mm256_cmpeq_epi8(a, b)) as u32 as u64 }
 }
 
 /// The record's latency for the `count` ASCII digits at `at`, 7 to 10 (1.2% of lines;
@@ -695,11 +683,10 @@ fn movemask(v: __m256i) -> u64 {
 #[cold]
 #[inline(never)]
 unsafe fn parse_digits(at: *const u8, count: usize, escapes: &mut Vec<u32>) -> u32 {
-    let mut latency = 0;
     // SAFETY: at most the 16 readable bytes at `at` (the caller's contract).
-    for &digit in unsafe { std::slice::from_raw_parts(at, count.min(16)) } {
-        latency = latency * 10 + digit.wrapping_sub(b'0') as u64;
-    }
+    let digits = unsafe { std::slice::from_raw_parts(at, count.min(16)) };
+    // '0'..='9' & 15 is the digit; at most 16 digits of at most 15 cannot overflow a u64.
+    let latency = digits.iter().fold(0, |v, &d| v * 10 + (d & 15) as u64);
     escapes.push(latency as u32); // exact: latencies fit 32 bits (the spec)
     ESCAPE
 }
@@ -741,15 +728,15 @@ impl Interner {
     }
 
     /// `id << ENDPOINT_SHIFT` of the endpoint of `len` bytes (0 to 62) at `from`,
-    /// followed by a space, whose first 64 bytes are `bytes`, and whether it is in its
-    /// home slot. Under 8 bytes the last 8 bytes reach before `from`, into the
-    /// method, so the slot is almost never the home one: the compare is exact all the
-    /// same, and a miss goes the long way.
+    /// followed by a space, whose first 64 bytes are `bytes`, if it is in its home
+    /// slot; `None` sends the caller the long way (`id`). Under 8 bytes the last 8
+    /// bytes reach before `from`, into the method, so the slot is almost never the
+    /// home one: the compare is exact all the same, and a miss goes the long way.
     ///
     /// # Safety
     ///
     /// The 8 bytes before `from` and the `len` bytes from it must be readable.
-    unsafe fn find(&self, bytes: &[__m256i; 2], from: *const u8, len: usize) -> (u32, bool) {
+    unsafe fn find(&self, bytes: &[__m256i; 2], from: *const u8, len: usize) -> Option<u32> {
         // SAFETY: AVX2, BMI2 (`bzhi`) and SSE4.2 are enabled (target-cpu=native: the box's
         // i5-13500 has all three; the compile_error! guard checks AVX2, which implies
         // SSE4.2); `from - 8 .. from + len` is readable
@@ -762,11 +749,11 @@ impl Interner {
             let id = self.slots[Self::home(len, first, last)].load(Acquire);
             let at = (id >> (ENDPOINT_SHIFT - 7)) as usize;
             let known = &*self.keys.as_ptr().cast::<u8>().add(at).cast::<Key>();
-            let same = |i: usize| movemask(_mm256_cmpeq_epi8(bytes[i], known[i]));
+            let same = |i: usize| eq_mask(bytes[i], known[i]);
             // Bytes 0..=len must match: the endpoint and its space, which the stored
             // key has at its own length.
             let differ = !(same(0) | same(1) << 32) & _bzhi_u64(!0, len as u32 + 1);
-            (id, differ == 0)
+            (differ == 0).then_some(id)
         }
     }
 
@@ -790,8 +777,7 @@ impl Interner {
             let space = _mm256_set1_epi8(b' ' as i8);
             // The space mask built from two 64-bit halves: as one u128 of the four
             // masks, it compiled to `vpinsrd` inserts on the path of every later step.
-            let mask = |i: usize| movemask(_mm256_cmpeq_epi8(line[i], space));
-            let half = |i: usize| (mask(i) | mask(i + 1) << 32) as u128;
+            let half = |i| (eq_mask(line[i], space) | eq_mask(line[i + 1], space) << 32) as u128;
             // 128 if there is none: a 125-byte endpoint's space is in the 128 bytes.
             let len = (half(2) << 64 | half(0)).trailing_zeros() as usize;
             // Tripwire for the spec's endpoint length: a file that breaks it stops here.
@@ -814,10 +800,10 @@ impl Interner {
                     0 => self.add(&self.slots[i], &key, std::slice::from_raw_parts(from, len)),
                     slot => (slot >> ENDPOINT_SHIFT) as usize,
                 };
+                // The keys are equal when all 128 bytes are: each mask has its 32 bits set.
                 let known = &*self.keys[id].get();
-                let diff = |i: usize| _mm256_xor_si256(known[i], key[i]);
-                let diff = (1..4).fold(diff(0), |all, i| _mm256_or_si256(all, diff(i)));
-                if _mm256_testz_si256(diff, diff) != 0 {
+                let same = |i: usize| eq_mask(known[i], key[i]);
+                if same(0) & same(1) & same(2) & same(3) == 0xFFFF_FFFF {
                     return ((id as u32) << ENDPOINT_SHIFT, len);
                 }
                 i = (i + 1) % SLOTS;
@@ -838,16 +824,14 @@ impl Interner {
     fn add(&self, slot: &AtomicU32, key: &Key, name: &[u8]) -> usize {
         // An id that lost its slot stays this thread's, for its next insert: at most
         // one id per thread is ever unpublished.
-        thread_local!(static SPARE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) });
-        let id = match SPARE.take() {
-            0 => self.count.fetch_add(1, Relaxed) + 1,
-            spare => spare,
-        };
+        thread_local!(static SPARE: Cell<Option<usize>> = const { Cell::new(None) });
+        let fresh = || self.count.fetch_add(1, Relaxed) + 1;
+        let id = SPARE.take().unwrap_or_else(fresh);
         assert!(id < MAX_ENDPOINTS, "requests.log: too many endpoints");
         // SAFETY: the id is this thread's alone until a slot publishes it.
         unsafe { (*self.keys[id].get(), *self.names[id].get()) = (*key, name.to_vec().leak()) };
         let won = slot.compare_exchange(0, (id as u32) << ENDPOINT_SHIFT, Release, Acquire);
-        SPARE.set(if won.is_err() { id } else { 0 }); // (taken above: 0 unless kept here)
+        SPARE.set(won.is_err().then_some(id)); // (taken above: None unless kept here)
         won.map_or_else(|held| (held >> ENDPOINT_SHIFT) as usize, |_| id)
     }
 }
