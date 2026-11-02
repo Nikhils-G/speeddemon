@@ -18,7 +18,9 @@ known, and the record counted one record later; names hashed with AES into one t
 the pairs handed over in buffers, so no atomics and no barriers; and only four threads fault in
 memory. The best run, run-11ac398da908, of step 74's code, took 0.016899 s at 8.00 MB, 84.60 points: about 850x
 faster than the reference with 46x less memory. The submitted code is step 75 (d75329f, S 548):
-step 74's with four cold lines fewer, at the same speed on the replica; its board run is pending.
+step 74's with four cold lines fewer, at the same speed on the replica; its board run,
+run-0754da76d391, took 0.020164 s at 11.0 MB (81.32 points), in a dispatch where Track B ran
+0.079944 s.
 On 20 fresh full seeds, step 70's code (step 74's
 code less two cold lines and the vector add) scores 84.02 points on average (std 0.19),
 and its output matched the organisers' reference on all 20.
@@ -26,7 +28,7 @@ and its output matched the organisers' reference on all 20.
 | | Run | T | M (MB) | S | Points |
 |---|---|---|---|---|---|
 | Reference | | 14.44 s | 367 | 108 | |
-| The submitted code, step 75 (d75329f), step 74 with four cold lines fewer in the setup and the merge | pending | | | 548 | |
+| The submitted code, step 75 (d75329f), step 74 with four cold lines fewer in the setup and the merge | run-0754da76d391 | 0.020164 s, in a dispatch where Track B ran 0.079944 s | 11.0 | 548 | 81.32 |
 | Best run: step 74 (c55ea87), from push 7c45267 | run-11ac398da908 | 0.016899 s | 8.00 | 552 | 84.60 |
 | Its other runs: step 74 (c55ea87), step 71 with a group's four sums in one 256-bit add | run-4785d0ca4b6a, run-22d43fe21a46, run-720b875a4f70 | 0.016778 s, the fastest Track C time, and 0.016847 s, both within the board's spread; 0.019039 s in a dispatch where Track A ran 0.021276 s | 9.38, 9.98, 10.67 | 552 | 83.99, 83.68, 82.06 |
 | 20 fresh full seeds 9101-9120, step 70's code, two PGO builds (replica; PERF.md, "How the final number was verified") | | mean 17.73 ms by the final's rule | median 7.72 (replica; the board reads about 0.33 more) | 552 | mean 84.02, std 0.19, worst 83.49; 20 of 20 equal to the reference |

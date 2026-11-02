@@ -4,14 +4,13 @@ Team SALAAR's entry for [Speed Demon 2026](https://speeddemon.dev). All four tra
 
 | Track | Best board run | T (s) | M (MB) | S | Points | Commit | Docs |
 |---|---|---|---|---|---|---|---|
-| A: Ingest | run-0b59d8b4b145 | 0.015546 | 18.04 | 436 | 87.19 | 1a5a6ba | [README](track-a/README.md), [PERF.md](track-a/PERF.md) |
+| A: Ingest | run-e363238f04fe | 0.015320 | 18.17 | 442 | 87.27 | feda862 | [README](track-a/README.md), [PERF.md](track-a/PERF.md) |
 | B: Index | run-dec3de0cc771 | 0.065617 | 31.73 | 1164 | 82.01 | ae81227 | [README](track-b/README.md), [PERF.md](track-b/PERF.md) |
 | C: Join | run-11ac398da908 | 0.016899 | 8.00 | 548 | 84.60 | 7c45267 | [README](track-c/README.md), [PERF.md](track-c/PERF.md) |
 | D: Traverse | run-15c21ec71a29 | 0.19878 | 122.87 | 589 | 64.17 | 2bf221c | [README](track-d/README.md), [PERF.md](track-d/PERF.md) |
 
 Commit is the push the board built for that run, not always the commit of the code it ran. A's
-best run is of step 77's code (008c49b, S 436), six lines shorter than the final A code (below);
-B's is of step 94's code (285539d, S 1172), ten lines longer than the final B code (below); C's
+best run is of the final A code (below); B's is of step 94's code (285539d, S 1172), ten lines longer than the final B code (below); C's
 of step 74's code (c55ea87, S 552), four lines longer than the final C code (below). The S column
 is the final code's.
 
@@ -21,9 +20,12 @@ is the final code's.
 - **D: Traverse** is built and passes, but we stopped tuning it on October 31: a bidirectional Dijkstra over a CSR graph renumbered in BFS order for locality.
 
 A's final code, 5fc484e (S 442), is step 80: step 79's with one more assert, so that a spilled id
-in a thread's last hour also stops the program (noise on our replica of the box). Its first
-board run took 0.015605 s (run-5211f4666d16, 87.04 points), 1.1% under step 78's best and inside
-the board's spread; its next five, 0.017806 to 0.021276 s, came in disturbed dispatches. Step 79, bf4f03c (S 441), is step 78's with the inline endpoint lookup also checking the
+in a thread's last hour also stops the program (noise on our replica of the box). Its newest
+board run, run-e363238f04fe (0.015320 s, 18.17 MB, 87.27 points), is our best Track A run and the
+fastest Track A time, 0.9% under step 75's run-b6e32914afe1 (0.015462 s); its first took 0.015605 s
+(run-5211f4666d16, 87.04 points), and six others, 0.017806 to 0.021276 s, came in disturbed
+dispatches, among them run-953fd4a9a8a6 (0.020812 s, 17.93 MB, the lowest Track A memory peak on
+the board), from the same dispatch as the best run. Step 79, bf4f03c (S 441), is step 78's with the inline endpoint lookup also checking the
 slot after the home slot, −0.70% on 20 fresh seeds and about −0.5% on seed 1 on the replica. Its
 four board runs, 0.015925 to 0.018303 s (86.78 points at best), do not show that gain: three came
 in dispatches where another track ran slow too. Step 78, 631ec7f (S 437),
@@ -35,9 +37,9 @@ our replica of the box it runs at step 77's speed, −0.05% over four pairings o
 its newest, run-1d4590b7ab6a, ran 0.015809 s (86.94 points), and five of its eight runs came in
 slow dispatches (track-a/PERF.md, step 78).
 
-B's best run is of step 94's code (285539d, S 1172): step 92's with the queries split in one AVX2 pass, built with PGO trained at full scale. It ran 0.065617 s (run-dec3de0cc771, 82.01 points), 0.43% under step 92's best run (run-2116938ec9fc, 0.065903 s), the direction our replica of the box measured but inside the board's spread. The final B code, c2df45a (S 1164), is step 96: step 95's with ten cold lines fewer in the setup and the plan, at step 95's speed on the replica (+0.10% over 12 paired A/Bs, within the PGO builds' spread); its board run is pending. Step 95, 8f57770 (S 1174), is step 94's with the format fetching the threads' states four lines ahead, −0.36 ms (−0.54%) on the replica over 16 paired A/Bs. Its nine board runs took 0.066011 to 0.087889 s; the fastest, run-4acf92b53275 (0.066011 s, 81.94 points), is 0.6% over the best run, inside the board's spread. On 18 fresh full seeds step 94's code scores 81.97 points on average (std 0.08, worst 81.72).
+B's best run is of step 94's code (285539d, S 1172): step 92's with the queries split in one AVX2 pass, built with PGO trained at full scale. It ran 0.065617 s (run-dec3de0cc771, 82.01 points), 0.43% under step 92's best run (run-2116938ec9fc, 0.065903 s), the direction our replica of the box measured but inside the board's spread. The final B code, c2df45a (S 1164), is step 96: step 95's with ten cold lines fewer in the setup and the plan, at step 95's speed on the replica (+0.10% over 12 paired A/Bs, within the PGO builds' spread); its board runs took 0.065770 s (run-ccdf9f5dc176, 31.90 MB, 82.010 points, 0.003 under the best run's 82.013 unrounded, inside noise) and 0.079944 s (run-b130a12b8425, in a disturbed dispatch). Step 95, 8f57770 (S 1174), is step 94's with the format fetching the threads' states four lines ahead, −0.36 ms (−0.54%) on the replica over 16 paired A/Bs. Its nine board runs took 0.066011 to 0.087889 s; the fastest, run-4acf92b53275 (0.066011 s, 81.94 points), is 0.6% over the best run, inside the board's spread. On 18 fresh full seeds step 94's code scores 81.97 points on average (std 0.08, worst 81.72).
 
-C's best run is of step 74's code, c55ea87 (S 552, below), from push 7c45267: 0.016899 s, 8.00 MB, 84.60 points (run-11ac398da908), above step 71's 84.43 (run-93a9a47dc0be, from 0ad2490: ab83410, S 550, step 68 with the inbox bound halved and 11 cold lines fewer, at step 68's speed and memory on the replica) and step 68's 84.40 (run-38f216bf39eb). Steps 72 and 73 had aligned the name table's key slots and `KEEP` so that no hot load straddles two cache lines (replica −0.41%) and added a group's four sums in one 256-bit add (replica −0.90% against step 72), but their three board runs took 0.020345 to 0.021423 s, about 20% over step 71's code, with Track A at its usual speed in two of those dispatches: the replica and the box disagreed on the aligned layout, and 0ad2490 put step 71's code back. The final C code, d75329f (S 548), is step 75: step 74's with four cold lines fewer in the setup and the merge, at step 74's speed on the replica (a mean of −0.03% over eight paired A/Bs; memory the same); its board run is pending. Step 74, c55ea87 (S 552), is step 71's code with the add alone (replica −1.05% on seed 1 and −1.19% on holdout 99). Its four runs took 0.016778 s (run-4785d0ca4b6a, the fastest C time), 0.016847, 0.016899 (the best run) and 0.019039 s (run-720b875a4f70, in a dispatch where Track A ran 21.3 ms), inside the board's spread; three of them peaked at 9.38 to 10.67 MB (83.99, 83.68 and 82.06 points), over the replica's max of 20 runs (7.91 MB), as the board shows for other teams too. On 20 fresh full seeds step 70's code scores 84.02 points on average (std 0.19, worst 83.49).
+C's best run is of step 74's code, c55ea87 (S 552, below), from push 7c45267: 0.016899 s, 8.00 MB, 84.60 points (run-11ac398da908), above step 71's 84.43 (run-93a9a47dc0be, from 0ad2490: ab83410, S 550, step 68 with the inbox bound halved and 11 cold lines fewer, at step 68's speed and memory on the replica) and step 68's 84.40 (run-38f216bf39eb). Steps 72 and 73 had aligned the name table's key slots and `KEEP` so that no hot load straddles two cache lines (replica −0.41%) and added a group's four sums in one 256-bit add (replica −0.90% against step 72), but their three board runs took 0.020345 to 0.021423 s, about 20% over step 71's code, with Track A at its usual speed in two of those dispatches: the replica and the box disagreed on the aligned layout, and 0ad2490 put step 71's code back. The final C code, d75329f (S 548), is step 75: step 74's with four cold lines fewer in the setup and the merge, at step 74's speed on the replica (a mean of −0.03% over eight paired A/Bs; memory the same); its board run, run-0754da76d391, took 0.020164 s at 11.0 MB (81.32 points), in a dispatch where Track B ran 0.079944 s. Step 74, c55ea87 (S 552), is step 71's code with the add alone (replica −1.05% on seed 1 and −1.19% on holdout 99). Its four runs took 0.016778 s (run-4785d0ca4b6a, the fastest C time), 0.016847, 0.016899 (the best run) and 0.019039 s (run-720b875a4f70, in a dispatch where Track A ran 21.3 ms), inside the board's spread; three of them peaked at 9.38 to 10.67 MB (83.99, 83.68 and 82.06 points), over the replica's max of 20 runs (7.91 MB), as the board shows for other teams too. On 20 fresh full seeds step 70's code scores 84.02 points on average (std 0.19, worst 83.49).
 
 ## Checking a track
 

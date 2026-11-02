@@ -22,17 +22,19 @@ percentiles need every latency of a group, not a running summary.
 
 The reference runs 32.05 s at 228 MB and S 56. The submitted code is step 80 (5fc484e, S 442):
 step 79's code with one more assert, so that a spilled id in a thread's last hour also stops the
-program (replica: noise; board 0.015605 s at best, run-5211f4666d16, 87.04 points). Step 79 (bf4f03c, S 441) is step 78's code with the
+program (replica: noise; board 0.015320 s at best, run-e363238f04fe, 18.17 MB, 87.27 points, our
+best Track A run and the fastest Track A time, among seven others from 0.015605 to 0.021276 s). Step 79 (bf4f03c, S 441) is step 78's code with the
 inline endpoint lookup also checking the slot after the home slot, −0.70% on 20 fresh seeds and
 about −0.5% on seed 1 on the replica; its four board runs, 0.015925 to 0.018303 s, do not show
 it. Step 78
 (631ec7f, S 437) is step 77's code, which is step 74's engine in five fewer lines, with one assert
 per hour that keeps pass 2's scatter inside its buffer on a malformed latency ("Error handling"),
-at step 77's speed on the replica (−0.05%, noise). Our best board run is step 77's run-0b59d8b4b145: 0.015546 s,
-18.04 MB, S 436, 87.19 points; step 78's best is run-1a7f895d269e: 0.015777 s, 18.35 MB, S 437,
-86.95 points. The fastest is still run-b6e32914afe1, from step 74's code: 0.015462 s, 18.23 MB,
-S 441, 87.16 points. Both of step 77's runs lie within the spread of that code's runs, so its best
-comes from the five lines and the noise, not from speed. PERF.md has every step and its runs.
+at step 77's speed on the replica (−0.05%, noise). Step 77's best board run is run-0b59d8b4b145: 0.015546 s,
+18.04 MB, S 436, 87.19 points, our best until step 80's run-e363238f04fe; step 78's best is
+run-1a7f895d269e: 0.015777 s, 18.35 MB, S 437, 86.95 points. The fastest until step 80's was
+run-b6e32914afe1, from step 74's code: 0.015462 s, 18.23 MB, S 441, 87.16 points. All of these
+runs lie within the spread of one engine's runs, so the best comes from S and the noise, not from
+speed. PERF.md has every step and its runs.
 
 **Reading the code.** All the code is `src/main.rs`. Read `main`'s phase list (phases 1-6) first,
 then `merge`, `names`, `parse` with `Interner::find`, `id` and `add`, `stats` and `small_ranks`,

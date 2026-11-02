@@ -2,7 +2,9 @@
 
 **Result.** The submitted code is PERF.md's step 96 (c2df45a, S 1164): step 95's code (8f57770,
 S 1174) with ten cold lines fewer in the setup and the plan, at the same speed on the replica
-(+0.10%, within the PGO builds' spread); its board run is pending. The best of step 95's nine
+(+0.10%, within the PGO builds' spread); its board runs took 0.065770 s (run-ccdf9f5dc176,
+31.90 MB, 82.010 points, 0.003 under the best run's 82.013 unrounded) and 0.079944 s
+(run-b130a12b8425, in a disturbed dispatch). The best of step 95's nine
 board runs is run-4acf92b53275: 0.066011 s at 32.14 MB, 81.94 points. The best Track B run,
 run-dec3de0cc771 (0.065617 s at 31.73 MB, 82.01 points, 859× faster than the reference's 56.35 s at
 2,200 MB), is of step 94's code (285539d, S 1172), which step 95 changes by one prefetch in the
@@ -67,7 +69,7 @@ two builds a side, crossed, and the mean decides.
 On the board these steps are within noise. Step 92's machine code ran 0.065903 to 0.098793 s in
 seven runs; its best, run-2116938ec9fc (0.065903 s, 82.01 points), came from push 631ec7f, which
 changed no Track B file. Step 94's best run is 0.43% under it, the direction the replica measured,
-and step 95's best is 0.6% over step 94's; step 96's run is pending. One binary's board runs have spread up to 45% in
+and step 95's best is 0.6% over step 94's; step 96's first run is 0.23% over it. One binary's board runs have spread up to 45% in
 disturbed dispatches (PERF.md, "Reading the numbers").
 
 **Checking the output.** With Docker and Python 3, from the repository's root (root README,

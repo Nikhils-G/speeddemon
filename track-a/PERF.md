@@ -2,9 +2,10 @@
 
 **Result.** The reference runs 32.05 s at 228 MB and S 56. The submitted code is step 80
 (5fc484e, S 442): step 79's with one more assert, after pass 2's hour loop, so that a spilled id
-in a thread's last hour also stops the program (replica, seed 1 −0.12% and −0.05%: noise). Its first
-board run took 0.015605 s (run-5211f4666d16, 87.04 points), 1.1% under step 78's best and inside
-the board's spread; the next five, 0.017806 to 0.021276 s, came in disturbed dispatches. Step 79 (bf4f03c, S 441) is step 78's code with the inline endpoint lookup also
+in a thread's last hour also stops the program (replica, seed 1 −0.12% and −0.05%: noise). Its newest
+board run, run-e363238f04fe (0.015320 s, 18.17 MB, 87.27 points), is our best Track A run and the
+fastest Track A time; its first took 0.015605 s (run-5211f4666d16, 87.04 points), and six others,
+0.017806 to 0.021276 s, came in disturbed dispatches. Step 79 (bf4f03c, S 441) is step 78's code with the inline endpoint lookup also
 checking the slot after the home slot, −0.70% on 20 fresh seeds (17 of 20 faster) and about −0.5%
 on seed 1 on the replica; of its four board runs, three came in dispatches where another track ran
 slow too and the fourth, 0.015925 s (run-c2cdd6401dd4, 86.78 points), lies within step 78's normal
@@ -12,12 +13,13 @@ runs: the board does not show that gain. Step 78 (631ec7f, S 437) is step 77's c
 engine in five fewer lines, with one assert per hour that keeps pass 2's scatter inside its buffer
 on a malformed latency (step 77's build segfaulted on two such logs), at step 77's speed on the
 replica (−0.05%, noise). Our best board
-run is step 77's second, run-0b59d8b4b145: 0.015546 s, 18.04 MB, S 436, 87.19 points, about
-2,060× faster than the reference with about 12.6× less memory. Step 78's best is run-1a7f895d269e
+run is step 80's eighth, run-e363238f04fe: 0.015320 s, 18.17 MB, S 442, 87.27 points, about
+2,090× faster than the reference with about 12.5× less memory; until it, step 77's second,
+run-0b59d8b4b145 (0.015546 s, 18.04 MB, S 436, 87.19 points). Step 78's best is run-1a7f895d269e
 (0.015777 s, 18.35 MB, S 437, 86.95 points), and its newest, run-1d4590b7ab6a (0.015809 s,
-18.27 MB, 86.94 points), is 0.2% slower than it. The fastest Track A time is still
-run-b6e32914afe1, a run of step 75 (step 74's code, comments only): 0.015462 s, 18.23 MB, S 441,
-87.16 points. Steps 75, 77 and 78's normal runs lie within one another's spread: the board cannot
+18.27 MB, 86.94 points), is 0.2% slower than it. The fastest Track A time until step 80's
+best run was run-b6e32914afe1, a run of step 75 (step 74's code, comments only): 0.015462 s,
+18.23 MB, S 441, 87.16 points. Steps 75, 77 and 78's normal runs lie within one another's spread: the board cannot
 tell them apart, and step 77's best comes from S and the noise, not from speed.
 
 Three ideas carry it: a parse that finds each line's fields from one AVX2 mask and looks its
@@ -64,6 +66,7 @@ board run (every run is in the step table below):
 | 77 | Five lines fewer at step 75's speed | run-0b59d8b4b145 | 0.015546 | 18.04 | 436 | 87.19 |
 | 78 | One assert per hour keeps the scatter in bounds on malformed latencies | run-1a7f895d269e | 0.015777 | 18.35 | 437 | 86.95 |
 | 79 | The endpoint lookup also checks the next slot (replica −0.70% on 20 fresh seeds) | run-696083c574fa | 0.016903 | 18.55 | 441 | 86.12 |
+| 80 | One more assert after the hour loop; the submitted code | run-e363238f04fe | 0.015320 | 18.17 | 442 | 87.27 |
 
 From step 75 on, single board runs cannot separate the steps: the replica's paired runs put steps
 75, 77 and 78 at the same speed (steps 77 and 78), and step 79's −0.5 to −0.7% has not shown in
@@ -175,7 +178,7 @@ file mean ours, among team SALAAR's runs.
 | 77 | 008c49b (second run from 1a5a6ba, Track A unchanged) | Step 76 without its line-head hunk (replica +0.04% against step 75: equal, in five fewer lines) | run-eb078ed3a0a7, run-0b59d8b4b145 | 0.015816, 0.015546 | 18.73, 18.04 | 436 | 86.84, 87.19 |
 | 78 | 631ec7f (later runs from 4eaa885, 45920b7, 4c101fb, 3c2e860, 285539d, ab83410 and ae81227, Track A unchanged) | Step 77 with one `assert_eq!` per hour that bounds the scatter on a malformed latency; review fixes (replica −0.05% against step 77: equal). Submitted until step 79. Runs 1, 3 and 8 normal, the other five in slow dispatches | run-a6a3de2bdaca, run-7ec1a7779d3f, run-1a7f895d269e, run-34a31f6fe454, run-16fa13a9f87a, run-6865a81880be, run-de92c8943b9f, run-1d4590b7ab6a | 0.015946, 0.017015, 0.015777, 0.020219, 0.02239, 0.020461, 0.017747, 0.015809 | 18.44, 18.59, 18.35, 18.16, 18.48, 18.31, 18.42, 18.27 | 437 | 86.81, 86.07, 86.95, 84.30, 83.11, 84.13, 85.65, 86.94 |
 | 79 | bf4f03c (later runs from 8f57770, 943254b and 905584e, Track A unchanged) | Step 78 with `Interner::find` also checking the slot after the home slot (replica: 20 fresh seeds −0.70%, 17 of 20 faster; seed 1 about −0.5%, 201 pairs a build). Submitted until step 80. The first three runs slow, with B slow too in the first two (0.087774 and 0.087889 s) and C in the third (0.020345 s); the fourth within step 78's normal runs | run-2e49db69e87b, run-696083c574fa, run-16a28cf72358, run-c2cdd6401dd4 | 0.017124, 0.016903, 0.018303, 0.015925 | 18.91, 18.55, 18.58, 18.5 | 441 | 85.90, 86.12, 85.25, 86.78 |
-| 80 | 5fc484e (later runs from 0ad2490, c55ea87, ec20be3, dfdf6a5 and 7c45267, Track A unchanged) | Step 79 with one `assert!` after pass 2's hour loop that a thread's counts are all taken back, so a spilled id in its last hour stops the program too; +1 line (replica, two PGO builds against step 79's, 201 pairs: seed 1 −0.12% and −0.05%, holdout 99 +0.33% and +0.15%, seed 9107 −0.13% and +0.29%: noise, the code is after the hot loop). **The submitted code**. The first run is 1.1% under step 78's best, inside the board's spread; the second came with Track B slow too (0.086961 s), the third with B and C at their usual speed (0.066207 and 0.016778 s); the last five were in disturbed dispatches | run-5211f4666d16, run-3d7e9ccd326b, run-2307ace3495e, run-229cf6ca54d3, run-bcb2da86c1bf, run-5db9a50d68de | 0.015605, 0.018175, 0.018665, 0.017806, 0.021276, 0.021104 | 18.31, 18.51, 18.38, 18.62, 18.67, 18.91 | 442 | 87.04, 85.33, 85.08, 85.53, 83.59, 83.62 |
+| 80 | 5fc484e (later runs from 0ad2490, c55ea87, ec20be3, dfdf6a5, 7c45267 and feda862, Track A unchanged) | Step 79 with one `assert!` after pass 2's hour loop that a thread's counts are all taken back, so a spilled id in its last hour stops the program too; +1 line (replica, two PGO builds against step 79's, 201 pairs: seed 1 −0.12% and −0.05%, holdout 99 +0.33% and +0.15%, seed 9107 −0.13% and +0.29%: noise, the code is after the hot loop). **The submitted code**. The first run is 1.1% under step 78's best, inside the board's spread; the second came with Track B slow too (0.086961 s), the third with B and C at their usual speed (0.066207 and 0.016778 s); runs two to seven were in disturbed dispatches (the seventh, at 17.93 MB, is the lowest Track A memory peak on the board); the eighth, from the same dispatch as the seventh, is the best Track A run and the fastest Track A time, 0.9% under step 75's run-b6e32914afe1 | run-5211f4666d16, run-3d7e9ccd326b, run-2307ace3495e, run-229cf6ca54d3, run-bcb2da86c1bf, run-5db9a50d68de, run-953fd4a9a8a6, run-e363238f04fe | 0.015605, 0.018175, 0.018665, 0.017806, 0.021276, 0.021104, 0.020812, 0.015320 | 18.31, 18.51, 18.38, 18.62, 18.67, 18.91, 17.93, 18.17 | 442 | 87.04, 85.33, 85.08, 85.53, 83.59, 83.62, 84.00, 87.27 |
 
 **The submitted code is step 80 (a-short-assert, 5fc484e), S 442**: step 79 with one cold
 assert after pass 2's hour loop, `assert!(counts.iter().all(|&c| c == 0), "requests.log: bad
@@ -189,7 +192,11 @@ seed 1 −0.12% and −0.05%, holdout 99 +0.33% and +0.15%, seed 9107 −0.13% a
 442. Board: run-5211f4666d16, 0.015605 s, 18.31 MB, 87.04 points, then 0.018175 and 0.018665 s
 (run-3d7e9ccd326b, run-2307ace3495e), the first of those with Track B slow too, and 0.017806,
 0.021276 and 0.021104 s (run-229cf6ca54d3, run-bcb2da86c1bf, run-5db9a50d68de) in disturbed
-dispatches; the step rests on the gate, not on speed. A lookup that also probes the slot `id` hashes a name under 8 bytes to
+dispatches; then, from push feda862 (docs only), 0.020812 s (run-953fd4a9a8a6, 17.93 MB, 84.00
+points, disturbed; the lowest Track A memory peak on the board) and, in the same dispatch,
+0.015320 s (run-e363238f04fe, 18.17 MB, 87.27 points): the best Track A run and the fastest
+Track A time, 0.9% under step 75's run-b6e32914afe1 and 1.5% under step 77's run-0b59d8b4b145.
+One run inside the spread of the same engine's runs: the step rests on the gate, not on speed. A lookup that also probes the slot `id` hashes a name under 8 bytes to
 (S 443) lost on seed 1 (+0.38% and +0.37%) for −1.7% on seed 9107; it was not kept
 (experiments).
 
@@ -1790,7 +1797,9 @@ drift cancels, and its T scaled to seed 1's 15.720 ms; M is each build's max of 
 The gate is a shell script kept outside the repo (scc would count it as code): for each input, run
 `solution <data dir> <out dir>` and compare `summary.txt` with `cmp` or its sha256.
 
-**The box number.** One binary's board runs spread by up to 40% (above). So:
+**The box number.** One binary's board runs spread by up to 40% (above), and the best Track A
+run (run-e363238f04fe, 0.015320 s) came in the same dispatch as a 0.020812 s run of the same
+build. So:
 
 - **The replica first** (from step 49): paired runs against the code a step would replace (step
   51's table above).
