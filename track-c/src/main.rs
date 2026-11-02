@@ -255,7 +255,7 @@ fn main() {
     // SAFETY: a libc call that touches no memory of ours; a failure keeps the default.
     unsafe { mallopt(M_ARENA_MAX, 1) };
     let dir = |k: usize, or: &str| std::env::args().nth(k).unwrap_or(or.into());
-    run(&dir(1, "/data"), dir(2, "/out").leak())
+    run(&dir(1, "/data"), &dir(2, "/out"))
 }
 
 /// What the worker threads share: the input and the sizes `run` derives from it,
@@ -268,10 +268,7 @@ struct Shared<'a> {
     body_start: usize,
     /// regions.csv, past its header.
     lines: &'a [u8],
-    out_dir: &'a str,
     threads: usize,
-    /// The runs records.csv is cut into (`RUNS_PER_THREAD` per thread).
-    runs: usize,
     /// The key slots of each name table, and the pairs a buffer has room for.
     slots: usize,
     capacity: usize,
@@ -289,10 +286,9 @@ struct Shared<'a> {
     next_run: AtomicUsize,
     flushed: AtomicUsize,
     merged: AtomicUsize,
-    /// The CPUs the threads found themselves on after regions.csv, a bit each, and
-    /// the ones they may use (CPUs 0 to 63; none if there are more, or the call fails).
+    /// The CPUs the threads found themselves on after regions.csv, a bit each (CPUs 0
+    /// to 63, see `move_off_shared_cpu`).
     on: AtomicU64,
-    allowed: u64,
     /// Each thread's table (its partition), and its inbox: buffers of pairs filed
     /// under it that it has not taken yet. Buffers are handed over, not copied
     /// (copying them: +1.2 ms). Emptied buffers go to one pool that every filer draws
@@ -315,12 +311,13 @@ struct Shared<'a> {
 
 /// What the workers share, made once by `run`: a static, so that `worker`, which
 /// pthread_create hands only its number, finds it. Hence `Shared<'static>`, for which
-/// `main` leaks `out_dir` and `run` the join table (the exit frees both).
+/// `run` leaks the join table (the exit frees it).
 static SHARED: std::sync::OnceLock<Shared<'static>> = std::sync::OnceLock::new();
 
 /// Builds the join table from regions.csv, then parses and aggregates every run,
 /// and writes the output. One set of threads does all of it, this one included, as
-/// worker 0, which writes the output and exits the process.
+/// worker 0, which returns once every thread has added its totals (see `finish`):
+/// this thread then writes the output and exits the process.
 ///
 /// The memory every worker writes is faulted in by the faulters only, workers 0 to 3
 /// (`FAULTERS`; this thread is worker 0): a page fault charges the run's memory cgroup
@@ -343,7 +340,7 @@ static SHARED: std::sync::OnceLock<Shared<'static>> = std::sync::OnceLock::new()
 ///   threads or more, the name tables' keys, under malloc's 128 KB mmap threshold,
 ///   have grown it by then. With fewer, its populate stops at the heap's end, and the
 ///   workers fault in the rest themselves: more memory, the same output.
-fn run(data_dir: &str, out_dir: &'static str) -> ! {
+fn run(data_dir: &str, out_dir: &str) -> ! {
     let lines = map(&format!("{data_dir}/regions.csv")).strip_prefix(b"region_id,country\n");
     let lines = lines.expect("regions.csv: the header is not region_id,country");
     touch(lines);
@@ -379,16 +376,11 @@ fn run(data_dir: &str, out_dir: &'static str) -> ! {
     // The workers' stacks, slot w for worker w (slot 0 unused), allocated before the
     // heap's top is taken, so that they do not take the margin.
     let mut stacks: Vec<u8> = Vec::with_capacity(threads * STACK);
-    let mut allowed = 0;
-    // SAFETY: a system call that writes the 8 bytes of `allowed`.
-    unsafe { sched_getaffinity(0, 8, &mut allowed) };
     let s = SHARED.get_or_init(|| Shared {
         text,
         body_start,
         lines,
-        out_dir,
         threads,
-        runs,
         slots,
         capacity,
         group_of: Box::leak(group_of),
@@ -400,7 +392,6 @@ fn run(data_dir: &str, out_dir: &'static str) -> ! {
         flushed: AtomicUsize::new(0),
         merged: AtomicUsize::new(0),
         on: AtomicU64::new(0),
-        allowed,
         tables: (0..threads).map(|_| table()).collect(),
         inboxes: (0..threads).map(|_| Default::default()).collect(),
         empties: Mutex::new(Vec::new()),
@@ -433,7 +424,10 @@ fn run(data_dir: &str, out_dir: &'static str) -> ! {
         }
     }
     worker(0);
-    unreachable!("worker 0 exits the process")
+    // Back here once every thread has added its totals (see `finish`).
+    let sums = s.sums.lock().unwrap();
+    write_output(out_dir, &sums, &s.countries.lock().unwrap());
+    std::process::exit(0)
 }
 
 /// Faulter f's share, of `faulters`, of the memory every thread writes (see `run`): the
@@ -458,12 +452,14 @@ fn fault_in(s: &Shared, f: usize, faulters: usize) {
 /// Worker `w` (the main thread is worker 0, called by `run`; the others start here,
 /// from pthread_create): for the faulters, a share of the faulting (see `run`); its
 /// share of regions.csv, then runs claimed one at a time, each one's pairs handed to
-/// the threads that own their partitions; then `finish`. It returns 0, its thread's
-/// exit value (a null `void *`), which nothing reads.
+/// the threads that own their partitions; then `finish`. It returns 0: to `run` on the
+/// main thread, and as its thread's exit value (a null `void *`) on the others; nothing
+/// reads it.
 extern "C" fn worker(w: usize) -> usize {
     let s = SHARED.get().expect("run sets it before any worker starts");
     let (text, body_start, lines, threads) = (s.text, s.body_start, s.lines, s.threads);
-    let (runs, capacity) = (s.runs, s.capacity);
+    // The runs records.csv is cut into (`RUNS_PER_THREAD` per thread, as in `run`).
+    let (runs, capacity) = (threads * RUNS_PER_THREAD, s.capacity);
     // Workers 0 to `faulters` - 1 fault in a share each.
     let faulters = FAULTERS.min(threads);
     if w < faulters {
@@ -489,7 +485,7 @@ extern "C" fn worker(w: usize) -> usize {
     // and the parse finds the input's page tables made.
     wait(&s.faulted, faulters);
     let mut pairs: Vec<_> = (0..threads).map(|_| Vec::with_capacity(capacity)).collect();
-    move_off_shared_cpu(&s.on, s.allowed);
+    move_off_shared_cpu(&s.on);
     // Runs are claimed one at a time, so a thread slowed down parses fewer of them,
     // and past the faulters' waits no thread waits for another one until the end.
     while let Some(nth) = claim(&s.next_run, runs) {
@@ -501,10 +497,9 @@ extern "C" fn worker(w: usize) -> usize {
         let cut = |k| run_start(text, body_start, k, runs);
         let span = (cut(run_index), cut(run_index + 1));
         parse_run(text, span, s.group_of, &mut totals, &mut pairs);
-        // Empty buffers for the next run's pairs, all at once.
+        // Up to `threads` empty buffers for the next run's pairs, all at once.
         let mut pool = s.empties.lock().unwrap();
-        let n = pool.len().saturating_sub(threads);
-        spare.extend(pool.drain(n..));
+        spare.extend((0..threads).map_while(|_| pool.pop()));
         drop(pool);
         for (t, buffer) in pairs.iter_mut().enumerate() {
             let fresh = spare.pop().unwrap_or_else(|| Vec::with_capacity(capacity));
@@ -557,8 +552,8 @@ fn take(s: &Shared, t: usize, taken: &mut Vec<Vec<u64>>, totals: &mut [Totals; G
 
 /// Worker `w` after its last run: once no thread files pairs any more, every table
 /// takes its inbox and every thread adds its totals to the sums; then thread 0
-/// writes the output and exits, while the others drop pages that exit would
-/// otherwise free one by one on one core, and end.
+/// returns, to write the output and exit (see `run`), while the others drop pages
+/// that exit would otherwise free one by one on one core, and end.
 fn finish(s: &Shared, w: usize, taken: &mut Vec<Vec<u64>>, totals: &mut [Totals; GROUPS]) {
     let (text, body_start, lines, threads) = (s.text, s.body_start, s.lines, s.threads);
     // Every thread's table takes its inbox (below), this thread's first. A table that
@@ -581,26 +576,23 @@ fn finish(s: &Shared, w: usize, taken: &mut Vec<Vec<u64>>, totals: &mut [Totals;
     s.merged.fetch_add(1, Release);
     wait(&s.merged, threads);
     // Once every thread has added its totals, only the output is read again. This
-    // thread 0, the main one, writes it and exits, without dropping anything. The
-    // others meanwhile drop their table's pages and their share of the join
-    // table's, of regions.csv's and of the input's last third, which exit would
-    // otherwise free one by one on one core, and end. (About 1% faster on the
-    // replica: PERF.md, steps 51 and 52.)
-    if w == 0 {
-        let sums = s.sums.lock().unwrap();
-        write_output(s.out_dir, &sums, &s.countries.lock().unwrap());
-        std::process::exit(0);
+    // thread 0, the main one, returns to `run`, which writes it and exits, without
+    // dropping anything. The others meanwhile drop their table's pages and their
+    // share of the join table's, of regions.csv's and of the input's last third,
+    // which exit would otherwise free one by one on one core, and end. (About 1%
+    // faster on the replica: PERF.md, steps 51 and 52.)
+    if w > 0 {
+        let (keys, rows) = &*s.tables[w].lock().unwrap();
+        // This thread's share of 0..n, one of threads - 1.
+        let share = |n| part(n, w - 1, threads - 1);
+        // SAFETY: no thread reads the tables, the join table or regions.csv again
+        // (above), and the input is `map`'s.
+        unsafe { drop_pages(&keys[..]) };
+        unsafe { drop_pages(&rows[..]) };
+        unsafe { drop_pages(&s.group_of[share(REGION_IDS)]) };
+        unsafe { drop_pages(&lines[share(lines.len())]) };
+        unsafe { drop_pages(&text[early..][share(text.len() - early)]) };
     }
-    let (keys, rows) = &*s.tables[w].lock().unwrap();
-    // This thread's share of 0..n, one of threads - 1.
-    let share = |n| part(n, w - 1, threads - 1);
-    // SAFETY: no thread reads the tables, the join table or regions.csv again
-    // (above), and the input is `map`'s.
-    unsafe { drop_pages(&keys[..]) };
-    unsafe { drop_pages(&rows[..]) };
-    unsafe { drop_pages(&s.group_of[share(REGION_IDS)]) };
-    unsafe { drop_pages(&lines[share(lines.len())]) };
-    unsafe { drop_pages(&text[early..][share(text.len() - early)]) };
 }
 
 /// Two threads can start on one CPU while another one idles, and the scheduler then
@@ -608,15 +600,19 @@ fn finish(s: &Shared, w: usize, taken: &mut Vec<Vec<u64>>, totals: &mut [Totals;
 /// second one to get here moves to the lowest CPU of `allowed` that no thread has
 /// claimed in `on`, and stays there for the rest of the run: only movers are pinned
 /// (pinning every thread was worse: 18 slow runs in 300 against 4), and a move happens
-/// in about 3% of runs. A failed call leaves it where it is: sched_getcpu's -1 reads as
-/// CPU 63, outside `allowed` unless the machine has 64 CPUs.
-fn move_off_shared_cpu(on: &AtomicU64, allowed: u64) {
+/// in about 3% of runs. `allowed` is the CPUs this thread may use: the process's, which
+/// every thread starts with (CPUs 0 to 63; none if there are more, or the call fails).
+/// A failed call leaves it where it is: sched_getcpu's -1 reads as CPU 63, outside
+/// `allowed` unless the machine has 64 CPUs.
+fn move_off_shared_cpu(on: &AtomicU64) {
+    let mut allowed = 0;
+    // SAFETY: a system call that writes the 8 bytes of `allowed`.
+    unsafe { sched_getaffinity(0, 8, &mut allowed) };
     // SAFETY: a libc call that touches no memory of ours.
     let cpu = unsafe { sched_getcpu() } as u32 % 64;
     let seen = on.fetch_or(1 << cpu, AcqRel) & allowed;
     // The lowest CPU it may use that no thread has claimed (0 if none is left).
-    let free = !seen & allowed;
-    let bit = free & free.wrapping_neg();
+    let bit = (!seen & allowed).isolate_lowest_one();
     if seen >> cpu & 1 == 1 && bit != 0 && on.fetch_or(bit, AcqRel) & bit == 0 {
         // SAFETY: a system call that reads the 8 bytes of `bit`; a failure keeps the
         // thread where it is.
@@ -927,14 +923,12 @@ unsafe fn fast_record(text: &[u8], i: usize, fast_end: usize) -> Option<Record> 
     // - the hash's, from the name in the first window to 32 bytes past it: by 96;
     // - the tail's 32 bytes, from note_end + 1 <= 128: by 160;
     // - load(k), the 8 bytes before k, for k = id_end (< 64), region_end and
-    //   amount_end, and at(region_end + 1), the byte after the region's comma (the
-    //   only call of `at`). region_len and dot are below 32, or 64 if their byte is
+    //   amount_end, and the byte after the region's comma, at region_end + 1 (read
+    //   for `negative`). region_len and dot are below 32, or 64 if their byte is
     //   missing, so region_end = note_end + 1 + region_len <= 192, region_end + 1 <=
     //   193 and amount_end = note_end + 4 + dot <= 195.
     // SAFETY: i < text.len() (above).
     let p = unsafe { text.as_ptr().add(i) };
-    // SAFETY: k <= 195 at every call (above).
-    let at = |k: usize| unsafe { *p.add(k) };
     // SAFETY: k <= 195 at every call, and i >= 8 (above).
     let load = |k: usize| unsafe { p.add(k).sub(8).cast::<u64>().read_unaligned() }; // ends at k
     // SAFETY: the 64 bytes at i are inside the text (above).
@@ -982,7 +976,8 @@ unsafe fn fast_record(text: &[u8], i: usize, fast_end: usize) -> Option<Record> 
     let tail = unsafe { _mm256_loadu_si256(p.add(note_end + 1).cast()) };
     let region_len = bytes_eq(tail, b',').trailing_zeros() as usize;
     let dot = bytes_eq(tail, b'.').trailing_zeros() as usize;
-    let negative = at(note_end + 2 + region_len) == b'-';
+    // SAFETY: note_end + 2 + region_len is region_end + 1 <= 193 (above).
+    let negative = unsafe { *p.add(note_end + 2 + region_len) } == b'-';
     // The amount ends two digits after its dot (spec 2.2).
     let (region_end, amount_end) = (note_end + 1 + region_len, note_end + 4 + dot);
     let [id, region_id, c] = numbers([load(id_end), load(region_end), load(amount_end)]);
