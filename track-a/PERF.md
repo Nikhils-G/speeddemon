@@ -1,19 +1,22 @@
 # Track A: performance log
 
-**Result.** The reference runs 32.05 s at 228 MB and S 56. The submitted code is step 71 (al-6,
-ccc90a3, S 438): step 69's engine in 18 fewer lines, cut in steps 70 and 71 at the same speed
-(replica −0.23% against step 69). Its second board run, run-89081c753251 (0.015752 s, 18.32 MB,
-86.96 points), is the best Track A run; its first, run-7e63f1ceb70a, took 0.016146 s (18.4 MB,
-86.67 points). Step 69 (am5-2, abc7b44, S 456) is step 68 with the endpoints' name order sorted
-after the merge's hand-off, while the other threads start pass 2 (replica −0.92% and −0.86%
-against step 68). Its first board run, run-a533307c210b (0.018707 s, 18.62 MB, 84.89 points), was
-a slow run: Track A alone was slow in that dispatch, and B set its best time then in the same
-dispatch (run-567ede8911b8, 0.074086 s). Its second, run-b3a4984e4320, took 0.015715 s (18.22 MB,
-86.88 points), and its third, run-dcb2c65578ff (0.015702 s, 18.24 MB, 86.88 points), was the best
-Track A run until step 71 and is still the fastest Track A time. Step 68 (am5-1, 9f2993f, S 452)
-is step 67 with the endpoint table in static memory, a cheaper cold lookup and the space window 3
-bytes later (replica −1.18% and −1.19%); its run-be74feabcc76 (0.015722 s, 18.44 MB, 86.85
-points) had them until step 69. Steps
+**Result.** The reference runs 32.05 s at 228 MB and S 56. The submitted code is step 74 (ar-5,
+0098691, S 441): step 71 with the first slices sized by start order and one release per pair of
+slices (step 72), std's start-up skipped (step 73) and the Dockerfile's `RUN` on fewer lines
+(step 74), about −1.7% against step 71 on the replica. Its first board run, run-977a4610bb91
+(0.015606 s, 18.23 MB, 87.06 points), is the best Track A run and the fastest Track A time. Step 71
+(al-6, ccc90a3, S 438) is step 69's engine in 18 fewer lines, cut in steps 70 and 71 at the same
+speed (replica −0.23% against step 69); its second board run, run-89081c753251 (0.015752 s,
+18.32 MB, 86.96 points), was the best Track A run until step 74. Step 69 (am5-2, abc7b44, S 456) is
+step 68 with the endpoints' name order sorted after the merge's hand-off, while the other threads
+start pass 2 (replica −0.92% and −0.86% against step 68). Its first board run, run-a533307c210b
+(0.018707 s, 18.62 MB, 84.89 points), was a slow run: Track A alone was slow in that dispatch, and B
+set its best time then in the same dispatch (run-567ede8911b8, 0.074086 s). Its second,
+run-b3a4984e4320, took 0.015715 s (18.22 MB, 86.88 points), and its third, run-dcb2c65578ff
+(0.015702 s, 18.24 MB, 86.88 points), was the best Track A run until step 71 and the fastest Track A
+time until step 74. Step 68 (am5-1, 9f2993f, S 452) is step 67 with the endpoint table in static
+memory, a cheaper cold lookup and the space window 3 bytes later (replica −1.18% and −1.19%); its
+run-be74feabcc76 (0.015722 s, 18.44 MB, 86.85 points) had them until step 69. Steps
 64 to 67 are step 63's engine with a reviewed `main` (the worker defined once, named structs, a
 lines pass, review comments), each at the same speed on the replica; until step 68, step 64 had
 the best Track A run, run-1bda764d4b1e (0.016043 s, 18.67 MB, S 442, 86.65 points), and step 63
@@ -26,9 +29,10 @@ disorder bound is assumed (step 8); and a pass 2 that counts ranks for small gro
 each hour in place once its start is known (steps 19 and 44). Steps 56 to 66 traded 27 lines
 (0.20 points of S) for an exact id bound, a reviewed `main` with named structs, a lower memory peak
 and a shorter tail, and the best points moved from step 55's run-ea674ef8448a (0.016399 s, S 428,
-86.44) to step 64's, then to step 68's, step 69's (run-dcb2c65578ff, 0.015702 s, 86.88) and step
-71's (run-89081c753251, 0.015752 s, 86.96). Every run ID below is in the board's history for team
-SALAAR; "probe" marks a timing build that reports through its exit code ("Box probes").
+86.44) to step 64's, then to step 68's, step 69's (run-dcb2c65578ff, 0.015702 s, 86.88), step
+71's (run-89081c753251, 0.015752 s, 86.96) and step 74's (run-977a4610bb91, 0.015606 s, 87.06).
+Every run ID below is in the board's history for team SALAAR; "probe" marks a timing build that
+reports through its exit code ("Box probes").
 
 | What moved the score most | Step | Board, before → after |
 |---|---|---|
@@ -133,12 +137,87 @@ numbers are left out rather than guessed.
 | 66 | a09d036 (later runs from 79fb02b, 14aa7c9, f37f273, 9b2ee21, 41e6cfe and 1eb28f0) | A lines pass in `main`: the six shared counters as one array, the room per thread inline, the hour key in one line, `counts` zeroed as each group is taken instead of a 16 KB fill per hour, the scope returning the total (replica −0.04, +0.29, −0.01 and +0.03% over four pairings: equal) | run-b46ef564c46b, run-ce29fb96c3ac, run-64335e22618d, run-ee262fe95b70, run-dd77010a62f8, run-d5416e8b5c12, run-870c44970b40 | 0.016216, 0.020944, 0.02058, 0.016158, 0.016152, 0.016473, 0.016041 | 18.35, 18.65, —, 18.21, 18.48, —, 18.54 | 455 | 86.51, 83.67, —, 86.59, 86.53, 86.31, 86.59 |
 | 67 | 12e48b1 (later runs from bbce7e9 and 3305ff6) | jc5-a-2: review comments only: the safety arguments, the phases, and the Dockerfile's note on reproducible builds; the token stream is step 66's (first run slow, with B slow in the same dispatch; the second run's T, M and points from `board.py`) | run-0713194d9d4c, run-44c2757557ea, run-574c80fb3ed7 | 0.020705, 0.01611, 0.017024 | 18.48, 18.32, 18.92 | 455 | 83.83, 86.59, 85.85 |
 | 68 | 9f2993f | am5-1: the endpoint table a zeroed static, with no 0.13 ms memset before the first spawn; the cold lookup's hash read from the line and its space mask built from two 64-bit halves; the space window from byte 31 instead of 28, so 6.6% of seed 1's lines end past it instead of 7.6% (replica −1.18% and −1.19% against step 67, 150 and 146 of 201 pairs). The best Track A run and the fastest Track A time until step 69 | run-be74feabcc76 | 0.015722 | 18.44 | 452 | 86.85 |
-| 69 | abc7b44 (later runs from later pushes, Track A unchanged) | am5-2: the endpoints' name order sorted after the merge's hand-off, while the other threads start pass 2, and 4 lines cut at the same speed (replica −0.92% and −0.86% against step 68, 141 and 144 of 201 pairs). Its first run was slow, with Track A alone slow in that dispatch; its third was the best Track A run until step 71 and is the fastest Track A time; its fourth came with B slow too | run-a533307c210b, run-b3a4984e4320, run-dcb2c65578ff, run-19e874ad85e8, run-bee68d630395, run-4dc2beaa9133, run-dedaf3c2c2f6 | 0.018707, 0.015715, 0.015702, 0.018389, 0.015805, 0.01608, 0.016067 | 18.62, 18.22, 18.24, —, 18.7, 18.4, 18.89 | 456 | 84.89, 86.88, 86.88, —, 86.71, 86.59, 86.48 |
+| 69 | abc7b44 (later runs from later pushes, Track A unchanged) | am5-2: the endpoints' name order sorted after the merge's hand-off, while the other threads start pass 2, and 4 lines cut at the same speed (replica −0.92% and −0.86% against step 68, 141 and 144 of 201 pairs). Its first run was slow, with Track A alone slow in that dispatch; its third was the best Track A run until step 71 and the fastest Track A time until step 74; its fourth came with B slow too | run-a533307c210b, run-b3a4984e4320, run-dcb2c65578ff, run-19e874ad85e8, run-bee68d630395, run-4dc2beaa9133, run-dedaf3c2c2f6 | 0.018707, 0.015715, 0.015702, 0.018389, 0.015805, 0.01608, 0.016067 | 18.62, 18.22, 18.24, —, 18.7, 18.4, 18.89 | 456 | 84.89, 86.88, 86.88, —, 86.71, 86.59, 86.48 |
 | 70 | 90bc87f (second run from 0dbb27c, Track A unchanged) | al-5: nine line cuts at the same speed: `find` returns an `Option`, one `eq_mask` helper for the compare and the mask, the done-slice test as a `let`-`else`, the spare id a `Cell<Option<usize>>`, `parse_digits` one fold, a part's reader count its number of runs, `id`'s key compare four ANDed masks, no reslice of the values buffer, no `Order` alias (replica +0.13, −0.05, +0.19 and +0.03% against step 69: a mean of +0.075%). First run DISTURBED (B 0.115912 s, C's memory 10.52 MB); the second slow, with Track A alone slow in that dispatch | run-69ff2588acf9, run-772f480011c8 | 0.015945, 0.018846 | 18.85, 18.47 | 439 | 86.70, 84.97 |
-| 71 | ccc90a3 (second run from 5257718, Track A unchanged) | al-6: step 70 with the done-slice test a plain `if` again, the 5xx flag stored directly, `Interner::add` no longer `#[cold]`, and the Dockerfile's training run and profile merge on one line (replica −0.23% against step 69, the mean of eight pairings; −0.42% and −0.18% against step 70's builds). **The submitted code**. Its second run is the best Track A run | run-7e63f1ceb70a, run-89081c753251 | 0.016146, 0.015752 | 18.4, 18.32 | 438 | 86.67, 86.96 |
+| 71 | ccc90a3 (later runs from 5257718, 446aee0, 1b4d9ff, d85e890 and a0632f7, Track A unchanged) | al-6: step 70 with the done-slice test a plain `if` again, the 5xx flag stored directly, `Interner::add` no longer `#[cold]`, and the Dockerfile's training run and profile merge on one line (replica −0.23% against step 69, the mean of eight pairings; −0.42% and −0.18% against step 70's builds). Its second run was the best Track A run until step 74; its next four were slow, each with B slow too (the last three DISTURBED) | run-7e63f1ceb70a, run-89081c753251, run-dfbda2da77f9, run-13f4d67ceb2b, run-bfd4ca97ff0e, run-1104e6349b05 | 0.016146, 0.015752, 0.021444, 0.018704, 0.018601, 0.017454 | 18.4, 18.32, 18.82, 18.58, 18.68, 19.07 | 438 | 86.67, 86.96, 83.50, 85.03, 85.07, 85.67 |
+| 72 | 835cf16 (later runs from afa2a36 and 4131672, Track A unchanged) | ar-2: the first slices sized by start order, the first pair 5% smaller (the gain); one `madvise` per pair of slices instead of per slice; the cuts in one closure; the runs presized and sorted by hour alone (replica −0.275% against step 71 for the sizing, the mean of four pairings, and about −0.62% in all). First run slow, with Track A alone slow in that dispatch; the second with B slow too | run-8dc452c4fd51, run-6eadbf0d60da, run-2030fda93d3d | 0.0197, 0.017918, 0.015938 | 18.66, 19.23, 18.47 | 441 | 84.43, 85.33, 86.78 |
+| 73 | 835b127 (second run from 68e2d9f, Track A unchanged) | ar-4: std's start-up skipped (`#![no_main]`, our own C `main`), and `ptr` imported so that the pair's release fits one line (replica −1.08% against step 72 with that import, about 175 µs; about −1.7% against step 71). Both runs slow, with B slow too in each dispatch | run-72ac01d67671, run-619d42467af5 | 0.019251, 0.017649 | 18.48, 18.37 | 442 | 84.72, 85.68 |
+| 74 | 0098691 (second run from 480db54, Track A unchanged) | ar-5: step 73 with the Dockerfile's `RUN` on three lines, the same commands (replica −0.10, −0.00, −0.05 and −0.00% against step 73: equal). **The submitted code**. Its first run is the best Track A run and the fastest Track A time; the second was slow, with B slow too | run-977a4610bb91, run-ab14a5bbbaa8 | 0.015606, 0.020882 | 18.23, 18.24 | 441 | 87.06, 83.90 |
 
-**The submitted code is step 71 (al-6, ccc90a3), S 438**: step 69's engine in 18 fewer lines,
-cut in step 70 (al-5, 90bc87f, S 439) and step 71 at the same speed.
+**The submitted code is step 74 (ar-5, 0098691), S 441**: step 71 with the first slices sized by
+start order and one release per pair (step 72, ar-2, 835cf16, S 441), std's start-up skipped
+(step 73, ar-4, 835b127, S 442) and the Dockerfile's `RUN` on three lines (step 74).
+- *Step 72: the first pair smaller (+2 lines; with only this change, ar-1).* The cuts are no
+  longer at `len * p / slices` but at `at(p) = len * (w(0) + ... + w(p - 1)) / (w(0) + ... +
+  w(slices - 1))`, with `w(q) = 200 + threads.saturating_sub(q / 2) - 10 * (q < 2)`. So each pair
+  of the first round (one a thread, claimed in start order) is half a percent smaller than the one
+  claimed before it, pair 0 is another 5% smaller, and the second round is even.
+  - *Why.* In 14 runs with phase marks from the work on steps 68 and 69, the threads started 0,
+    87, 151, 207, 240, 288, 328, 379, 416, 442, 478 and 526 µs after the first (means per claim),
+    and the first round's pair took 4.65 ms for claim 0 against 4.23 to 4.43 ms for the others:
+    that thread adds most of the endpoints to the table while the main thread is still spawning.
+    The last thread ended its parse 192 µs after the mean. Replaying the runs predicted −58 µs for
+    this formula; a pure slope does almost nothing, because claim 0 is an outlier.
+  - *Measured.* Against step 71: −0.19, −0.22, −0.38 and −0.31% (110 to 127 of 201 pairs won), a
+    mean of −0.275%. A later scan settled what matters. One PGO binary of the final code read its
+    schedule from its own file name, so hardlinks differed only in the schedule (A/A +0.08%). Even
+    slices measured +0.63% and +0.49%. A pair-0 cut alone, with no slope, ran like the full formula
+    at any size from 5% to 20% (5%: −0.08, −0.15 and +0.06%; 7.5%: −0.18%; 10%: +0.08 and +0.22%;
+    15%: +0.10%; 20%: −0.02%), and a slope alone +0.41%. So the gain is the pair-0 cut, and the
+    start-order slope adds nothing measurable.
+- *Step 72, three more changes (+1 line).* `cut(p)` is one closure, `at(p)` less the length of the
+  part line before it (−1; alone, a mean of −0.005% over four pairings). One `madvise` per parsed
+  pair instead of one per slice (+2): the pair's two slices are adjacent, so one call releases
+  both, and `parse`'s `# Safety` says so; that is 24 fewer rounds of TLB shootdowns on the other
+  threads' CPUs. And the merge's runs vector is presized to the parts' total starts, and the runs
+  are sorted by hour key alone, not by (key, part). The three on top of ar-1: −0.39, −0.36, −0.45
+  and −0.20% (108 to 124 won), a mean of −0.35%; step 72 against step 71, about −0.62%. Each
+  removed alone: without the single `madvise`, +0.38, +0.19, +0.11 and +0.57% (mean +0.31%);
+  without the presized, hour-only sort, −0.05, +0.40, −0.13 and +0.18% (mean +0.10%). So it is
+  mostly the single `madvise`. Memory over two rounds (40 and 60 runs per binary): expected
+  highest of 5 peaks 18.34 to 18.44 MB against ar-1's 18.28 to 18.52 MB: equal.
+- *Step 73: no std start-up (+1 line).* `ptr` is imported, so the pair's release fits one line
+  (−1; the plain builds' `.text` is byte-identical). `#![no_main]` (+2): the C runtime calls our
+  own `extern "C" fn main(_: i32, _: *const *const u8) -> i32`, and the empty input returns 0.
+  - *What is skipped.* std's start-up: the main thread's stack-guard lookup
+    (`pthread_getattr_np`, which reads /proc/self/maps in glibc), the SIGSEGV and SIGBUS handlers
+    with the main thread's alternate signal stack, SIGPIPE set to ignore, the poll of fds 0 to 2,
+    and naming the main thread. With no handler installed, std also skips the alternate signal
+    stack (an `mmap` and an `mprotect`) in every thread it spawns.
+  - *What still works.* The arguments, which glibc passes to std through `.init_array` (the PGO
+    training run and every replica tool pass directories), and panics, which print their message
+    and abort (`panic = "abort"`); the main thread shows as `<unnamed>` in a panic message.
+    Nothing here recurses deeply, writes to a pipe or uses stdout.
+  - *Measured.* Against step 72 with the import: −1.16, −0.97, −1.09 and −1.09% (147 to 152 of
+    201 won), a mean of −1.08%, about 175 µs; it had been estimated at −0.4%. Against step 71,
+    about −1.7%. Memory, 40 runs per binary: expected highest of 5 peaks 18.42 and 18.46 MB
+    against 18.48 and 18.54: equal. (The import alone read +0.17, +0.07, +0.25 and +0.22% against
+    step 72's builds and −0.32% against ar-1's, where step 72 read −0.35%: for byte-identical
+    code, that +0.18% is the spread between PGO builds.)
+- *Step 74: the Dockerfile's `RUN` on three lines (−1; the Dockerfile counts 9).* The
+  instrumented `cargo build` comes first, then the generator joins the training run's line. The
+  commands, sources, flags and training data are the same; the longest line is 196 characters,
+  under the harness's 200-character flag, and `dockerfile_check.py` passes. Against step 73's
+  builds: −0.10, −0.00, −0.05 and −0.00%: equal, as expected.
+- *Why exact.* Cuts still follow an LF and never decrease: only which thread parses which bytes
+  changes. A pair's two slices are adjacent, so one `madvise` covers exactly them. The order of an
+  hour's runs changes no output byte: each run reads its own escapes, and a group's values are
+  only counted or selected. Nothing that std's start-up sets up is used, and the arguments and
+  panic messages work as before. Every kept build passed the gate ("How the final number was
+  verified").
+- *Board.* Step 72 ran 0.0197 s (run-8dc452c4fd51, 84.43 points) with Track A alone slow in its
+  dispatch (B 0.070026 s, C 0.017147 s), 0.017918 s (run-6eadbf0d60da) with B slow too
+  (0.082291 s), and 0.015938 s (run-2030fda93d3d, 18.47 MB, 86.78 points), within the 0.015752
+  to 0.016146 s of step 71's two normal runs: single board runs do not resolve a 0.6% change, as
+  with step 69. Step 73 ran 0.019251 s (run-72ac01d67671) and 0.017649 s (run-619d42467af5), with
+  B slow in both dispatches (0.088981 and 0.088847 s). Step 74, the same source built by the
+  shorter `RUN`, ran 0.015606 s (run-977a4610bb91, 18.23 MB, 87.06 points): the best Track A run
+  and the fastest Track A time, 0.61% under step 69's 0.015702 s and 0.93% under step 71's
+  0.015752 s. Its second run took 0.020882 s (run-ab14a5bbbaa8), with B slow in the same dispatch
+  (0.103705 s).
+
+**Step 71 (al-6, ccc90a3), S 438**: step 69's engine in 18 fewer lines, cut in step 70 (al-5,
+90bc87f, S 439) and step 71 at the same speed.
 - *Step 70, nine cuts, S 456 → 439.*
   - `Interner::find` returns `Option<u32>`, `Some` when the endpoint is in its home slot; the
     parse takes the hit or goes the long way in one line,
@@ -186,9 +265,12 @@ cut in step 70 (al-5, 90bc87f, S 439) and step 71 at the same speed.
   dispatch, where B ran 0.115912 s and C's memory read 10.52 MB, and 0.018846 s
   (run-772f480011c8, 84.97 points) with Track A alone slow (B 0.069944 s, C 0.01721 s). Step 71
   ran 0.016146 s (run-7e63f1ceb70a, 18.4 MB, 86.67 points) and 0.015752 s (run-89081c753251,
-  18.32 MB, 86.96 points), the best Track A run: 0.32% over step 69's fastest time, within the
-  0.015702 to 0.01608 s of step 69's normal runs, and 0.08 points over step 69's best, as the 18
-  lines are worth about 0.13 points.
+  18.32 MB, 86.96 points), the best Track A run until step 74: 0.32% over step 69's fastest time,
+  within the 0.015702 to 0.01608 s of step 69's normal runs, and 0.08 points over step 69's best,
+  as the 18 lines are worth about 0.13 points. Its next four runs, from 06:05 to 06:41 UTC, took
+  0.021444 s (run-dfbda2da77f9), 0.018704 s (run-13f4d67ceb2b), 0.018601 s (run-bfd4ca97ff0e) and
+  0.017454 s (run-1104e6349b05), each with B slow in the same dispatch (0.143676, 0.098043,
+  0.079581 and 0.090154 s); our log marks the last three DISTURBED.
 
 **Step 69 (am5-2, abc7b44), S 456**: step 68 with the endpoints' name order
 sorted after the merge's hand-off.
@@ -226,7 +308,7 @@ sorted after the merge's hand-off.
   Track A alone was slow in that dispatch; B set its best time then, in the same dispatch
   (run-567ede8911b8, 0.074086 s). Its second, run-b3a4984e4320, took 0.015715 s (18.22 MB, 86.88
   points), and its third, run-dcb2c65578ff, 0.015702 s (18.24 MB, 86.88 points): the best Track A
-  run until step 71, and still the fastest Track A time. Its next four: run-19e874ad85e8,
+  run until step 71, and the fastest Track A time until step 74. Its next four: run-19e874ad85e8,
   0.018389 s, with B slow in the same dispatch; run-bee68d630395, 0.015805 s; run-4dc2beaa9133,
   0.01608 s; run-dedaf3c2c2f6, 0.016067 s. Against step 68's one run (0.015722 s) its best is
   0.13% faster and its five normal runs took 0.015702 to 0.01608 s: single board runs do not
@@ -789,6 +871,19 @@ dispatches where B's unchanged code ran 0.1209-0.1312 s.
   more and were not kept: the parse filling its two `Part`s in place moved the worker's register
   allocation (+0.34 and +0.45% on step 71), and `parse_digits` without `#[cold]` ran +0.32 and
   +0.64%, so that hint still matters under PGO ("Experiments").
+- **Step 72: the parse's tail was the thread that started first.** It adds most of the 1,842
+  endpoints to the table while the main thread is still spawning, and its first pair took 4.65 ms
+  against 4.23 to 4.43 ms for the others: its pair 5% smaller gave the whole gain, and the
+  start-order slope that the marks suggested did nothing measurable. A PGO binary that reads its
+  parameters from its own file name gives schedule comparisons free of build noise (A/A +0.08%).
+  The same schedule in closed form compiled the worker differently and ran +0.33%, as earlier
+  code-layout effects did. And every `madvise` is a round of TLB shootdowns: one call per pair
+  instead of one per slice was worth about 0.3%.
+- **Step 73: std's start-up cost about 1% of the run**, about 175 µs on the critical path, before
+  and around the 11 spawns. Waking the sleepers on the merge's hand-off sooner by spinning cost
+  more than it saved (+0.92%): a spinning thread, even on `pause`, takes its core from the sibling
+  that is still parsing or merging, and an idle CPU is slow to wake ("What we learned about the
+  box").
 
 Pass 2 per thread (replica, profile and phase timers, steps 56-57's code): counting 0.41 ms,
 placing the values 1.11 ms (bound by L1 store misses: 7.8 cycles per record per thread),
@@ -808,6 +903,29 @@ Pass 2 is 56.4 thread-ms: counting 5.3, the scatter and the release of parts 12.
 (the selections, `small_ranks` and `line_len`) 25.1, and writing 13.1. That is 4.7 ms a thread
 against about 4.9 ms of wall time, so the threads are balanced to about 0.3 ms; the tail is the
 last block of hours.
+
+Where step 73's run goes (replica, quiet box, one PGO build with phase marks; µs from `main`'s
+start, medians of 9 runs, each with a fresh output directory; first, median and last thread):
+- the first spawn at 80, after `prctl`, the two opens, the log's `mmap` and
+  `available_parallelism` (36 to 52 µs alone); the 11 spawns done at 623, about 49 µs a spawn on
+  the main thread (a lone spawn on a quiet box takes 25 to 32 µs);
+- the workers start at 295 / 493 / 718;
+- the parse ends at 8,950 / 9,027 / 9,195 (the last 168 µs after the median), and the merge at
+  9,292, 97 µs after the last parse;
+- pass 2 begins at 9,293 / 9,322 / 9,694 (the last is the merging thread: the `munmap`, the name
+  sort and the key release);
+- the hour queue is empty at 13,951 / 14,165 / 14,295, each thread's last flush is done at
+  14,220 / 14,363 / 14,477, the threads are past the barrier at 14,483 / 14,517 / 14,546 (woken 6
+  to 69 µs after the last one arrives) and have dropped their output shares at 14,527 / 14,582 /
+  14,665;
+- `set_len` and `exit()` at 14,684.
+
+The same code without marks runs 15.585 ms from exec to exit (sd-timer, median of 7), so 0.90 ms
+lies outside `main`: fork and exec, glibc's start, the exit and the parent's wake-up. A trivial
+static `#![no_main]` Rust binary takes 0.593 ms under the same timer (median of 9), so about
+0.3 ms of it is this program's own: its exit frees about 2.7 MB of anonymous pages (VmRSS 3.8 MB
+at the exit: eleven glibc thread arenas of 112 to 248 kB, a 176 kB heap and the binary's pages)
+and 192 kB of page tables.
 
 
 Where pass 2's time goes on the replica (steps 54 to 56's code; builds that skip one part, wrong
@@ -944,6 +1062,12 @@ The box is the board's scoring machine; the test server is a 16-vCPU VM. What he
   built. Resident at the end of the second block of hours (smaps): records 8.69 MB, values buffers
   2.98, the arenas (the pending statistics) about 1.0, output 1.15, stacks 0.41, heap 0.21, the
   endpoint table 0.10 MB.
+- **An idle CPU is slow to wake** (replica, `intel_idle`, kernel 6.12.67). Its idle states are
+  POLL, C1_ACPI (1 µs exit latency), C2_ACPI (127 µs, residency 381 µs) and C3_ACPI (1,048 µs,
+  residency 3,144 µs). On a quiet box a std spawn returns after 25 to 32 µs, but the new thread
+  runs 164 to 218 µs after the spawn began; in an older marked run, the threads sleeping on the
+  merge's hand-off woke 80 to 105 µs after it. Spinning instead of sleeping did not pay (step 73,
+  +0.92%).
 
 ## Box probes (failed runs on the board, by design)
 
@@ -1085,6 +1209,17 @@ The earlier probes behind step 12 used 0.25 ms units; their run IDs are not in o
 | The pointer-free intrinsics called without `unsafe`: `small_ranks` without its outer `unsafe` block, −2 lines (step 70 work) | Does not compile on rustc 1.99.1: AVX2 enabled in the build configuration does not remove the requirement to list it in `#[target_feature]`, and `#[target_feature]` cannot be combined with `#[inline(always)]` |
 | `line_len` with `2 + v.max(1).ilog10()` per number; `parse_digits` taking a slice (steps 70 and 71 work) | No line saved: with a slice, the call's arguments wrap |
 | More sharing between `find` and `id` than the hash, `home` (step 70 work) | Not built: `find` compares 64 bytes masked to len + 1 at the home slot only, and `id` 128 bytes over a probe loop, with a hash masked differently under 8 bytes. A miss in `find` calling `id` itself measured +0.75% and +0.08% (above) |
+| PGO trained at full scale: the Dockerfile's `a_ingest.py --scale full`, with /tmp/train and /tmp/out removed before the final build (step 72 work) | Slower: +0.16, +0.30, +0.37 and +0.09% against step 71 (77 to 96 of 201 won), a mean of +0.23%. The build took 38 to 40 s on the replica against 26 to 28 s |
+| Selection hints: each endpoint's last p50 and p95 kept in a zeroed `[[AtomicU32; 2]; MAX_ENDPOINTS]`; for groups of more than 64 values, one branch-free Lomuto partition around the hint, then `select_nth_unstable` on the rank's side only, whose result is the next hint. Exact for any hint (randomized check: 1.2M groups of 65 to 6,000 values, no failure), +14 lines (step 72 work) | −0.43, −0.63, −0.56 and +0.11% against ar-1 (mean −0.38%; an earlier pair of builds −0.39 and −0.21%): about −0.06 points net. On one thread over seed 1's 5,937 groups of more than 64 values (1.97M values, 63%): 8.37 ms, with the hint 7.51 (−10%), with a two-pivot bracket h ± h/16 7.30 (−13%). The reason is the generator: latency = base << octave + uniform, with octave weights 560/250/110/52/28/14/6/3/1 of 1024, so p95 sits at the boundary of octaves 3 and 4 (94.9% cumulative), where the density is lowest, and one hour's p95 predicts the next one's poorly |
+| Selection inside a narrow bracket from the previous hour's percentiles: one pass counts the values below the p50 bracket and compacts [lo, hi) about the p50 hint, and everything from just under the p95 hint up, into a spare buffer from both ends; then a selection inside, and a full selection on a miss (step 72 work) | Not built into the program: in the microbenchmark above it ran 8.42 to 10.08 ms against 8.37 ms. Its p50 bracket hit 52% of the time and its p95 bracket 58% (the generator, as above) |
+| One more `small_ranks` arm, V = 2 for 9 to 16 values, +1 line (step 73 work) | +0.23% against step 72's builds, and −0.22% against ar-1's, where step 73's import alone had −0.32%: no gain. The microbenchmark had promised −4.5% of the small-group time (120,971 groups of 1 to 64 values in seed 1, 79,517 of them of 1 to 8 values) |
+| Step 72's schedule without the slope, in closed form `len * (20 * p - p.min(2)) / (20 * slices - 2)`, −1 line (step 73 work) | +0.33% against the builds of step 72 with step 73's import, and equal to ar-1's (+0.01%). The schedule itself ran like the sloped one in the file-name scan, so the loss is code generation |
+| Three or four pairs of slices a thread, with step 72's schedule (file-name scan) | Three: +0.47% and +0.33%. Four: +1.38% |
+| Spinning on the merge's hand-off, `while merged.get().is_none() { std::hint::spin_loop(); }` before the wait, +3 lines (step 73 work) | +0.52, +0.86, +1.12 and +1.18% against step 73 (53 to 68 of 201 won), a mean of +0.92%. In the old marked runs the sleepers woke 80 to 105 µs after the merge, but spinners take their core from the siblings still parsing or merging |
+| The thread that drops the last teardown share sizes the file and exits, with no scope join and no wake-up of the main thread, +2 lines (step 73 work) | +0.28, −0.10, +0.08 and +0.22% (mean +0.12%): no gain |
+| `sched_getaffinity` in place of `std::thread::available_parallelism` (step 73 work) | Not built. The first call of `available_parallelism` takes 36 to 52 µs (it reads cgroup files), so it would save about 35 µs, but at +3 lines that is net zero |
+| One records mapping for all threads, made before the spawns, for fewer `mmap` calls in the spawn window (step 73 work) | Not built: with per-VMA locks (the replica's kernel 6.12.67), twelve threads faulting in one VMA would share its lock's cache line, and every fault would pay for it |
+| Groups of up to 8 (or 4) values sorted instead of rank-counted (step 73 work) | Not built: in the microbenchmark all the small groups took 8.75 ms (6.93 ms for up to 4) against 6.25 ms now |
 
 ## Lessons
 
@@ -1247,6 +1382,9 @@ On top of that:
   seeds 2-4 and holdout seed 99 byte-equal to the reference, and the empty input. Both are
   rustfmt-clean, step 70 builds without a warning, and step 71's Dockerfile passes the harness's
   `dockerfile_check.py`.
+- **Steps 72 to 74** passed the same replica gate on every kept build (250 malformed logs: 9 stop
+  at a tripwire, none crashes), with S from the harness's `static_axes.py`; step 74's Dockerfile
+  passes `dockerfile_check.py`.
 
 **Robustness runs** (replica, from Sun 1 Nov about 17:00 UTC; steps 68 and 69 on Mon 2 Nov), on
 the exact Dockerfile builds, with data generated on the replica by the organisers' generator (it
@@ -1284,10 +1422,14 @@ The gate is a shell script kept outside the repo (scc would count it as code): f
   first run (run-a533307c210b), with Track A alone slow in that dispatch, and 0.015715 s in its
   second (run-b3a4984e4320, 18.22 MB, 86.88 points) and 0.015702 s in its third
   (run-dcb2c65578ff, 18.24 MB, 86.88 points, the best Track A run until step 71 and the fastest
-  Track A time), step 70 0.015945 s (run-69ff2588acf9, 86.70 points) in a DISTURBED dispatch and
-  0.018846 s (run-772f480011c8) with Track A alone slow, and the submitted step 71 0.016146 s
+  Track A time until step 74), step 70 0.015945 s (run-69ff2588acf9, 86.70 points) in a DISTURBED
+  dispatch and 0.018846 s (run-772f480011c8) with Track A alone slow, step 71 0.016146 s
   (run-7e63f1ceb70a, 86.67 points) and 0.015752 s (run-89081c753251, 18.32 MB, 86.96 points, the
-  best Track A run).
+  best Track A run until step 74), and 0.017454 to 0.021444 s in four dispatches where B was slow
+  too, step 72 0.015938 s (run-2030fda93d3d, 86.78 points), 0.017918 s with B slow too and 0.0197 s
+  with Track A alone slow, step 73 0.019251 and 0.017649 s, with B slow in both dispatches, and the
+  submitted step 74 0.015606 s (run-977a4610bb91, 18.23 MB, 87.06 points, the best Track A run and
+  the fastest Track A time) and 0.020882 s with B slow too.
 - **Alternating dispatches**, before the replica: a candidate and the code it would replace were
   pushed in turn, a few minutes apart, so both met the same box state, and a result counted only
   if it repeated. Example (runs.log 08:10Z): step 37, step 39, step 37, step 39, step 37 gave
