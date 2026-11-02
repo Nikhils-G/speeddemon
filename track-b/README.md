@@ -56,11 +56,15 @@ PERF.md, "Where the scan's time goes"):
 
 37% of the tokens are of no row term and go to one sink row, whose word every such token ORs.
 
-The reference runs 56.35 s at 2,200 MB and S 91. The submitted code (PERF.md step 86, btr-3,
-1b4d9ff, S 1194) is step 85 with each slice's first-id log given back in place at the end of the
-merge (design 8). Its one board run so far, run-4b47a698c5ee (0.098043 s), came in a disturbed
-dispatch, with Track A slow too. The best Track B run is step 85's run-3835f14c495a: 0.068502 s
-at 32.15 MB for 81.49 points, the fastest Track B time and the best Track B points. Steps 82 to 85
+The reference runs 56.35 s at 2,200 MB and S 91. The submitted code (PERF.md step 89, bnm-1,
+480db54, S 1171) is step 86 in 25 fewer lines, with the scan's machine code and its alignment
+unchanged (steps 87 and 88), and with std's start-up skipped (step 89; Index, item 62). Its second
+board run, run-0fc9764834f2, took 0.067543 s at 31.92 MB for 81.70 points, the fastest Track B
+time and the best Track B points. That is 1.4% under step 85's run-3835f14c495a (0.068502 s, 81.49
+points), inside the board's spread, so the time gain rests on the replica, and the 21 lines fewer
+than step 85 add about 0.06 points. Step 86 (btr-3, 1b4d9ff, S 1194) is step 85 with each slice's
+first-id log given back in place at the end of the merge (design 8); its fastest board run took
+0.070026 s (81.25 points). Steps 82 to 85
 are step 81 with freed memory kept in the heaps and the term order sorted from 4-byte keys (step
 82), the trigger's query entries in 16 bytes and its group starts in 16 bits (step 83), the
 superblock counts from byte sums (step 84), and the entries loaded and transposed instead of
@@ -72,8 +76,8 @@ built at compile time (design 3). Step 79 (bsu-1, 03fe293, S 1165) is step 78 wi
 from 0.30 to 0.40 (design 4) and a check that queries.txt ends with LF (Error handling). Step 78
 (bt9-2, 51f656f, S 1164) is step 77 with 16-byte pending tokens, the ids and rows of the presence
 stores made 8 at a time, and each superblock row's four words side by side (designs 2 and 4).
-Since step 66, 9 of B's 34 board runs (eight in disturbed dispatches left out) took 0.089 to
-0.095 s and 25 took 0.068 to 0.083 s; the replica shows no such mode (PERF.md, "How
+Since step 66, 12 of B's 44 board runs (ten in disturbed dispatches left out) took 0.0888 to
+0.095 s and 32 took 0.0675 to 0.083 s; the replica shows no such mode (PERF.md, "How
 the final number was verified"). Step 77 is step 76 with a cheaper token path (design 2,
 *Presence and lists*): each stamp's cache line fetched for writing just before its store, the
 trigger and anchor lists left-packed 8 lanes per store, keys loaded from the window's start, and
@@ -85,8 +89,9 @@ On the replica step 66 runs in about 81.0 ms, steps 67 to 70 about 3.6 ms less, 
 75 about 1.3 ms less again, step 77 about 2.8 ms less again (2.1 to 2.5 ms on holdout 99) and
 step 78 about 1.5 ms less again (2.2 ms on holdout 99), step 79 about 0.1 to 0.5 ms, step 80
 about 0.3 ms, step 81 about 0.9 ms, step 82 about 0.4 ms, step 83 about 1.4 ms, steps 84 and 85
-about 0.6 ms each and step 86 about 0.5 ms less again, against 83.7 ms for step 65, 90.6 ms for
-step 53 and 97.2 ms for step 49 (details: PERF.md, steps 52-86).
+about 0.6 ms each, step 86 about 0.5 ms and step 89 about 0.1 ms less again (steps 87 and 88 at
+the same speed), against 83.7 ms for step 65, 90.6 ms for step 53 and 97.2 ms for step 49
+(details: PERF.md, steps 52-89).
 
 ## The design
 
@@ -96,9 +101,10 @@ board measured 37.52 to 40.32 MB for steps 52 to 55, 30.93 to 31.57 MB for step 
 30.25 MB for step 59, 29.97 to 30.63 MB for steps 61 and 62, 29.96 to 30.45 MB for steps 63 and
 64, 30.21 to 30.28 MB for step 65, 32.17 to 34.16 MB for step 66, 31.67 to 32.72 MB for steps 67
 to 69, 31.38 to 31.58 MB for step 77, 31.28 and 31.47 MB for step 78, 30.9 and 31.26 MB for step
-79, 30.97 and 31.72 MB for step 80, 31.42 MB for step 81, 31.4 to 32.42 MB for steps 82 to 85 and
-32.4 MB for the submitted step 86; the replica's max of 10 runs of step 69 was 32.73 MB, and of 20
-runs of step 86 32.39 MB, under the 44 MB credit.
+79, 30.97 and 31.72 MB for step 80, 31.42 MB for step 81, 31.4 to 32.42 MB for steps 82 to 85,
+31.9 to 32.4 MB for step 86, 31.97 to 32.12 MB for steps 87 and 88 and 31.17 to 32.03 MB for the
+submitted step 89; the replica's max of 10 runs of step 69 was 32.73 MB, and of 20 runs of step 89
+31.71 MB, under the 44 MB credit.
 malloc's mmap threshold is fixed at 1 MB, with transparent huge pages off (`mmap::set_up_memory`):
 at 32 MB the scan's first-id logs came from cleared heap and the peak reached 40 MB. Since step
 82 freed memory also stays in the heaps (a trim threshold of 1 GB): a trim flushes the TLB of every
@@ -388,6 +394,7 @@ and the perfect hash: `split_lines`, `Vocab`, `Phf`, `place_regions`, `hash`, `p
 59. No dependencies: libc calls declared by hand.
 60. One persistent pool of threads behind `par` (`worker`, `JOB`, `GENERATION`, `FINISHED`, `BUSY`): the first call spawns the workers, and each later call publishes a job and waits for every worker to count it done; an assert allows one call at a time. A waiting worker maps the corpus in ahead of the scan, one read per 64 KB (`ahead`). Exact: `par` returns only after every part is done, and no worker uses the job after the call returns (its SAFETY comment).
 61. Workers wait in `umwait` on the generation word (`wait`), woken by a write to its cache line or by the kernel's time limit; without WAITPKG, a polling loop. Exact: a wait ends only when the word shows the next job.
+62. std's start-up skipped (`#![no_main]`, our own C `main`, as in Track A): no stack-guard lookup through /proc/self/maps, and no signal handlers or alternate signal stacks, in the spawned threads either: 66 fewer system calls at 8 CPUs, about 0.12 ms on the replica (PERF.md, step 89). The data paths are joined by `concat`, not `format!`, which keeps the scan's hot functions at their 64-byte offsets. Exact: nothing here recurses deeply or handles a signal; the arguments arrive as before (glibc passes them to std), and a panic still prints its message, then aborts (a panic on the main thread now names it `<unnamed>`).
 
 ## Why the output is exact
 
@@ -533,7 +540,7 @@ Evidence, on the binary the Dockerfile builds:
   fresh-seed, repeat, tiny/sample and edge suites again, 1,426 runs each, all exact; steps 67 to 75
   change the setup, the page releases at the end and how `look_up` keeps anchor positions, and
   passed the gate, but of seeds 101-130 only 109 ran again, in step 70's A/B, with the same output
-  as step 69's; steps 77 to 86 ran all 30 again, below), with data generated on the replica by the
+  as step 69's; steps 77 to 89 ran all 30 again, below), with data generated on the replica by the
   organisers' generator (Python 3.11, which
   reproduces the official sample seed 1 and its reference output byte for byte). Every run was
   byte-exact, with no crash, no nonzero exit and no output on stderr:
@@ -546,12 +553,12 @@ Evidence, on the binary the Dockerfile builds:
     20 CPUs for both users: 840 of 840;
   - copies of seed 101 whose every file is an exact multiple of 4096 bytes, so that a read past
     the end of a file would fault, at 1, 3, 7, 12 and 20 CPUs: 5 of 5.
-- **The submitted code's final gate** (step 86, on the replica, Mon 2 Nov), every output
+- **The submitted code's final gate** (step 89, on the replica, Mon 2 Nov), every output
   byte-equal to the reference: fresh full seeds 101-130 at 1, 3, 7 and 12 CPUs (120 of 120 runs);
   tiny and sample seeds 201-210 as root and as uid 65534 at 1, 3, 12 and 20 CPUs (160 of 160);
   holdout 99 at nine CPU counts from 1 to 20 (9 of 9); 20 repeats of seed 101 at 12 and at 20 CPUs
   (40 of 40); 18 board-like edge cases at 1 and 12 CPUs as both users (72 of 72); and the gate's
-  144 runs and 66 hand-made edge runs. Memory, max of 20 runs, 32.39 MB. Steps 77 to 85 passed
+  144 runs and 66 hand-made edge runs. Memory, max of 20 runs, 31.71 MB. Steps 77 to 88 passed
   the same gate, with 30.91 to 32.78 MB (PERF.md, "How the final number was verified").
 - **The perfect hash, forced.** The per-region retry ran end to end from forced start seeds: in
   300 runs, 20 placed a region again, and all were exact.
@@ -617,7 +624,11 @@ Measured or modelled on seed 1; none of this was built.
 - **Setup is still about 8.3 ms of 73.4** (step 77's phase marks on the replica, PGO, median of 7
   runs; the split, the vocabulary, the sample and the plan). The plan alone was 5.7 ms on step 49.
   Tokenizing needs only the perfect hash, not the plan, so the scan could start as soon as the hash is built, buffering
-  each thread's first documents until the plan is published: about 3 to 4 ms, by our estimate.
+  each thread's first documents until the plan is published. We estimated 3 to 4 ms; timing-only
+  builds on step 88's code put its ceiling at about 0.6 to 0.75 ms (the idle window is about 1.9 ms
+  a worker, and the pre-pass slows the plan), for about 65 to 70 lines and 5 MB, so it stays
+  unbuilt (PERF.md, experiments). The lever they point at is the plan itself: 3.5 ms on every
+  thread's critical path, 1.34 ms of it serial.
 - **The triggered random accesses.** Two random accesses are left in the per-document evaluation,
   priced by timing-only builds (wrong output) of an earlier version of step 66: sending every
   match's state update to one answer saved 3.13 ms, and reading every entry from entry 0 also
