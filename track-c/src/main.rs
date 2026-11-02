@@ -52,7 +52,7 @@ compile_error!("track-c needs AVX2 and PCLMULQDQ: build with RUSTFLAGS=\"-C targ
 #[cfg(not(target_feature = "aes"))]
 compile_error!("track-c needs AES (the name hash): build with RUSTFLAGS=\"-C target-cpu=native\"");
 
-use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering::*};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering::*};
 use std::{arch::x86_64::*, fmt::Write, os::fd::AsRawFd, ptr::null_mut, sync::Mutex, thread};
 
 /// Each thread parses this many runs, on average: they are claimed as threads go,
@@ -125,9 +125,6 @@ unsafe extern "C" {
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     fn mallopt(param: i32, value: i32) -> i32;
     fn prctl(option: i32, ...) -> i32;
-    fn sched_getcpu() -> i32;
-    fn sched_getaffinity(pid: i32, size: usize, mask: *mut u64) -> i32;
-    fn sched_setaffinity(pid: i32, size: usize, mask: *const u64) -> i32;
     fn pthread_attr_init(attr: &mut [u64; 8]) -> i32;
     fn pthread_attr_setstack(attr: &mut [u64; 8], stack: *mut u8, size: usize) -> i32;
     fn pthread_create(thread: &mut u64, attr: &[u64; 8], f: Entry, w: usize) -> i32;
@@ -297,9 +294,6 @@ struct Shared<'a> {
     next_run: AtomicUsize,
     flushed: AtomicUsize,
     merged: AtomicUsize,
-    /// The CPUs the threads found themselves on after regions.csv, and the ones movers
-    /// claimed, a bit each (CPUs 0 to 63, see `move_off_shared_cpu`).
-    on: AtomicU64,
     /// Each thread's table (its partition), and its inbox: buffers of pairs filed
     /// under it that it has not taken yet. Buffers are handed over, not copied
     /// (copying them: +1.2 ms). Emptied buffers go to one pool that every filer draws
@@ -402,7 +396,6 @@ fn run(data_dir: &str, out_dir: &str) -> ! {
         next_run: AtomicUsize::new(0),
         flushed: AtomicUsize::new(0),
         merged: AtomicUsize::new(0),
-        on: AtomicU64::new(0),
         tables: (0..threads).map(|_| table()).collect(),
         inboxes: (0..threads).map(|_| Default::default()).collect(),
         empties: Mutex::new(Vec::new()),
@@ -500,7 +493,6 @@ extern "C" fn worker(w: usize) -> usize {
     // and the parse finds the input's page tables made.
     wait(&s.faulted, faulters);
     let mut pairs: Vec<_> = (0..threads).map(|_| Vec::with_capacity(capacity)).collect();
-    move_off_shared_cpu(&s.on);
     // Runs are claimed one at a time, so a thread slowed down parses fewer of them,
     // and past the faulters' waits no thread waits for another one until the end.
     while let Some(nth) = claim(&s.next_run, runs) {
@@ -609,31 +601,6 @@ fn finish(s: &Shared, w: usize, taken: &mut Vec<Vec<u64>>, totals: &mut [Totals;
         unsafe { drop_pages(&s.group_of[share(REGION_IDS)]) };
         unsafe { drop_pages(&lines[share(lines.len())]) };
         unsafe { drop_pages(&text[early..][share(text.len() - early)]) };
-    }
-}
-
-/// Two threads can start on one CPU while another one idles, and the scheduler then
-/// leaves them there for most of the run (+20%; on the replica, in 3% of runs). The
-/// second one to get here moves to the lowest CPU of `allowed` that no thread has
-/// claimed in `on`, and stays there for the rest of the run: only movers are pinned
-/// (pinning every thread was worse: 18 slow runs in 300 against 4), and a move happens
-/// in about 3% of runs. `allowed` is the CPUs this thread may use: the process's, which
-/// every thread starts with (CPUs 0 to 63; none if there are more, or the call fails).
-/// A failed call leaves it where it is: sched_getcpu's -1 reads as CPU 63, outside
-/// `allowed` unless the machine has 64 CPUs.
-fn move_off_shared_cpu(on: &AtomicU64) {
-    let mut allowed = 0;
-    // SAFETY: a system call that writes the 8 bytes of `allowed`.
-    unsafe { sched_getaffinity(0, 8, &mut allowed) };
-    // SAFETY: a libc call that touches no memory of ours.
-    let cpu = unsafe { sched_getcpu() } as u32 % 64;
-    let seen = on.fetch_or(1 << cpu, AcqRel) & allowed;
-    // The lowest CPU it may use that no thread has claimed (0 if none is left).
-    let bit = (!seen & allowed).isolate_lowest_one();
-    if seen >> cpu & 1 == 1 && bit != 0 && on.fetch_or(bit, AcqRel) & bit == 0 {
-        // SAFETY: a system call that reads the 8 bytes of `bit`; a failure keeps the
-        // thread where it is.
-        unsafe { sched_setaffinity(0, 8, &bit) };
     }
 }
 
