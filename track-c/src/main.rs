@@ -157,10 +157,16 @@ const FAULTERS: usize = 4;
 const STACK: usize = 256 << 10;
 const STACK_USED: usize = 24 << 10;
 /// The heap past its top as the workers start (`Shared::heap`), faulted in for the
-/// workers' allocations (nearly all of them pair buffers: 1.03 to 1.17 MB in all,
-/// measured on full seed 1). Past it, a worker faults its own pages: more memory, the
-/// same output.
-const MARGIN: usize = 1280 << 10;
+/// workers' allocations (nearly all of them pair buffers: 0.74 to 0.92 MB in all,
+/// measured on full seed 1 and holdout99). Past it, a worker faults its own pages: more
+/// memory, the same output.
+const MARGIN: usize = 1024 << 10;
+/// How much more of the margin main faults in than each other faulter. A CPU's stock is
+/// charged 64 pages at a time (see `run`), so a faulter that charges one page past a
+/// multiple of 64 keeps 63 unused ones. With equal shares, workers 1 to 3 charge 334 to
+/// 340 pages each (perf, kmem:mm_page_alloc, seed 1 and holdout99), just past 5 batches
+/// (320); this takes 26 pages of each one's share to main: 309 to 314, 5 batches each.
+const MAIN_EXTRA: usize = 104 * PAGE;
 
 /// Maps a whole file read-only for the rest of the process. It is never unmapped:
 /// the process exits right after using it, and exit unmaps everything.
@@ -326,7 +332,7 @@ static SHARED: std::sync::OnceLock<Shared<'static>> = std::sync::OnceLock::new()
 /// in the memory peak. With every thread faulting (step 59), they were 1.9 to 2.6 MB of its
 /// 9.6 to 10.1 MB on the replica; this way, only the CPUs that fault keep one.
 /// - Here, before the workers start: the join table, regions.csv's page tables, the
-///   heap margin's first 80 KB (`MARGIN / 16`, for the threads' first, small
+///   heap margin's first 64 KB (`MARGIN / 16`, for the threads' first, small
 ///   allocations) and the top `STACK_USED` of each worker's stack.
 /// - The faulters, a share each (`fault_in`): the input's page tables and the heap margin
 ///   (the pair buffers), which every thread waits for before its parse (`faulted`); then
@@ -437,8 +443,10 @@ fn fault_in(s: &Shared, f: usize, faulters: usize) {
     // The f-th of `faulters` equal parts of 0..n.
     let part = |n: usize| n * f / faulters..n * (f + 1) / faulters;
     touch(&s.text[part(s.text.len())]);
+    // Where faulter f's share of the margin starts: main's (f = 0) is MAIN_EXTRA larger.
+    let cut = |f: usize| MAIN_EXTRA * f.min(1) + (MARGIN - MAIN_EXTRA) * f / faulters;
     // A page more than the share, so that the divisions' rounding leaves no page out.
-    populate(s.heap + MARGIN * f / faulters, MARGIN / faulters + PAGE);
+    populate(s.heap + cut(f), cut(f + 1) - cut(f) + PAGE);
     s.faulted.fetch_add(1, Release);
     for table in &s.tables[part(s.threads)] {
         let (keys, rows) = &mut *table.lock().unwrap();
@@ -468,8 +476,8 @@ extern "C" fn worker(w: usize) -> usize {
     // The next of `n` items from a shared counter, or None once all are claimed.
     let claim = |next: &AtomicUsize, n: usize| Some(next.fetch_add(1, Relaxed)).filter(|&k| k < n);
     let mut totals = [EMPTY; GROUPS];
-    // Buffers taken from an inbox (see `take`), and empty ones for the next run.
-    let (mut taken, mut spare) = (Vec::new(), Vec::new());
+    // Buffers taken from an inbox (see `take`).
+    let mut taken = Vec::new();
     // regions.csv first, in REGION_CHUNKS equal parts. Every LF in it is followed
     // by a digit or the end, so `run_start` cuts it into whole lines. The entries a
     // listed id may have: one at or past the last is outside spec 2.3, and its index
@@ -497,14 +505,9 @@ extern "C" fn worker(w: usize) -> usize {
         let cut = |k| run_start(text, body_start, k, runs);
         let span = (cut(run_index), cut(run_index + 1));
         parse_run(text, span, s.group_of, &mut totals, &mut pairs);
-        // Up to `threads` empty buffers for the next run's pairs, all at once.
-        let mut pool = s.empties.lock().unwrap();
-        spare.extend((0..threads).map_while(|_| pool.pop()));
-        drop(pool);
         for (t, buffer) in pairs.iter_mut().enumerate() {
-            let fresh = spare.pop().unwrap_or_else(|| Vec::with_capacity(capacity));
             let mut inbox = s.inboxes[t].lock().unwrap();
-            inbox.push(std::mem::replace(buffer, fresh));
+            inbox.push(std::mem::take(buffer));
             // A thread that falls behind (it lost its core) would let its inbox,
             // and the memory peak, grow: past a bound, the filer takes it over.
             // (Normally an inbox holds a few buffers.) If the owner holds its table
@@ -523,6 +526,12 @@ extern "C" fn worker(w: usize) -> usize {
         // before it cost 2.6% (PERF.md, experiments).
         wait(&s.made, faulters);
         take(s, w, &mut taken, &mut totals);
+        // Empty buffers for the next run, drawn once this take has refilled the pool (drawn
+        // before the pushes, they were new ones while the last 12 waited: 0.3 MB more heap).
+        let mut pool = s.empties.lock().unwrap();
+        for buffer in &mut pairs {
+            *buffer = pool.pop().unwrap_or_else(|| Vec::with_capacity(capacity));
+        }
     }
     finish(s, w, &mut taken, &mut totals);
     0
