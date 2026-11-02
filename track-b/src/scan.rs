@@ -370,8 +370,7 @@ impl<'a> Scan<'a> {
     fn trigger(&mut self, plan: &Plan) {
         let (doc, stamp, entries) = (self.doc, self.stamp, plan.entries.as_ptr());
         let (evals, hits) = (self.evals.as_mut_ptr(), self.hits.as_mut_ptr());
-        let (group, lastdoc) = (plan.group.as_ptr(), self.lastdoc.as_mut_ptr());
-        let mut n = 0;
+        let (group, lastdoc, mut n) = (plan.group.as_ptr(), self.lastdoc.as_mut_ptr(), 0);
         // SAFETY: trigger terms are below bool_terms <= count, so t indexes lastdoc
         // (count + 5 bytes), and group has bool_terms + 2 entries. Fresh terms are
         // distinct, so their ranges are disjoint, and n stays at most the number of
@@ -401,8 +400,7 @@ impl<'a> Scan<'a> {
             let padding = _mm256_set1_epi32(plan.entries.len() as i32 - 1);
             _mm256_storeu_si256(evals.add(n).cast(), padding);
         }
-        let stamps = lastdoc.cast::<i32>().cast_const();
-        let mut nh = 0;
+        let (stamps, mut nh) = (lastdoc.cast::<i32>().cast_const(), 0);
         for b in (0..n).step_by(8) {
             // SAFETY: AVX2 and BMI2 are enabled for the whole build. evals[b..b + 8]
             // (b < n) were written above: lanes below n by the ranges' stores (a
@@ -506,8 +504,7 @@ impl Answers {
         // SAFETY: answer indexes the state (the caller's contract); an answer logs
         // at most FIRST_IDS ids, so logged <= FIRST_IDS * answers < log.len().
         let s = unsafe { &mut *self.state.as_mut_ptr().add(answer as usize) };
-        let log = self.log.as_mut_ptr();
-        let count = *s >> SUM_BITS;
+        let (log, count) = (self.log.as_mut_ptr(), *s >> SUM_BITS);
         let entry = |bits: u64| answer << 16 | (base + bits.trailing_zeros()) & 0xFFFF;
         // The first id without a branch: always written, kept only if wanted.
         // SAFETY: as above.

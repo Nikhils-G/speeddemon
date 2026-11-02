@@ -127,29 +127,19 @@ impl Plan {
         // Per old id: bit 0 for a BOOL term, bit 1 for a term of an `always` query.
         let kind: Vec<AtomicU8> = (0..sample_df.len()).map(|_| AtomicU8::new(0)).collect();
         // Whether each line is a BOOL query evaluated in every superblock.
-        let always_part = |p: usize| {
-            let (spans, terms) = &queries[p];
-            let always_line = |&(start, len, phrase): &Span| {
-                let words = &terms[start as usize..(start + len) as usize];
-                classify(words, phrase, cost, &kind)
-            };
-            spans.iter().map(always_line).collect::<Vec<_>>()
-        };
-        let always_lines = par(parts, &always_part).concat();
+        let always_lines = par(parts, &|p| classify(&queries[p], cost, &kind)).concat();
         let lines = always_lines.len();
         let kind: Vec<u8> = kind.into_iter().map(AtomicU8::into_inner).collect();
         let (order, rank) = term_order(&kind, sample_df);
         let bool_terms = kind.iter().filter(|&&k| k > 0).count();
         let rows = kind.iter().filter(|&&k| k == 3).count();
-        // The costs by new id, so `cover` finds the sets `always_line` found.
+        // The costs by new id, so `cover` finds the sets `classify` found.
         let cost = |t: u32| cost(order[t as usize]);
         // The sampled document frequency of a new id: phrases anchor on their rarest term.
         let df = |t: u32| sample_df[order[t as usize] as usize];
-        let records = |p: usize| {
-            // The number of lines before this part's.
-            let first = queries[..p].iter().map(|q| q.0.len()).sum();
-            records(&queries[p], first, &rank, &df, &cost, &always_lines)
-        };
+        // The number of lines before part p's.
+        let first = |p: usize| queries[..p].iter().map(|q| q.0.len()).sum();
+        let records = |p| records(&queries[p], first(p), &rank, &df, &cost, &always_lines);
         // Part p's records are out[p]. The entries are grouped by their cover term,
         // the phrases by their anchor.
         let out = par(parts, &records);
@@ -157,7 +147,7 @@ impl Plan {
         // own: `trigger` writes up to 7 indices past a range, and pads its last 8
         // with the last of them.
         let pad = [(bool_terms as u32, DocEntry::default()); 8];
-        let entry_pairs = || out.iter().flat_map(|o| &o.triggered).chain(&pad).copied();
+        let entry_pairs = || out.iter().flat_map(|o| &o.triggered).copied().chain(pad);
         let anchor = |p: &Phrase| (p.terms[p.offset as usize], *p);
         let anchor_pairs = || out.iter().flat_map(|o| &o.phrases).map(anchor);
         let always: Vec<_> = out.iter().flat_map(|o| o.always.iter().copied()).collect();
@@ -222,6 +212,9 @@ impl Plan {
     }
 }
 
+/// A part of the queries, as in `Queries`: its lines' spans and their terms.
+type Part = (Vec<Span>, Vec<u32>);
+
 /// What the plan takes from a range of the lines (`records`): its per-document
 /// BOOL entries, one per cover term, its phrases and its `always` entries.
 struct Records {
@@ -236,7 +229,7 @@ struct Records {
 /// sampled document frequency and `cost` its cost (see `cover`); `always_lines`
 /// marks the lines evaluated in every superblock.
 fn records(
-    (spans, terms): &(Vec<Span>, Vec<u32>),
+    (spans, terms): &Part,
     first: usize,
     rank: &[u32],
     df: impl Fn(u32) -> u32,
@@ -280,16 +273,21 @@ fn records(
     }
 }
 
-/// Marks the kinds of a line's terms and returns whether the line is a BOOL query
-/// evaluated in every superblock (its cover terms are expected in more than ALWAYS
-/// of the blocks, summed). A BOOL line's terms get kind bit 0, and bit 1 too when
-/// it is such a query; a phrase's terms get nothing here.
-fn classify(words: &[u32], phrase: bool, cost: impl Fn(u32) -> f64, kind: &[AtomicU8]) -> bool {
-    let always = !phrase && cover(words, &cost).2 > ALWAYS;
-    for &word in words.iter().filter(|_| !phrase) {
-        kind[(word & TERM) as usize].fetch_or(1 | (always as u8) << 1, Relaxed);
-    }
-    always
+/// Marks the kinds of the terms of a part of the queries and returns, per line,
+/// whether it is a BOOL query evaluated in every superblock (its cover terms are
+/// expected in more than ALWAYS of the blocks, summed). A BOOL line's terms get
+/// kind bit 0, and bit 1 too when it is such a query; a phrase's terms get nothing
+/// here.
+fn classify((spans, terms): &Part, cost: impl Fn(u32) -> f64, kind: &[AtomicU8]) -> Vec<bool> {
+    let line = |&(start, len, phrase): &Span| {
+        let words = &terms[start as usize..(start + len) as usize];
+        let always = !phrase && cover(words, &cost).2 > ALWAYS;
+        for &word in words.iter().filter(|_| !phrase) {
+            kind[(word & TERM) as usize].fetch_or(1 | (always as u8) << 1, Relaxed);
+        }
+        always
+    };
+    spans.iter().map(line).collect()
 }
 
 /// The new order of the terms (old ids by new id), and each old id's new id.
