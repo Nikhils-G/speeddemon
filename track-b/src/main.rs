@@ -200,18 +200,28 @@ fn main() {
         if p == 0 {
             for chunk in &chunks {
                 std::io::Write::write_all(&mut &file, chunk).expect("write results.txt");
+                // SAFETY: written, and not read again before the process exits.
+                unsafe { mmap::release(chunk) };
             }
             return;
         }
         let share = |len| part(len, p - 1, parts - 1);
         // SAFETY: none of these is read again before the process exits.
         unsafe { mmap::release(&text[share(text.len())]) };
-        // SAFETY: as above.
-        unsafe { mmap::release(&results[p].state) };
-        // SAFETY: as above.
-        unsafe { mmap::release(&results[p].ends) };
+        for r in &results[share(results.len())] {
+            // SAFETY: as above.
+            unsafe { mmap::release(&r.state) };
+            // SAFETY: as above.
+            unsafe { mmap::release(&r.ends) };
+            // SAFETY: as above.
+            unsafe { mmap::release(&r.ids) };
+        }
         // SAFETY: as above.
         unsafe { mmap::release(&vocab.table[share(vocab.table.len())]) };
+        // SAFETY: as above.
+        unsafe { mmap::release(&plan.anchored[share(plan.anchored.len())]) };
+        // SAFETY: as above.
+        unsafe { mmap::release(&plan.entries[share(plan.entries.len())]) };
     });
     // Done: exit without freeing the tables and logs, one free at a time.
     std::process::exit(0)
