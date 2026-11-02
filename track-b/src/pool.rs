@@ -17,8 +17,7 @@ pub fn par<T: Send + Sync>(n: usize, f: &(impl Fn(usize) -> T + Sync)) -> Vec<T>
     assert!(!BUSY.swap(true, Acquire), "par: one call at a time");
     let out: Vec<_> = (0..n).map(|_| OnceLock::new()).collect();
     // Part i, if there is one: every worker runs the job with its i.
-    let job = |i: usize| _ = out.get(i).map(|r| r.set(f(i)));
-    let job: &(dyn Fn(usize) + Sync) = &job;
+    let job: &(dyn Fn(usize) + Sync) = &|i| _ = out.get(i).map(|r| r.set(f(i)));
     // SAFETY: the lifetime is erased so that the static can hold the job. A worker
     // reads JOB only after GENERATION reaches this call's generation, which is
     // published after this store, and holds the read lock until it has run the job;
@@ -66,13 +65,8 @@ fn wait(word: &AtomicUsize, done: impl Fn(usize) -> bool) {
         unsafe { asm!("umonitor {}", in(reg) word.as_ptr(), options(nostack, preserves_flags)) };
         if !done(word.load(Acquire)) {
             // SAFETY: as above. The register operand 0 asks for C0.2, the deeper of
-            // the two states (1 would ask for C0.1).
-            unsafe {
-                asm!(
-                    "umwait {:e}", in(reg) 0, in("edx") u32::MAX, in("eax") u32::MAX,
-                    options(nostack)
-                )
-            };
+            // the two states (1 would ask for C0.1); EDX:EAX, all ones, is the deadline.
+            unsafe { asm!("umwait {:e}", in(reg) 0, in("edx") !0, in("eax") !0, options(nostack)) };
         }
     }
     while !done(word.load(Acquire)) {

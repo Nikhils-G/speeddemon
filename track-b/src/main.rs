@@ -36,7 +36,7 @@ use {plan::*, pool::*, scan::*, vocab::*};
 use std::arch::asm;
 use std::arch::x86_64::*;
 use std::cmp::Reverse;
-use std::mem::{replace, take, transmute};
+use std::mem::{replace, transmute};
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicUsize};
 use std::sync::{Barrier, LazyLock, Mutex, OnceLock, RwLock};

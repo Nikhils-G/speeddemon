@@ -1,7 +1,6 @@
 //! Read-only mmap and other libc calls, declared by hand so the crate has no dependencies.
 
-use std::io::Error;
-use std::os::fd::AsRawFd;
+use std::{io::Error, os::fd::AsRawFd};
 
 // The Linux x86-64 values of the libc constants used below.
 const PR_SET_THP_DISABLE: i32 = 41;

@@ -152,16 +152,14 @@ impl Plan {
         };
         // Part p's records are out[p]. The entries are grouped by their cover term,
         // the phrases by their anchor.
-        let mut out = par(parts, &records);
-        let mut by_trigger: Vec<_> = out.iter_mut().map(|o| take(&mut o.triggered)).collect();
+        let out = par(parts, &records);
         // 8 entries after the last that never match (truth 0), in a group of their
         // own: `trigger` writes up to 7 indices past a range, and pads its last 8
         // with the last of them.
-        by_trigger.push(vec![(bool_terms as u32, DocEntry::default()); 8]);
-        let by_anchor: Vec<_> = out.iter_mut().map(|o| take(&mut o.phrases)).collect();
-        let entry_pairs = || by_trigger.iter().flatten().copied();
+        let pad = [(bool_terms as u32, DocEntry::default()); 8];
+        let entry_pairs = || out.iter().flat_map(|o| &o.triggered).chain(&pad).copied();
         let anchor = |p: &Phrase| (p.terms[p.offset as usize], *p);
-        let anchor_pairs = || by_anchor.iter().flatten().map(anchor);
+        let anchor_pairs = || out.iter().flat_map(|o| &o.phrases).map(anchor);
         let always: Vec<_> = out.iter().flat_map(|o| o.always.iter().copied()).collect();
         let mut plan = Plan::default();
         // The anchors are grouped and the `always` entries sorted on a second
@@ -187,18 +185,16 @@ impl Plan {
         // In 16 bits, so that `trigger` reads half the lines.
         (plan.group, plan.entries) = (group.iter().map(|&g| g as u16).collect(), entries);
         (plan.anchor, plan.anchored) = anchors.into_inner().unwrap();
-        let mut always = always.into_inner().unwrap();
-        plan.number_answers(&mut always, lines);
+        (plan.always, plan.rows) = (always.into_inner().unwrap(), rows);
+        plan.number_answers(lines);
         let trig = |id: usize| id < bool_terms && plan.group[id] != plan.group[id + 1];
-        let flag = |id: usize| {
-            (plan.anchor[id] != plan.anchor[id + 1]) as u32 * ANCHOR | trig(id) as u32 * TRIG
-        };
+        let anchoring = |id: usize| plan.anchor[id] != plan.anchor[id + 1];
+        let flag = |id| anchoring(id) as u32 * ANCHOR | trig(id) as u32 * TRIG;
         // In parallel, a range of old ids per part.
         let word = |&id: &u32| id | flag(id as usize);
         let ids = |p| &rank[part(rank.len(), p, parts)];
         let info = par(parts, &|p| ids(p).iter().map(word).collect::<Vec<_>>());
         plan.info = info.concat();
-        (plan.always, plan.rows) = (always, rows);
         Some(plan)
     }
 
@@ -207,7 +203,7 @@ impl Plan {
     /// (47 KB instead of 4,000 scattered lines), then those of the entries in
     /// their order, then the phrases. Every line gets a number: it has an entry
     /// (a cover has at least one term), is an `always` one or is a phrase.
-    fn number_answers(&mut self, always: &mut [Entry], lines: usize) {
+    fn number_answers(&mut self, lines: usize) {
         (self.answer_of, self.line_of) = (vec![u32::MAX; lines], Vec::with_capacity(lines));
         let mut number = |line: &mut u32| {
             if self.answer_of[*line as usize] == u32::MAX {
@@ -216,7 +212,7 @@ impl Plan {
             }
             *line = self.answer_of[*line as usize];
         };
-        always.iter_mut().for_each(|e| number(&mut e.answer));
+        self.always.iter_mut().for_each(|e| number(&mut e.answer));
         for e in &mut self.entries {
             let mut answer = e.answer as u32;
             number(&mut answer);
@@ -228,7 +224,6 @@ impl Plan {
 
 /// What the plan takes from a range of the lines (`records`): its per-document
 /// BOOL entries, one per cover term, its phrases and its `always` entries.
-#[derive(Default)]
 struct Records {
     /// Each with its cover term.
     triggered: Vec<(u32, DocEntry)>,
@@ -259,20 +254,17 @@ fn records(
             // The first of the rarest terms (a phrase has at least one).
             let offset = (0..words.len()).min_by_key(|&k| df(words[k])).unwrap();
             assert!(words.len() <= 8, "queries.txt: a phrase of over 8 terms");
-            let mut phrase = Phrase {
+            phrases.push(Phrase {
+                terms: std::array::from_fn(|k| *words.get(k).unwrap_or(&0)),
                 answer,
                 offset: offset as u32,
                 len,
-                ..Phrase::default()
-            };
-            phrase.terms[..words.len()].copy_from_slice(words);
-            phrases.push(phrase);
+            });
             continue;
         }
         if always_lines[line] {
             // end_super reads only the first len terms: the rest stay 0.
-            let mut terms = [0; MAX_BOOL_TERMS];
-            terms[..words.len()].copy_from_slice(words);
+            let terms = std::array::from_fn(|k| *words.get(k).unwrap_or(&0));
             always.push(Entry { terms, answer, len });
             continue;
         }

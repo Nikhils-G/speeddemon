@@ -46,9 +46,8 @@ pub struct Scan<'a> {
 
 impl<'a> Scan<'a> {
     pub fn new(vocab: &'a Vocab, plan: Option<&'a Plan>, df: &'a [AtomicU32]) -> Self {
-        let rows = plan.map_or(0, |p| p.rows);
         let answers = plan.map_or(0, |p| p.line_of.len());
-        let wide = written_zeros(4 * (rows + 1));
+        let wide = written_zeros(4 * (plan.map_or(0, |p| p.rows) + 1));
         Scan {
             vocab,
             plan,
@@ -601,11 +600,10 @@ fn count_positions(v: __m256i, base: u32) -> u64 {
 /// `at + i` is a token byte ([A-Za-z0-9]) before `end`, of the second when it is LF.
 fn masks(docs: &[u8], at: usize, end: usize) -> (u64, u64) {
     let half = |at: usize| {
-        let bytes = &docs[at..at + 32];
         // SAFETY: an unaligned 32-byte load from a 32-byte slice; AVX2 is enabled
         // for the whole build.
         let (token, lf) = unsafe {
-            let v = _mm256_loadu_si256(bytes.as_ptr() as *const __m256i);
+            let v = _mm256_loadu_si256(docs[at..at + 32].as_ptr().cast());
             let at_least = |x, lo: u8| _mm256_cmpgt_epi8(x, _mm256_set1_epi8(lo as i8 - 1));
             let at_most = |x, hi: u8| _mm256_cmpgt_epi8(_mm256_set1_epi8(hi as i8 + 1), x);
             let between = |x, lo, hi| _mm256_and_si256(at_least(x, lo), at_most(x, hi));
