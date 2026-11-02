@@ -22,15 +22,19 @@ pub struct Scan<'a> {
     trig: Vec<u32>,
     evals: Vec<u32>,
     hits: Vec<u32>,
-    /// Per block of this superblock, its words: word r < plan.rows of block b,
-    /// `wide[b * (rows + 1) + r]`, is BOOL term r's in that block. Word `rows`
-    /// takes the other terms (its bits are never read). Kept block by block,
-    /// so that a block's words, which every token updates, are contiguous.
+    /// Per row, its four words, one per block of this superblock: word b of row
+    /// r < plan.rows, `wide[4 * r + b]`, is BOOL term r's in block b. Row `rows`
+    /// takes the other terms (its bits are never read). A row's 256 bits are one
+    /// 32-byte load in end_super. (Kept block by block from step 56, a term took
+    /// four loads of four lines there; since the presence stores are prefetched
+    /// and made 8 at a time, rows of 4 words are 1.0-1.1 ms faster.)
     wide: Vec<u64>,
-    /// This document's tokens to look up: their keys and the byte offsets of
-    /// their slots.
-    pending: Vec<(__m128i, u64)>,
-    /// This document's tokens' info words, and the positions of anchors among them.
+    /// This document's tokens to look up: per token its key (12 bytes and zero
+    /// bytes), with the byte offset of its slot stored over its top 4 bytes,
+    /// which the probe does not compare (16 bytes, not 32: half the lines).
+    pending: Vec<__m128i>,
+    /// This document's tokens' info words (their ids once look_up has recorded
+    /// them), and the positions of anchors among them.
     toks: Vec<u32>,
     anchors: Vec<u32>,
     /// The current document.
@@ -138,10 +142,16 @@ impl<'a> Scan<'a> {
                         let off = phf.slot(key) * size_of::<u128>();
                         prefetch(table.cast::<u8>(), off);
                         // SAFETY: `reserve(32)` above made room for this window's tokens.
-                        unsafe { out.write((key, off as u64)) };
+                        unsafe { out.write(key) };
+                        // The offset is a second, 4-byte store (volatile, so that it stays
+                        // one): inserted into the key by vpinsrd, 2 uops, it ran 0.4 ms
+                        // slower. Offsets fit 32 bits: the table is far under 4 GB.
+                        // SAFETY: as above, bytes 12 to 15 of the entry.
+                        unsafe { out.cast::<u32>().add(3).write_volatile(off as u32) };
                     } else {
-                        // SAFETY: as above.
-                        unsafe { out.write(vocab.get_long(&window[b..=e])) };
+                        let (key, off) = vocab.get_long(&window[b..=e]);
+                        // SAFETY: as above; SSE4.1 is enabled for the whole build.
+                        unsafe { out.write(_mm_insert_epi32::<3>(key, off as i32)) };
                     }
                     out = out.wrapping_add(1);
                 }
@@ -192,8 +202,10 @@ impl<'a> Scan<'a> {
         if id {
             parse_id(&docs[p..p + len]);
         }
-        self.pending
-            .push(self.vocab.get_long(&docs[p..p + len.min(64)]));
+        let (key, off) = self.vocab.get_long(&docs[p..p + len.min(64)]);
+        // SAFETY: SSE4.1 is enabled for the whole build.
+        let token = unsafe { _mm_insert_epi32::<3>(key, off as i32) };
+        self.pending.push(token);
         p + len
     }
 
@@ -206,9 +218,9 @@ impl<'a> Scan<'a> {
     fn look_up(&mut self, bit: u64) {
         let (miss, table) = (self.vocab.count, self.vocab.table.as_ptr());
         let (doc, rows) = (self.doc, self.wide.len() / 4 - 1);
-        // This document's block in the superblock: its word in each row.
+        // This document's block in the superblock: word `block` of each row.
         let block = (doc / 64 % (SUPER / 64)) as usize;
-        let wide = self.wide.as_mut_ptr().wrapping_add(block * (rows + 1));
+        let wide = self.wide.as_mut_ptr().wrapping_add(block);
         // 8 more each: end_doc's phrase compares read 8 ids from any token, and the
         // second step reads 8 ids and stores 8 lanes at a time.
         let more = self.pending.len() + 8;
@@ -217,10 +229,14 @@ impl<'a> Scan<'a> {
         self.anchors.reserve(more);
         let (toks, start) = (self.toks.as_mut_ptr(), self.toks.len());
         let mut len = start;
-        for &(key, off) in &self.pending {
+        for key in &self.pending {
+            // The slot offset, a 4-byte load (volatile, or LLVM extracts it from
+            // the key's 16-byte load, 2 uops).
+            // SAFETY: the top 4 of the 16 bytes of a pending token.
+            let off = unsafe { (key as *const __m128i).cast::<u32>().add(3).read_volatile() };
             // SAFETY: off is the byte offset of a slot of the table: Phf::slot gives
             // one below 2^(64 - shift), and get_long a long term's or the last one.
-            let info = unsafe { probe(table.byte_add(off as usize), key, miss) };
+            let info = unsafe { probe(table.byte_add(off as usize), *key, miss) };
             // SAFETY: room for every pending token was reserved above.
             unsafe { toks.add(len).write(info) };
             len += 1;
@@ -243,13 +259,28 @@ impl<'a> Scan<'a> {
         let (anchors, mut na) = (self.anchors.as_mut_ptr(), self.anchors.len());
         let (lastdoc, stamp) = (self.lastdoc.as_mut_ptr(), self.stamp);
         let sample = self.plan.is_none();
+        let mut row = [0u32; 8];
         for at in (start..len).step_by(8) {
+            // SAFETY: AVX2 is enabled for the whole build; the 8 ids from at < len
+            // are written (above).
+            let infos = unsafe { _mm256_loadu_si256(toks.add(at).cast()) };
+            // The 8 tokens' ids replace their info words (end_doc masks them anyway),
+            // and their rows' offsets, 4 * id.min(rows), go to `row`: 5 uops for the
+            // 8, where the scalar `& ID` and cmp/cmov took 3 a token (replica,
+            // non-PGO: -0.72 ms).
+            // SAFETY: as above; `row` holds 8 u32s.
+            unsafe {
+                let ids = _mm256_and_si256(infos, _mm256_set1_epi32(ID as i32));
+                _mm256_storeu_si256(toks.add(at).cast(), ids);
+                let rows8 = _mm256_min_epu32(ids, _mm256_set1_epi32(rows as i32));
+                _mm256_storeu_si256(row.as_mut_ptr().cast(), _mm256_slli_epi32::<2>(rows8));
+            }
             if !sample {
                 for k in 0..8 {
                     // SAFETY: at + k < len + 8 (at < len): ids written above.
-                    let id = (unsafe { *toks.add(at + k) } & ID) as usize;
-                    // SAFETY: id <= count < lastdoc.len(), and id.min(rows) < rows + 1,
-                    // a word of this block's.
+                    let id = unsafe { *toks.add(at + k) } as usize;
+                    // SAFETY: id <= count < lastdoc.len(), and row[k] = 4 * id.min(rows)
+                    // starts one of the rows + 1 rows, whose word `block` is this one.
                     unsafe {
                         // A store that misses L1 holds up the stores after it, which
                         // commit in order; fetched for writing first, the line arrives
@@ -257,17 +288,15 @@ impl<'a> Scan<'a> {
                         // cycles, -1.7 ms; ahead in the probe loop, +1.4 ms).
                         _mm_prefetch::<_MM_HINT_ET0>(lastdoc.add(id).cast());
                         *lastdoc.add(id) = stamp;
-                        *wide.add(id.min(rows)) |= bit;
+                        *wide.add(row[k] as usize) |= bit;
                     }
                 }
             }
-            // SAFETY: AVX2 is enabled for the whole build. The 8 ids from at < len
-            // are written (above). nt and na grow by at most one per token before
-            // at, at most at - start <= len - 1 - start past their first values, so
-            // the 8 lanes stored from them end inside the room reserved for them,
-            // more = len - start + 8 past those first values.
+            // SAFETY: AVX2 is enabled for the whole build. nt and na grow by at most
+            // one per token before at, at most at - start <= len - 1 - start past
+            // their first values, so the 8 lanes stored from them end inside the room
+            // reserved for them, more = len - start + 8 past those first values.
             unsafe {
-                let infos = _mm256_loadu_si256(toks.add(at).cast());
                 let positions = _mm256_add_epi32(_mm256_set1_epi32(at as i32), LANES);
                 // TRIG is bit 30, shifted to the sign bit; ANCHOR is the sign bit.
                 nt += left_pack(infos, _mm256_slli_epi32::<1>(infos), trig.add(nt));
@@ -418,16 +447,15 @@ impl<'a> Scan<'a> {
     /// `base`, on four words at once (one bit per document), then clears it.
     fn end_super(&mut self, base: u32) {
         let Some(plan) = self.plan else { return };
-        let (wide, stride) = (self.wide.as_ptr(), plan.rows + 1);
+        let wide = self.wide.as_ptr();
         for entry in &plan.always {
             let terms = &entry.terms[..entry.len as usize];
             // SAFETY: the terms of `always` entries are rows below plan.rows, so
-            // their 4 words are in wide. AVX2 is enabled for the whole build.
+            // their 4 words are in wide (an unaligned load: the Vec is 8-aligned).
+            // AVX2 is enabled for the whole build.
             let hits = unsafe {
                 terms.iter().fold(_mm256_setzero_si256(), |r, &word| {
-                    let w = wide.add((word & TERM) as usize);
-                    let words = [0, 1, 2, 3].map(|b| *w.add(b * stride) as i64);
-                    let x = _mm256_set_epi64x(words[3], words[2], words[1], words[0]);
+                    let x = _mm256_loadu_si256(wide.add(4 * (word & TERM) as usize).cast());
                     match word >> 30 {
                         AND => _mm256_and_si256(r, x),
                         NOT => _mm256_andnot_si256(x, r),
@@ -437,7 +465,8 @@ impl<'a> Scan<'a> {
             };
             self.answers.add_wide(entry.answer, hits, base);
         }
-        (0..4).for_each(|b| self.wide[b * stride..b * stride + plan.rows].fill(0));
+        // The sink row is never read, so never cleared.
+        self.wide[..4 * plan.rows].fill(0);
     }
 }
 
