@@ -896,7 +896,6 @@ fn ensure(ok: bool) -> Option<()> {
 /// # Safety
 /// `i` must be at least 8, and `fast_end` at most `text.len() - FAST_MARGIN`, or 0.
 /// Every read is in `i - 8..i + 196` (see below), so it is then inside the text.
-#[inline(always)]
 unsafe fn fast_record(text: &[u8], i: usize, fast_end: usize) -> Option<Record> {
     // (i >= 8, the caller's contract: load() reads the 8 bytes before an offset.)
     ensure(i < fast_end)?;
@@ -981,7 +980,6 @@ unsafe fn fast_record(text: &[u8], i: usize, fast_end: usize) -> Option<Record> 
 /// of line, so that it does not crowd the registers of the fast path's loop. Boxed:
 /// a Record returned by value is written into the caller's own Record, which then
 /// stays in memory, and the fast path stored every field of every record into it.
-#[cold]
 #[inline(never)]
 fn walk_record(text: &[u8], i: usize) -> Box<Record> {
     let mut at = i + (text[i] == 0xEF) as usize * 3; // a BOM is not data
@@ -1030,7 +1028,6 @@ fn number(bytes: &[u8]) -> u64 {
 /// Bitmaps of a 64-byte block: bit k is set if byte k is `"`, if it is `,`, and if
 /// it is inside quotes, counting from the block's start (an opening quote counts as
 /// inside, a closing one as outside, and a `""` pair leaves the state unchanged).
-#[inline(always)]
 fn masks(block: &[u8; 64]) -> (u64, u64, u64) {
     // SAFETY: AVX2 is enabled for this build (see the compile_error), and the two
     // unaligned 32-byte loads are inside the 64-byte array.
@@ -1050,7 +1047,6 @@ fn masks(block: &[u8; 64]) -> (u64, u64, u64) {
 /// opaque to the optimizer. LLVM rewrites the intrinsic as a vector of booleans,
 /// and on CPUs without AVX-512 (the scoring box) it then assembled our 64-bit
 /// masks one bit at a time: a quarter of the run time.
-#[inline(always)]
 fn bytes_eq(v: __m256i, byte: u8) -> u64 {
     // A u64: writing the 32-bit register clears the top half, so no zero-extension.
     let mask: u64;
@@ -1068,7 +1064,6 @@ fn bytes_eq(v: __m256i, byte: u8) -> u64 {
 /// (spec section 3, "Magnitudes"), region ids at most 9,999,999 and amounts at
 /// most 99,999.99 (spec 2.2), and the byte before it is not a digit (a BOM, an LF,
 /// a comma or a minus sign) unless it fills the word.
-#[inline(always)]
 fn numbers(words: [u64; 3]) -> [u64; 3] {
     // SAFETY: AVX2 is enabled for this build (see the compile_error), and the
     // transmute turns 32 bytes into 32 bytes, all of whose bit patterns are valid.
@@ -1108,7 +1103,6 @@ fn numbers(words: [u64; 3]) -> [u64; 3] {
 ///
 /// # Safety
 /// `s..s + len + 32` must be inside the text.
-#[inline(always)]
 unsafe fn hash_words(text: &[u8], s: usize, len: usize) -> u64 {
     // SAFETY: each block's 32 bytes start before `s + len` (or at `s`), and each
     // mask is inside the 64 bytes of `KEEP`. AES and AVX2 are enabled (see the
