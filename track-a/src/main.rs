@@ -53,7 +53,7 @@ const MAX_ENDPOINTS: usize = 1 << (32 - ENDPOINT_SHIFT);
 const PAD: usize = 256;
 /// The fewest bytes the parse moves on per line, whatever the bytes are (see
 /// `parse`): a slice of n bytes holds at most n / MIN_LINE + 1 lines.
-const MIN_LINE: usize = 35;
+const MIN_LINE: usize = 38;
 /// The longest endpoint the spec allows, in bytes; the parse stops on a longer one.
 const MAX_NAME: usize = 125;
 /// An output line starts with the hour label "YYYY-MM-DDTHH:00:00Z" and a space.
@@ -136,10 +136,6 @@ fn main() {
     // fault back in from the page cache unchanged (see release).
     let lf = |p| log[..len * p / slices].iter().rposition(|&b| b == b'\n');
     let cut = |p| lf(p).map_or(0, |i| i + 1);
-    // SAFETY: all-zero bytes are an empty table: every field is an atomic, a SIMD
-    // vector or a raw slice pointer (null, length 0), all valid as zeros.
-    // Allocated zeroed, its pages are mapped as the parse first touches them.
-    let table: &Interner = Box::leak(unsafe { Box::new_zeroed().assume_init() });
     // One pool of threads for both passes: each parses slices, then waits for the
     // merge (done by the last thread to finish pass 1, once every part is in) and
     // goes on with pass 2, so no thread is joined or started between the passes.
@@ -174,7 +170,7 @@ fn main() {
                 let pair = [&log[cut(p)..cut(p + 1)], &log[cut(p + 1)..cut(p + 2)]];
                 // SAFETY: the slices are part of the log: a read-only file mapping,
                 // which PAD zero bytes follow.
-                let [a, b] = unsafe { parse(pair, table, &mut free) };
+                let [a, b] = unsafe { parse(pair, &mut free) };
                 // Each index comes from the counter once, so these are the only sets
                 // of parts p and p + 1 and cannot fail. (Unchecked on purpose:
                 // `expect` or an assert here changed the instructions of the parse
@@ -183,7 +179,7 @@ fn main() {
             }
             // 4. The merge, on the last thread to finish pass 1: every part is in.
             if parsed.fetch_add(1, AcqRel) == threads - 1 {
-                merged.set(merge(&parts, &readers, table, &output)).ok(); // cannot fail
+                merged.set(merge(&parts, &readers, &output)).ok(); // cannot fail
                 // The parse threads gave back the log's pages, but not the page
                 // tables that mapped them (0.5 MB, charged to us): unmapping frees
                 // those too, while the other threads start pass 2. A failure would
@@ -194,7 +190,7 @@ fn main() {
                 // SAFETY: the keys (anonymous memory, in the table) are only looked
                 // up during the parse and the merge, so nothing reads them again;
                 // names are kept.
-                unsafe { release(&table.keys[..]) };
+                unsafe { release(&TABLE.keys[..]) };
             }
             // 5. Pass 2, once the merge has handed everything over.
             let (hours, file, lens, endpoints) = merged.wait();
@@ -353,12 +349,7 @@ fn main() {
 /// The merge between the passes: every part's runs sorted by (hour, part) and cut
 /// into hours, each part's reader count, the endpoints in byte order of their names,
 /// and the output mapped at a size no output can exceed.
-fn merge(
-    parts: &[OnceLock<Part>],
-    readers: &[AtomicUsize],
-    table: &'static Interner,
-    output: &File,
-) -> Merged<'static> {
+fn merge(parts: &[OnceLock<Part>], readers: &[AtomicUsize], output: &File) -> Merged<'static> {
     // Every part's runs, in order of hour then part. Every part is in (this is the
     // last thread to finish pass 1), so no `wait` here blocks. Two adjacent starts
     // of a part make one run, which ends at the second one's first record.
@@ -387,11 +378,11 @@ fn merge(
     // SAFETY: every part is in (waited for above, which orders every parse
     // thread's writes before this), so the parse is over: each id up to `count`
     // has its name written, and nothing writes the table any more.
-    let count = table.count.load(Relaxed);
-    let name = |id: usize| unsafe { &**table.names[id].get() };
+    let count = TABLE.count.load(Relaxed);
+    let name = |id: usize| unsafe { &**TABLE.names[id].get() };
     // SAFETY: as above, for the keys. A Key's first 32 bytes, read as two
     // [u8; 16], are plain bytes: any value is valid, and their alignment is 1.
-    let key = |id: usize| unsafe { *table.keys[id].get().cast::<[[u8; 16]; 2]>() };
+    let key = |id: usize| unsafe { *TABLE.keys[id].get().cast::<[[u8; 16]; 2]>() };
     let mut endpoints: Vec<_> = (1..=count).map(|id| (id, name(id))).collect();
     endpoints.sort_unstable_by_key(|&(id, name)| (key(id).map(u128::from_be_bytes), name));
 
@@ -511,9 +502,9 @@ type Order<'a> = Vec<(usize, &'a [u8])>;
 /// The PAD bytes after each slice must be readable: the loads of a line run on past
 /// its end. And the slices must be file-mapped memory that this process never
 /// writes, as their whole pages go back to the kernel at the end (see `release`).
-unsafe fn parse(chunks: [&[u8]; 2], table: &Interner, free: &mut &'static mut [u32]) -> [Part; 2] {
+unsafe fn parse(chunks: [&[u8]; 2], free: &mut &'static mut [u32]) -> [Part; 2] {
     // The loop writes without capacity checks: it moves on at least MIN_LINE bytes
-    // per line whatever the bytes are (the endpoint ends at byte 29 or later, then
+    // per line whatever the bytes are (the endpoint ends at byte 32 or later, then
     // 5 + 0 + 1), so no slice has more lines than its room. The second slice's
     // records start after room for the first one's.
     let most = chunks.map(|chunk| chunk.len() / MIN_LINE + 1);
@@ -533,12 +524,12 @@ unsafe fn parse(chunks: [&[u8]; 2], table: &Interner, free: &mut &'static mut [u
     // SAFETY: whatever the bytes, every load starts at a line start below its
     // slice's end and ends within PAD (256) bytes of it, which the caller makes
     // readable. Counted from the line start:
-    // - the space window ends by byte 92 (28 + 64);
-    // - the endpoint starts by 93 (29 + 64); the inline lookup reads from 8 bytes
-    //   before it to 64 after it (by 157), the long way 128 after it (by 221);
-    // - it ends by 91 (28 + 63), not before its start, or in the long way by 218
-    //   (93 + 125), where the assert stops an over-125-byte name;
-    // - the latency's 16 bytes start by 223 (218 + 5) and end by 239.
+    // - the space window ends by byte 95 (31 + 64);
+    // - the endpoint starts by 96 (32 + 64); the inline lookup reads from 8 bytes
+    //   before it to 64 after it (by 160), the long way 128 after it (by 224);
+    // - it ends by 94 (31 + 63), not before its start, or in the long way by 221
+    //   (96 + 125), where the assert stops an over-125-byte name;
+    // - the latency's 16 bytes start by 226 (221 + 5) and end by 242.
     // The digit tables are read only for count <= 6: 16 of DIGITS.0's 72 bytes from
     // byte 8 * count (so by byte 64), 8 of DIGITS.1's 36 entries from entry 4 * count
     // (by entry 32).
@@ -563,24 +554,27 @@ unsafe fn parse(chunks: [&[u8]; 2], table: &Interner, free: &mut &'static mut [u
         }
         // One 64-byte window after the timestamp: its first two spaces end the
         // method and the endpoint (no branch on the method or the length). Byte 27
-        // is the space after the timestamp, so the window starts at the method,
-        // byte 28; the endpoint starts one byte after the method's space.
+        // is the space after the timestamp and every method has 3 to 7 letters, so
+        // bytes 28-30 are letters and the window starts at byte 31, where the
+        // shortest method's space is: 3 more bytes of endpoint end in the window
+        // than from byte 28 (window misses 7.6% -> 6.6% of lines, seed 1). The
+        // endpoint starts one byte after the method's space.
         let load = |p: *const u8| _mm256_loadu_si256(p.cast());
-        let spaces = |at: usize| movemask(_mm256_cmpeq_epi8(load(line.add(28 + at)), space));
+        let spaces = |at: usize| movemask(_mm256_cmpeq_epi8(load(line.add(31 + at)), space));
         let window = spaces(0) | spaces(32) << 32;
         let first = window.trailing_zeros() as usize;
-        let from = line.add(29 + first);
+        let from = line.add(32 + first);
         // The window without its lowest bit: its lowest bit is now the second space
         // (none: the endpoint goes on past the window, and the long way finds its
         // end; a zero window stays zero and goes the long way too).
         let rest = window & window.wrapping_sub(1);
         let len = (rest.trailing_zeros() as usize).wrapping_sub(first + 1);
-        // Endpoints that end in the window (92% of lines) are looked up inline; the
+        // Endpoints that end in the window (93% of lines) are looked up inline; the
         // rest, and the inline lookup's misses, go the long way.
-        let found = (rest != 0).then(|| table.find(&[load(from), load(from.add(32))], from, len));
+        let found = (rest != 0).then(|| TABLE.find(&[load(from), load(from.add(32))], from, len));
         let (endpoint, len) = match found {
             Some((endpoint, true)) => (endpoint, len),
-            _ => table.id(from),
+            _ => TABLE.id(from),
         };
         // The latency: 1 to 10 digits from 5 bytes after the endpoint (its space,
         // the three status digits and a space), to the LF, all within the 16 bytes
@@ -709,6 +703,12 @@ unsafe impl Sync for Interner {}
 
 const SLOTS: usize = 8 * MAX_ENDPOINTS;
 
+/// The endpoint table, in zero-initialised memory: all-zero bytes are an empty table
+/// (every field is an atomic, a SIMD vector or a raw slice pointer, null with length 0,
+/// all valid as zeros), and its pages are mapped as the parse first touches them.
+// SAFETY: see above.
+static TABLE: Interner = unsafe { std::mem::zeroed() };
+
 impl Interner {
     /// The slot an endpoint starts its probe at: its length, its first 8 bytes and
     /// its last 8, two CRC steps. SLOTS is a power of two, so `%` is a mask.
@@ -764,17 +764,24 @@ impl Interner {
             let load = |p: *const u8| _mm256_loadu_si256(p.cast());
             let line: Key = std::array::from_fn(|i| load(from.add(32 * i)));
             let space = _mm256_set1_epi8(b' ' as i8);
-            let mask = |i: usize| (movemask(_mm256_cmpeq_epi8(line[i], space)) as u128) << (32 * i);
+            // The space mask in two 64-bit halves: built as one u128 from the four
+            // masks, it compiled to vector inserts on the path of every later step.
+            let mask = |i: usize| movemask(_mm256_cmpeq_epi8(line[i], space));
+            let half = |i: usize| (mask(i) | mask(i + 1) << 32) as u128;
             // 128 if there is none: a 125-byte endpoint's space is in the 128 bytes.
-            let len = (mask(0) | mask(1) | mask(2) | mask(3)).trailing_zeros() as usize;
+            let len = (half(2) << 64 | half(0)).trailing_zeros() as usize;
             // Tripwire for the spec's endpoint length: a file that breaks it stops here.
             assert!(len <= MAX_NAME, "requests.log: an endpoint is too long");
             // The key: the bytes up to and with the space after the endpoint, then zeros.
             let keep = KEEP.as_ptr().cast::<u8>().add(127 - len);
             let key = std::array::from_fn(|i| _mm256_and_si256(line[i], load(keep.add(32 * i))));
             // The same bytes as `find` hashes, from 8 bytes up (under 8 it almost never
-            // finds one).
-            let at = |i: usize| key.as_ptr().byte_add(i).cast::<u64>().read_unaligned();
+            // finds one): the key's bytes, read from the line, where `keep` keeps only a
+            // short endpoint and its space, as the key does. (Read back from `key`, the
+            // loads waited on the stores of the vectors just built: this cold path took
+            // 10% of the run's cycles; reading the line made the run 0.3% faster.)
+            let keep = 8 * len.min(7) as u32 + 8;
+            let at = |i: usize| _bzhi_u64(from.add(i).cast::<u64>().read_unaligned(), keep);
             let mut i = Self::home(len, at(0), at(len.max(8) - 8));
             loop {
                 let id = match self.slots[i].load(Acquire) {
