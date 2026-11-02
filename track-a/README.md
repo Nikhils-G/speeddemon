@@ -20,8 +20,12 @@ percentiles need every latency of a group, not a running summary.
 
 ## Where the time goes on the box
 
-The reference runs 32.05 s at 228 MB and S 56. Our best board run before this push is
-run-b6e32914afe1: 0.015462 s, 18.23 MB, S 441, 87.16 points, from step 74's code. PERF.md has
+The reference runs 32.05 s at 228 MB and S 56. The submitted code is step 77 (S 436): step 74's
+engine in five fewer lines, at its speed on the replica (+0.04% against step 75, which changed
+comments only). Our best board run before this push is step 77's run-0b59d8b4b145: 0.015546 s,
+18.04 MB, S 436, 87.19 points. The fastest is still run-b6e32914afe1, from step 74's code:
+0.015462 s, 18.23 MB, S 441, 87.16 points. Both of step 77's runs lie within the spread of that
+code's runs, so the new best comes from the five lines and the noise, not from speed. PERF.md has
 every step and its runs.
 
 **Reading the code.** All the code is `src/main.rs`. Read `main`'s phase list (phases 1-6) first,
@@ -71,10 +75,10 @@ page cache already, charged to the host. The peak came 2 to 3 ms into pass 2, wh
 of the 48 parts were still alive. Since step 61 the output waits until the records given back make
 room for it (*Gate*, below), and in 7 of 10 replica runs of step 68's code the peak is the start of
 pass 2, when each thread's first scatter faults in its values buffer. The expected highest of five
-peaks is 18.42 and 18.46 MB on the replica for two builds of the submitted source (40 rounds),
-against 19.49 MB for step 60. Each run's peak also includes 0 to 3 MB of the kernel's per-CPU
-charge batches, 2.3 to 3.1 MB at the peak in those 10 runs (PERF.md, "What we learned about the
-box").
+peaks is 18.50 MB on the replica for four builds of the submitted source (120 peaks, interleaved
+with step 75's builds, which read 18.51 MB), against 19.49 MB for step 60. Each run's peak also
+includes 0 to 3 MB of the kernel's per-CPU charge batches, 2.3 to 3.1 MB at the peak in those 10
+runs (PERF.md, "What we learned about the box").
 
 ## The design
 
@@ -101,6 +105,8 @@ The program has five parts. Each one exists because of one bottleneck.
 | Every output write deferred to the end of pass 2 | −1.00 MB, +1.90% T | the gate: −0.84 MB at the same speed |
 | `pwrite` from a 64 KB buffer; one writer thread with `write()` | server +1.4 ms; +5.1 ms | the shared output mapping (technique 10) |
 | Spinning on the merge's hand-off | +0.52 to +1.18% | sleeping on the `OnceLock` |
+| The hour's line head built once and copied whole | replica +0.23% for −1 line (step 76, taken out in step 77) | the key's 13 bytes and `:00:00Z ` copied apart (technique 10) |
+| A third 32-byte window, so that endpoints of up to about 93 bytes stay inline | not built: a probe that ran the cold lookup twice per long-way line put the whole cold path at about 1.7% of T | the cold path (technique 5) |
 | `MADV_POPULATE_WRITE` per hour; non-temporal record stores | replica +3.30%; +0.71% | plain page faults and stores |
 
 **Parse (pass 1).**
@@ -194,11 +200,11 @@ One line per technique: what it is, where it is in `src/main.rs`, and why the ou
 7. Hour change from one 8-byte compare of `MM-DDTHH` (`step`, `last`). Exact: all timestamps lie in one 72-hour span (spec).
 8. Hour key = the timestamp's first 13 bytes as a big-endian number. Exact: fixed width, so byte order is time order, and the bytes are the output label.
 9. Runs of lines instead of an hour per record (`Part`, `Start`, `Run`). Exact: every run of an hour is gathered from every slice, so no disorder bound is assumed.
-10. One 64-byte AVX2 space mask from byte 31, three letters into the method that follows the fixed 27-byte timestamp (`window`): 6.6% of seed 1's lines end past it, against 7.6% from byte 28 (PERF.md, step 68). Exact: fields are separated by one space, and every method has 3 to 7 letters, so bytes 28 to 30 are letters and the method's space is at byte 31 to 35.
+10. One 64-byte AVX2 space mask from byte 31, three letters into the method that follows the fixed 27-byte timestamp (`window`, compared with `SPACE`, one constant of 32 spaces): 6.6% of seed 1's lines end past it, against 7.6% from byte 28 (PERF.md, step 68). Exact: fields are separated by one space, and every method has 3 to 7 letters, so bytes 28 to 30 are letters and the method's space is at byte 31 to 35.
 11. Field ends by `tzcnt` and clear-lowest-bit, no branch on the method or the length. Exact: the first two set bits from byte 31 are the method's and the endpoint's spaces (10).
 12. `vpcmpeqb` and `vpmovmskb` by the plain intrinsics, in one helper since step 70 (`eq_mask`). At step 9 LLVM rebuilt the 64-bit mask bit by bit from the intrinsic, without AVX-512, and inline asm avoided it; in the code of step 53 the intrinsic compiles to the same hot loop as the asm, and the Dockerfile's build has no `vpinsrb` (PERF.md, step 53). Tracks B and C keep the inline asm. Exact: the same instructions.
 13. Endpoint lookup where it lies (`Interner::find`): the home slot from two CRC steps over the length and the first and last 8 bytes (`home`), then the stored key compared over bytes 0..=len (`eq_mask`, `bzhi`). Exact: the stored key is the endpoint, a space, then zeros, so a match of bytes 0..=len means the same bytes and the same length; the hash only picks the slot.
-14. Cold path for endpoints past the window, misses and inserts (`Interner::id`, `#[cold]`, `#[inline(never)]`; the insert itself, `Interner::add`, is not marked cold, as `id` is its only caller): 128 bytes loaded, the space mask built from two 64-bit halves (`half`), the key built with a sliding `KEEP` mask, the hash's two 8-byte words read from the line and cut by `bzhi` to a short endpoint and its space (not read back from the key just stored, which waited on store forwarding), linear probing from the home slot, and per slot four equality masks ANDed (`eq_mask`). Exact: the hash's words are the key's bytes at the same offsets, for every length, and the whole 128-byte key is compared.
+14. Cold path for endpoints past the window, misses and inserts (`Interner::id`, `#[cold]`, `#[inline(never)]`; the insert itself, `Interner::add`, is not marked cold, as `id` is its only caller): 128 bytes loaded, the space mask built from two 64-bit halves (`half`) against the same `SPACE` constant as the parse's window, the key built with a sliding `KEEP` mask, the hash's two 8-byte words read from the line and cut by `bzhi` to a short endpoint and its space (not read back from the key just stored, which waited on store forwarding), linear probing from the home slot, and per slot four equality masks ANDed (`eq_mask`). Exact: the hash's words are the key's bytes at the same offsets, for every length, and the whole 128-byte key is compared.
 15. 128-byte keys: an endpoint of up to 125 bytes, its space and zeros (`Key`). Exact: no endpoint byte is a space or zero, so equal keys mean equal endpoints, at any length.
 16. Tripwire `assert!` on the endpoint length (`MAX_NAME`, 125): malformed input stops instead of reading past the pad. Exact: it stops; it never guesses.
 17. One lock-free open-addressing table shared by all threads, ids published by compare-and-swap (`Interner::add`); a thread keeps an id that lost its slot for its next insert (`SPARE`, a thread-local `Cell<Option<usize>>`). Exact: a losing id is never in a record, and at most one id per thread is unpublished, so the 2,047 ids hold the spec's 1,842 endpoints for up to 205 threads.
@@ -355,7 +361,10 @@ stays exact for every seed of the generator.
     8 bytes from the line, with `bzhi` keeping 8 × min(len, 7) + 8 bits, instead of reading them
     back from the key it has just stored as vectors, which waited on store forwarding. Its space
     mask is built from two 64-bit halves, since one `u128` of four masks compiled to `vpinsrd`
-    inserts. The two measured −0.45% and −0.62% on the replica (PERF.md, step 68).
+    inserts. The two measured −0.45% and −0.62% on the replica (PERF.md, step 68). Its space
+    compares use the parse's `SPACE` constant (step 76). A probe that ran it twice per long-way
+    line was about 1.7% slower, which bounds what any wider inline window could gain (PERF.md,
+    experiments).
   - *Size.* There are 8 times as many slots as possible ids (11% load), so almost every lookup is
     one probe.
   - *Memory.* The table is one zeroed static (`TABLE`), so nothing allocates or clears its 352 KB:
@@ -418,6 +427,9 @@ stays exact for every seed of the generator.
   - A slice starts a new run when bytes 5..13 of the timestamp (`MM-DDTHH`, one 8-byte load)
     change.
   - The run's key is the first 13 bytes (`YYYY-MM-DDTHH`) read as a big-endian number.
+  - Each start of a part begins one run, which ends at the next start's first record; the last
+    one ends at the part's record count (since step 76; until then an end-marker start closed
+    each slice).
   - The merge sorts all runs by hour and cuts them into hours. The order of an hour's runs changes
     no output byte: each run reads its own escapes, and a group's values are only counted or
     selected.
@@ -616,8 +628,9 @@ from the techniques above:
 - **Evidence.** The seed-1 hash at 1, 3, 7 and 12 CPUs, sample seeds 2-4 and holdout seed 99 at
   every gate, and the robustness runs ("Robust on unseen seeds"): the 30 fresh full-scale seeds and
   1,485 more runs ran on step 59's build; step 71's code ran 2,224 runs on 136 new seeds; steps 72
-  to 74 passed the gate (seed 1 at 1, 3, 7 and 12 CPUs, sample seeds 1-4, holdout seed 99, the
-  empty input, 250 malformed logs).
+  to 74, 76 and 77 passed the gate (seed 1 at 1, 3, 7 and 12 CPUs, sample seeds 1-4, holdout seed
+  99, the empty input, 250 malformed logs); step 77's code ran 87 more new seeds, 698 runs at 1 to
+  8 CPUs.
 
 ## Spec edge cases
 
@@ -707,8 +720,15 @@ Evidence, all on the binary built by this directory's Dockerfile:
   holdout seed 99 and the empty input. Step 71's code also ran on 136 seeds never used before
   (tiny 301-400, sample 401-430, full 501-506), each against the organisers' reference at 1 to 8
   CPUs, with repeats and a harness-like container run: 2,224 runs, all byte-identical, no stderr.
-- **Steps 72 to 74** (step 74 is the submitted code): the same gate on every kept build (250
-  malformed logs: 9 stop at a tripwire, none crashes).
+- **Steps 72 to 74**: the same gate on every kept build (250 malformed logs: 9 stop at a
+  tripwire, none crashes).
+- **Steps 76 and 77** (step 77 is the submitted code), each on two exact Dockerfile builds: the
+  same gate (250 malformed logs: 9 stop at a tripwire, none crashes). Both versions' builds ran 43
+  seeds never used before (tiny 601-620, sample 631-645, full 651-658) on the laptop at 1, 3 and 8
+  CPUs, 129 of 129 runs per build. Step 77's builds also ran 44 more (tiny 681-700, sample
+  661-680, full 701-704) at 2, 4, 6, 7 and 8 CPUs, 220 of 220 per build, and the 20 tiny seeds on
+  the replica at 12 and 20 threads, 40 of 40 per build: 87 new seeds and 698 laptop runs with no
+  mismatch, no nonzero exit and nothing on stderr.
 - **The id bound, measured.** Every seed has 1,842 endpoints, against 2,047 ids. With step 54's
   code up to 13 ids were lost in 20 runs of a seed; with steps 57 to 59, at most 1 id in 150 runs,
   and the bound is one per thread: at most 1,854 ids at 12 threads.

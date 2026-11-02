@@ -1,9 +1,12 @@
 # Track A: performance log
 
-**Result.** The reference runs 32.05 s at 228 MB and S 56. The submitted code is step 74
-(0098691, S 441); step 75 changed comments only. Our best board run before this push is
-run-b6e32914afe1: 0.015462 s, 18.23 MB, 87.16 points, about 2,070× faster than the reference
-with about 12× less memory.
+**Result.** The reference runs 32.05 s at 228 MB and S 56. The submitted code is step 77
+(008c49b, S 436): step 75's engine in five fewer lines, at its speed on the replica (+0.04%). Our
+best board run before this push is step 77's second, run-0b59d8b4b145: 0.015546 s, 18.04 MB,
+S 436, 87.19 points, about 2,060× faster than the reference with about 12.6× less memory. The
+fastest Track A time is still step 75's run-b6e32914afe1 (0.015462 s, 18.23 MB, S 441, 87.16
+points). Both of step 77's runs lie within the spread of step 75's: the board cannot tell the two
+apart, and the new best comes from S and the noise, not from speed.
 
 Three ideas carry it: a parse that finds each line's fields from one AVX2 mask and looks its
 endpoint up where it lies, with two slices side by side per thread (steps 43 and 51); 4-byte
@@ -13,7 +16,7 @@ place once its start is known (steps 19 and 44). Steps 61 to 74 took our fastest
 0.016292 s (step 60, run-252c6a84434b) to 0.015462 s: the output gated on the records given back
 (61), the main thread as the 12th worker (63), a static endpoint table and a cheaper cold lookup
 (68), the name sort after the hand-off (69), the first pair of slices 5% smaller (72) and no std
-start-up (73).
+start-up (73). Steps 76 and 77 then cut five lines at the same speed (S 441 → 436).
 
 **How to read it.** One binary's board runs spread by up to 40%, so from step 49 every decision
 rests on paired runs on a replica of the box (the same CPU and the board's own timer), 201 pairs a
@@ -138,11 +141,81 @@ file mean ours, among team SALAAR's runs.
 | 71 | ccc90a3 (later runs from 5257718, 446aee0, 1b4d9ff, d85e890 and a0632f7, Track A unchanged) | al-6: step 70 with the done-slice test a plain `if` again, the 5xx flag stored directly, `Interner::add` no longer `#[cold]`, and the Dockerfile's training run and profile merge on one line (replica −0.23% against step 69, the mean of eight pairings; −0.42% and −0.18% against step 70's builds). Its second run was the best Track A run until step 74; its next four were slow, each with B slow too (the last three DISTURBED) | run-7e63f1ceb70a, run-89081c753251, run-dfbda2da77f9, run-13f4d67ceb2b, run-bfd4ca97ff0e, run-1104e6349b05 | 0.016146, 0.015752, 0.021444, 0.018704, 0.018601, 0.017454 | 18.4, 18.32, 18.82, 18.58, 18.68, 19.07 | 438 | 86.67, 86.96, 83.50, 85.03, 85.07, 85.67 |
 | 72 | 835cf16 (later runs from afa2a36 and 4131672, Track A unchanged) | ar-2: the first slices sized by start order, the first pair 5% smaller (the gain); one `madvise` per pair of slices instead of per slice; the cuts in one closure; the runs presized and sorted by hour alone (replica −0.275% against step 71 for the sizing, the mean of four pairings, and about −0.62% in all). First run slow, with Track A alone slow in that dispatch; the second with B slow too | run-8dc452c4fd51, run-6eadbf0d60da, run-2030fda93d3d | 0.0197, 0.017918, 0.015938 | 18.66, 19.23, 18.47 | 441 | 84.43, 85.33, 86.78 |
 | 73 | 835b127 (second run from 68e2d9f, Track A unchanged) | ar-4: std's start-up skipped (`#![no_main]`, our own C `main`), and `ptr` imported so that the pair's release fits one line (replica −1.08% against step 72 with that import, about 175 µs; about −1.7% against step 71). Both runs slow, with B slow too in each dispatch | run-72ac01d67671, run-619d42467af5 | 0.019251, 0.017649 | 18.48, 18.37 | 442 | 84.72, 85.68 |
-| 74 | 0098691 (second run from 480db54, third from 4f6e8b0, Track A unchanged) | ar-5: step 73 with the Dockerfile's `RUN` on three lines, the same commands (replica −0.10, −0.00, −0.05 and −0.00% against step 73: equal). **The submitted code**. Its first run was our best until step 75 (the same code); the second was slow, with B slow too; the third was slow, with Track A alone slow in that dispatch (B ran 0.067543 s) | run-977a4610bb91, run-ab14a5bbbaa8, run-870d15780bef | 0.015606, 0.020882, 0.017309 | 18.23, 18.24, 18.71 | 441 | 87.06, 83.90, 85.82 |
-| 75 | cbc99fd (later runs from f10f4b7, 60f559f, 4b997e4, 798ff2d and 9ccf3cb, Track A unchanged) | Comments only: the comments brought up to date with the code; the token stream is step 74's | run-53c59d1f073c, run-f23596461c7b, run-b6e32914afe1, run-095b20a38331, run-caaee94d9976, run-546f6f8bea92 | 0.015463, 0.015818, 0.015462, 0.016568, 0.015546, 0.015581 | 18.36, 18.38, 18.23, 18.86, 18.75, 18.62 | 441 | 87.13, 86.88, 87.16, 86.26, 86.98, 86.99 |
+| 74 | 0098691 (second run from 480db54, third from 4f6e8b0, Track A unchanged) | ar-5: step 73 with the Dockerfile's `RUN` on three lines, the same commands (replica −0.10, −0.00, −0.05 and −0.00% against step 73: equal). Submitted, with step 75's comments, until step 76. Its first run was our best until step 75 (the same code); the second was slow, with B slow too; the third was slow, with Track A alone slow in that dispatch (B ran 0.067543 s) | run-977a4610bb91, run-ab14a5bbbaa8, run-870d15780bef | 0.015606, 0.020882, 0.017309 | 18.23, 18.24, 18.71 | 441 | 87.06, 83.90, 85.82 |
+| 75 | cbc99fd (later runs from f10f4b7, 60f559f, 4b997e4, 798ff2d, 9ccf3cb and 9514121, Track A unchanged) | Comments only: the comments brought up to date with the code; the token stream is step 74's. Its third run was our best Track A run until step 77 and is the fastest Track A time; the seventh was slow, in a DISTURBED dispatch (B 0.147443 s) | run-53c59d1f073c, run-f23596461c7b, run-b6e32914afe1, run-095b20a38331, run-caaee94d9976, run-546f6f8bea92, run-af63fd2ceb52 | 0.015463, 0.015818, 0.015462, 0.016568, 0.015546, 0.015581, 0.018259 | 18.36, 18.38, 18.23, 18.86, 18.75, 18.62, 18.4 | 441 | 87.13, 86.88, 87.16, 86.26, 86.98, 86.99, 85.32 |
+| 76 | 718f0af | awf-s-2: six lines cut: one `SPACE` constant for both space masks; no end-marker start per slice, the merge ending each part's last run at the part's record count; two locals folded into closures in `names` and `Interner::id`; the hour's 21-byte line head built once and copied whole (replica +0.18% against step 75, the mean of eight pairings of four PGO builds a side, and +0.24% over twelve pairings of four other builds a side: at the edge of the ±0.4% that one 201-pair run spreads between PGO builds of one source). Its one run was slow, with Track A alone slow in that dispatch: B and C set their best runs in it | run-57937b939903 | 0.018512 | 18.57 | 435 | 85.17 |
+| 77 | 008c49b (second run from 1a5a6ba, Track A unchanged) | awf-final: step 76 without its line-head hunk, so the hour key's 13 bytes and `:00:00Z ` are copied apart again, as in step 75 (replica −0.23% against step 76, four of four direct pairings; +0.04% against step 75, the mean of eight pairings, and +0.05% on holdout seed 99: step 75's speed in five fewer lines). **The submitted code**. Its second run is our best Track A run, though B ran slow in that dispatch (0.086307 s). Both runs lie within the 0.015462 to 0.016568 s of step 75's six normal runs: the board cannot separate it from step 75 | run-eb078ed3a0a7, run-0b59d8b4b145 | 0.015816, 0.015546 | 18.73, 18.04 | 436 | 86.84, 87.19 |
 
-**The submitted code is step 74 (ar-5, 0098691), S 441**: step 71 with the first slices sized by
-start order and one release per pair (step 72, ar-2, 835cf16, S 441), std's start-up skipped
+**The submitted code is step 77 (awf-final, 008c49b), S 436**: step 75's engine in five fewer
+lines, cut in step 76 (awf-s-2, 718f0af, S 435) and given one back in step 77, at step 75's speed.
+Rust 432 → 427 lines; the Dockerfile's 9 are unchanged.
+- *Step 76, six cuts, S 441 → 435.*
+  - One `SPACE` constant (32 spaces, a transmuted `[b' '; 32]` with a SAFETY note: any 32 bytes
+    are a valid `__m256i`) for the space masks of `parse` and `Interner::id`, instead of a
+    `_mm256_set1_epi8` local in each: −1.
+  - No end-marker start per slice: `parse` no longer pushes a `u128::MAX` start after each slice's
+    runs; `merge` ends each part's last run at the part's record count
+    (`starts.iter().skip(1).map(|s| s.at).chain([records])`), and a part's reader count is its
+    number of starts: −2.
+  - `names`: one `entry` closure gives (id, name), with no `count` local: −1.
+  - `Interner::id`: the probe compares against `(*self.keys[id].get())[i]` inside `same`, with no
+    `known` local: −1.
+  - The hour's 21-byte line head built once per hour with `concat()` and copied whole, `write`
+    taking `head: &[u8]`: −1. Step 77 takes it out again.
+  - `ptr::null_mut()` without its `std::` prefix, twice (`ptr` is imported since step 73): tokens
+    only.
+- *Step 77: the line head in two copies again (+1).* `write` takes the hour key shifted to the
+  front of 16 big-endian bytes and copies their first 13 and `:00:00Z ` apart, as in step 75.
+- *Measured* (ab.sh, 201 pairs on full seed 1, four PGO builds a side; a pairing is one build of
+  each version).
+  - *Step 76 against step 75.* +0.31, −0.02, +0.25, +0.11, +0.04, +0.27, −0.10 and +0.57% (74 to
+    104 of 201 won), a mean of +0.18%; holdout seed 99, −0.18 and −0.26%. A/A pairings of step
+    75's own builds read −0.37, +0.10, −0.48, −0.04 and −0.01%: one 201-pair run spreads about
+    ±0.4% between PGO builds of one source. So step 76 was pushed as the same speed for six lines.
+    A second round on four other builds a side, twelve pairings: −0.02 to +0.43% (77 to 101 won),
+    a mean of +0.24%, and +0.23% on holdout seed 99 (A/A +0.28 and −0.05%). At A's exchange rates
+    (step 49) that is −0.026 points of T for +0.045 of S: still a net gain, but a small one.
+  - *Hunk by hunk.* Step 77 against step 76 directly: −0.16, −0.21, −0.34 and −0.20% (107 to 112 of
+    201 won), a mean of −0.23%, four of four faster. Against step 75: −0.12, −0.03, −0.00, +0.32,
+    −0.03, −0.03, +0.14 and +0.10% (90 to 106 won), a mean of +0.04%, and +0.12, −0.03, +0.07 and
+    +0.05% on holdout seed 99 (a mean of +0.05%): step 75's speed. So the line head in one piece
+    held the whole loss, +0.23% for one line, which is worth about 0.068% of T: 3.4 times its
+    price. Step 76 without `SPACE` instead (S 436) read −0.04 to +0.34%, a mean of +0.16% over
+    eight pairings against step 75, so `SPACE` costs at most about 0.08%, and it stays. Why the
+    line head in one piece is slower was not dissected; a guess is the slice-typed `head` in
+    `write`, with a length check per line and a copy whose length is not a constant.
+  - *Memory* (mem.sh, interleaved build by build, three rounds over four builds, 120 peaks a side).
+    Step 77: mean 18.160 MB, expected highest of 5 peaks 18.498 MB, against 18.152 and 18.513 MB
+    for step 75: equal. Step 76: 18.128 and 18.457 MB, against 18.116 and 18.422 MB in its own
+    rounds: equal.
+  - *Net.* Step 77 against step 75 at A's exchange rates: +0.037 points for S −5, −0.005 for
+    T +0.04%, M equal, so about +0.03 points.
+- *Why exact.* No cut changes an output byte.
+  - `SPACE` holds the 32 bytes that `_mm256_set1_epi8(b' ' as i8)` gave.
+  - A part's `records` has one entry per line of its slice, which was the end marker's `at`, so
+    every run ends where it did. The marker's escape index was never read: each run reads its
+    escapes from its own first escape on. An empty slice still gives no run and a reader count of
+    0, and a part with runs is still given back once its last run is placed.
+  - The two closures read the same table entries as the locals did, and step 77's `write` is step
+    75's.
+
+  Every kept build passed the gate ("How the final number was verified"), and step 77's two
+  builds ran 87 seeds never used before, 698 runs at 1, 2, 3, 4, 6, 7 and 8 CPUs, all
+  byte-identical.
+- *Board.* Step 76 ran once: 0.018512 s (run-57937b939903, 18.57 MB, 85.17 points), with Track A
+  alone slow in that dispatch, as B and C set their best runs in it (run-96f4490eeb42, 0.066 s;
+  run-38f216bf39eb, 0.016995 s). Step 77 ran 0.015816 s (run-eb078ed3a0a7, 18.73 MB, 86.84
+  points) and 0.015546 s (run-0b59d8b4b145, 18.04 MB, 87.19 points), both within the 0.015462 to
+  0.016568 s of step 75's six normal runs. Single runs cannot separate steps 75, 76 and 77: the
+  replica puts them 0.04 to 0.24% apart, while one binary's normal board runs spread about 7%. The
+  2.7 ms between step 76's run and step 77's first is the box, not the change, which the replica
+  measured at −0.23%. Step 77's second run is our best Track A run, 0.02 points over step 75's
+  run-b6e32914afe1 (87.16), with a T 0.54% higher and an M 0.19 MB lower than that run's, each
+  inside one binary's spread. So the new best comes from the five lines and the noise, not from
+  speed: the replica puts step 77's T at +0.04%.
+
+**Step 74 (ar-5, 0098691), S 441, submitted until step 76**: step 71 with the first slices sized
+by start order and one release per pair (step 72, ar-2, 835cf16, S 441), std's start-up skipped
 (step 73, ar-4, 835b127, S 442) and the Dockerfile's `RUN` on three lines (step 74).
 - *Step 72: the first pair smaller (+2 lines; with only this change, ar-1).* The cuts are no
   longer at `len * p / slices` but at `at(p) = len * (w(0) + ... + w(p - 1)) / (w(0) + ... +
@@ -891,6 +964,13 @@ dispatches where B's unchanged code ran 0.1209-0.1312 s.
   more than it saved (+0.92%): a spinning thread, even on `pause`, takes its core from the sibling
   that is still parsing or merging, and an idle CPU is slow to wake ("What we learned about the
   box").
+- **Steps 76 and 77: a set of cuts can hide one that costs.** Step 76's six cuts read +0.18% and
+  +0.24% together, inside the spread between PGO builds of one source, and were pushed as the same
+  speed. Measured hunk by hunk, one of them held the whole loss: the line head built once and
+  copied whole, +0.23% for one line, while one `SPACE` constant instead of two locals cost at most
+  0.08%. Without that hunk, step 77 runs at step 75's speed (+0.04%). A probe also bounded the
+  cold lookup: run twice per long-way line, it cost about 1.7%, so no wider inline window can gain
+  more than that ("Experiments").
 
 Pass 2 per thread (replica, profile and phase timers, steps 56-57's code): counting 0.41 ms,
 placing the values 1.11 ms (bound by L1 store misses: 7.8 cycles per record per thread),
@@ -1227,6 +1307,18 @@ The earlier probes behind step 12 used 0.25 ms units; their run IDs are not in o
 | `sched_getaffinity` in place of `std::thread::available_parallelism` (step 73 work) | Not built. The first call of `available_parallelism` takes 36 to 52 µs (it reads cgroup files), so it would save about 35 µs, but at +3 lines that is net zero |
 | One records mapping for all threads, made before the spawns, for fewer `mmap` calls in the spawn window (step 73 work) | Not built: with per-VMA locks (the replica's kernel 6.12.67), twelve threads faulting in one VMA would share its lock's cache line, and every fault would pay for it |
 | Groups of up to 8 (or 4) values sorted instead of rank-counted (step 73 work) | Not built: in the microbenchmark all the small groups took 8.75 ms (6.93 ms for up to 4) against 6.25 ms now |
+| The hour's 21-byte line head built once per hour with `concat()` and copied whole, −1 line (pushed in step 76, taken out in step 77) | +0.23%: step 76 without it ran −0.16, −0.21, −0.34 and −0.20% (107 to 112 of 201 won), 3.4 times the line's worth. Not dissected (step 77) |
+| `stats` without its `0 => return [0; 6]` arm, an empty group going through `small_ranks::<1>` and the rate over `n.max(1)`, −1 line (step 76 work) | +0.28, +0.15, +0.54 and +0.36% against step 75 (79 to 88 of 201 won), a mean of +0.33%, where the first four cuts alone read +0.13% on the same pairings |
+| That arm removed, `names`'s `entry` closure, and `order.wait()` inline in `flush` and in the groups loop, −4 lines (step 76 work) | −0.51 (a disturbed pairing), +0.37, +0.74, +0.34, +0.60, +0.54, +0.63 and +0.64%: a mean of +0.42%. The `entry` closure alone is in step 76 at the same speed, so the loss is in the two `order.wait()` sites and the arm |
+| `DIGITS` as two statics, `WEIGHTS` and `PLACES`, instead of one tuple, −2 lines (step 76 work) | +0.47, +0.88 and +1.21% (three pairings, 55 to 79 of 201 won): the tuple's single base address matters in the parse loop |
+| `Interner::id` without `#[inline(never)]`, −1 line (step 76 work) | `nm` shows the symbol gone: under PGO the cold lookup is then inlined into the worker, as `#[cold]` alone does not keep it out of line. +0.36, +0.35, +0.37 and −0.16% against step 75 (mean +0.23%), where step 76 read +0.16% on the same four pairings: no gain for the line |
+| No `#[inline(always)]` on `small_ranks`, with the line head in one piece, −2 lines (step 76 work) | +0.39, +0.08, +0.56 and +0.38% (79 to 94 of 201 won), a mean of +0.35%. The loss was put on the attribute then, as the first four cuts, the line head among them, read +0.11% (step 71's work had read −0.01 and −0.18% for the attribute alone); step 77 later measured the line head at +0.23%, so it may hold most of it. The attribute stays |
+| `parse_digits` summing in a `u32` instead of a `u64`, −1 line (step 76 work) | Not built: a latency of 11 or more digits, which breaks the spec, would then rely on wrapping arithmetic |
+| A home hash of one word, the length and the last 8 bytes, one CRC step less, −1 line (step 76 work) | Not built: offline, sample seed 1's 1,842 endpoints give 234 duplicate keys, which hold 43% of the lines |
+| A middle 8-byte word added to the home hash (step 76 work) | Not built: simulated with the real CRC32C, 16,384 slots and inserts in order of first appearance, the lines displaced from their home slot fell only from 2.18% to 1.93%, those of endpoints of 58 bytes or more staying at 7.71%: not worth a load and a CRC step on the hot path |
+| A third 32-byte window vector, so that endpoints of up to about 93 bytes stay inline (step 77 work) | Not built. A profile of step 75's code (perf record, 3 runs) put `Interner::id` at 6.8 to 8.5% of the cycles, about 70% of its calls from lines whose endpoint ends past the window. A ceiling probe ran the cold lookup twice per long-way line (same output): +1.54, +1.82, +1.73 and +1.63% (34 to 42 of 201 won). So the whole cold path costs about 1.7% of T (0.27 ms) and the long endpoints' share at most about 1.2%, against about 8 more uops on every line, a 96-byte compare in `find` and about 10 more lines. Twice the slots, which halved the home-slot misses (about 15% of the calls), measured −0.07% (step 69 work, above) |
+| The merge's runs sorted by a stable sort (`sort_by_key`) instead of an unstable one, 0 lines (step 77 work) | Against step 77's builds: seed 1 −0.11% (16 pairings, −0.41 to +0.15%), holdout seed 99 −0.02% (8 pairings); against step 75's builds +0.05% and −0.01%. Memory equal (80 peaks a side, means 18.074 and 18.133 MB). A seed-1 effect (an earlier round: −0.25% on seed 1, −0.04% on holdout), about nothing on an unseen seed: not taken |
+| LLVM's ext-TSP block layout, `-C llvm-args=-enable-ext-tsp-block-placement`, on the PGO build (step 77 work) | Slower: against step 77's builds, +0.20% on seed 1 (eight pairings, −0.26 to +0.73%) and +0.02% on holdout seed 99 |
 
 ## Lessons
 
@@ -1262,6 +1354,9 @@ The earlier probes behind step 12 used 0.25 ms units; their run IDs are not in o
   The sampler's data bounded both first: removing the stock needs every charge on one CPU, about
   −0.55 points of T for at most +0.45 of M, and removing the burst lowers the mean peak by 0.15 MB.
   Neither was built ("What we learned about the box").
+- **Split a set of cuts that reads at the edge of the noise.** Step 76's six cuts read +0.18% and
+  +0.24%, within the spread between builds. Measured one by one, a single cut held the loss
+  (+0.23% for one line), and the other five were free (step 77).
 
 ## How we measured
 
@@ -1395,6 +1490,16 @@ On top of that:
 - **Steps 72 to 74** passed the same replica gate on every kept build (250 malformed logs: 9 stop
   at a tripwire, none crashes), with S from the harness's `static_axes.py`; step 74's Dockerfile
   passes `dockerfile_check.py`.
+- **Steps 76 and 77** passed the same replica gate, each on two Dockerfile builds: the seed-1 hash
+  495ca09682b9… at 1, 3, 7 and 12 CPUs, sample seed 1 (ca6311bbeb53…) and sample seeds 2-4, holdout
+  seed 99, the empty input, and 250 malformed logs (9 stop at a tripwire, none crashes). Both are
+  rustfmt-clean, with S 435 and 436 from `static_axes.py`. The two builds of step 76 and the two of
+  step 77 also ran 43 fresh seeds (tiny 601-620, sample 631-645, full 651-658) against the
+  organisers' reference on the laptop at 1, 3 and 8 CPUs, 129 of 129 runs per build; step 77's builds then ran
+  44 more (tiny 681-700, sample 661-680, full 701-704) at 2, 4, 6, 7 and 8 CPUs, 220 of 220 per
+  build, and the 20 tiny seeds on the replica at 12 and 20 threads (48 and 80 slices, most of them
+  empty), 40 of 40 per build. Every run was byte-identical, and step 77's 698 runs on the fresh
+  seeds had no nonzero exit and nothing on stderr.
 
 **Robustness runs** (replica, from Sun 1 Nov about 17:00 UTC; steps 68 and 69 on Mon 2 Nov), on
 the exact Dockerfile builds, with data generated on the replica by the organisers' generator (it
