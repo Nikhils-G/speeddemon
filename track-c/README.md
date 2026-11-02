@@ -1,7 +1,7 @@
 # Track C: Join
 
 The task, the input files and the exact output format are in the [spec](https://github.com/hackathon-raptors/speed-demon-2026/blob/main/specs/c-join.md).
-The step-by-step history, with a board run for every step, is in [PERF.md](PERF.md).
+The step-by-step history, with the board run that measured each step (steps 4, 6, 10, 11, 13 and 29 have none in our log; the six probe steps report through their exit code), is in [PERF.md](PERF.md).
 
 ## What the program does
 
@@ -20,19 +20,12 @@ names must be counted per country over all records.
 
 ## Where the time goes on the box
 
-The reference runs 14.44 s at 367 MB and S 108. The submitted code (PERF.md step 63, d85e890,
-S 583) is step 62 with about 0.5 MB less memory peak on the replica: fewer buffers alive and a
-heap margin split so that each faulter charges whole batches of pages ("Memory" below). Step 62
-is step 60 in 12 fewer lines, and step 60 is step 59 with every page its workers write faulted in
-by four threads only, so that only four CPUs keep the kernel's per-CPU charge stock, which counts
-in the memory peak; the parse is unchanged. Step 63's two board runs came in dispatches where
-every track ran slow (run-37c6f4fc7adb, 0.019342 s, 10.67 MB; run-3647f4c11d20, 0.017982 s, 8.78
-MB). Steps 60 to 62 ran 15 times in our log at 0.017188 to 0.017841 s, and peaked at 8.55 to 9.33
-MB in 13 of them, where step 59's eight runs peaked at 9.76 to 10.69 MB. Its hot loops are those
-of steps 57 to 59: step 58 ran 0.0171 to 0.0174 s in 15 of its 19 board runs (fastest
-run-0be3ea3875d4, 0.017071 s, 10.58 MB, 83.69 points; best points run-00bcea1e0afe, 0.017356 s,
-9.66 MB, 83.90), and step 57 ran the fastest Track C time, 0.016978 s (run-c56b067ab64d). Details:
-PERF.md, steps 49-63.
+The reference runs 14.44 s at 367 MB and S 108. The submitted code, PERF.md step 67 (9ccf3cb,
+S 561), ran 0.017362 s at 8.16 MB, 84.17 points (run-0c9eb554171b). Its parse is step 66's, whose
+run-434f22246279 (0.017069 s, 8.23 MB, 84.32 points) has the best Track C points: 846x faster than
+the reference, with 45x less memory. The time comes from a simdjson-style parse, cuts and a record
+path that trust spec 2.2, and a join and a name count with no shared state (steps 7-49); the
+memory from four faulting threads that charge whole 64-page batches (steps 60-63). Details: PERF.md.
 
 Per record, step 46 executed about 193 instructions in all, parse and deduplication together
 (640.9M instructions for 3.32M records at 12 threads). The single largest stall is the join
@@ -44,16 +37,26 @@ the replica than counting at once: step 48's hot path against step 46's, 198 of 
 
 ## The design
 
-| Part | Bottleneck it addresses |
-|---|---|
-| Cuts from spec 2.2, found by each thread | A serial quote-parity pass over 202 MB |
-| simdjson-style bitmaps per record, numbers in one AVX2 pass | Instructions and branches per record on hostile CSV |
-| Two records in flight per loop; non-temporal prefetch | The random load into the 1 MB region table |
-| Region table: one byte per region id | The join itself |
-| Distinct names in one table per thread, buffers handed over | Atomics and cache-line traffic of one shared name table |
-| Runs claimed one at a time, no barriers | One slow CPU holding up every thread |
-| Input released in two calls per thread, small pooled buffers, tables dropped in parallel, exit without frees | Memory peak and the exit's serial unmap |
-| Memory faulted in by four threads only, on one heap and pre-faulted stacks | The per-CPU charge stock that every faulting CPU adds to the memory peak |
+| Part | Bottleneck it addresses | Measured effect |
+|---|---|---|
+| Cuts from spec 2.2, found by each thread | A serial quote-parity pass over 202 MB | Step 25 (trusting 2.2): 0.025101 → 0.022853 s, 561 → 445 lines |
+| simdjson-style bitmaps per record, numbers in one AVX2 pass | Instructions and branches per record on hostile CSV | Step 7: 0.0979 → 0.0553 s; step 15: 0.04093 → 0.02677 s, 506 → 282 instructions per record |
+| Two records in flight per loop; non-temporal prefetch | The random load into the 1 MB region table | Deferred counts −4.72% against counting at once (198 of 201 pairs); without the stream prefetch +0.75% |
+| Region table: one byte per region id | The join itself | Exact compact forms slower: rank table +6.6%, 32-id blocks 16.2 vs 12.8 ms a parse (server); the 256 KB upper bound −6.7% (wrong output, timing only) |
+| Distinct names in one table per thread, buffers handed over | Atomics and cache-line traffic of one shared name table | A shared lock-free table 0.0539 vs 0.0461 s (run-edc1e75d5cee); one table against four per thread −2.13%; buffers handed over, 0.19 vs 1.2 ms a flush copied (server) |
+| Runs claimed one at a time, no barriers | One slow CPU holding up every thread | With one CPU shared with a busy loop, 42 ms with barriers, 25 without (server) |
+| Input released in two calls per thread, small pooled buffers, tables dropped in parallel, exit without frees | Memory peak and the exit's serial unmap | About −1% (steps 51-52) |
+| Memory faulted in by four threads only, on one heap and pre-faulted stacks | The per-CPU charge stock that every faulting CPU adds to the memory peak | Max of 20 runs 10.61 → 8.54-8.69 MB (step 60); whole batches, mean 8.39 → 7.86 MB (step 63) |
+
+**What decided what stays.** By the board's formula, a code line costs about 0.052% of T or
+0.01 MB of M (S 583 → 561 is +0.125 points). On the replica, in 201 interleaved pairs, an A/A of
+two builds of one source reads −0.19% to +0.09%, so a difference under 0.3% counts as the same
+speed. A change stays only if it pays at that price:
+- the four faulters, +57 lines for 10.5 → 8.6 MB, stay;
+- the parallel teardown, +10 lines for about −1%, stays;
+- the CPU move, 16 lines (0.83% of T) for −0.39%, went in step 65;
+- `add` in batches, −1.20% for +18 lines, about break-even, was not taken;
+- the worker split, +49 lines for no speed, stays for readability, the one exception.
 
 **What the parser relies on.** Spec section 2.2 lists what the generator writes, for every seed
 and scale, the holdout included, and says that a solution may rely on it. This one does:
@@ -182,19 +185,17 @@ Two names are confused only if they share every compared bit:
 - *Why.* An earlier version had a barrier after each of 8 rounds, and one CPU shared with a busy
   loop made it take twice as long (42 ms instead of 22 on the test server); now it takes 25.
 - *Two threads on one CPU.* About one C run in four on the board was 20% slow: two of our threads
-  shared a CPU while another idled, and the scheduler left them together. After the wait for
-  regions.csv each thread now calls `move_off_shared_cpu`: it sets its CPU's bit (`sched_getcpu`) in one shared word; a thread that
-  finds its bit already set moves to the lowest CPU of its affinity mask that no thread has
-  claimed, and stays there for the rest of the run (`sched_setaffinity`). Only movers are pinned:
-  pinning every thread at its start was worse (18 slow runs in 300 against 4), and a move happens
-  in about 3% of runs. Each thread reads its own mask there (`sched_getaffinity`), and every
-  thread starts with the process's, so a move never leaves the CPUs the program was given, and a
-  failed call leaves the thread where it is. A normal
-  run moves nothing. On the replica, runs over 19.5 ms went from 9 to 2 and from 12 to 6 in two
-  sets of 300, and induced stacking from 43.96 to 20.57 ms (PERF.md, step 56).
+  shared a CPU while another idled. Steps 56 to 58 moved such a thread to a free CPU of its
+  affinity mask (replica median −0.39%; runs over 19.5 ms 9 → 2 and 12 → 6 in two sets of 300).
+  Step 65 removed the move again. Its 16 lines were worth more in S (+0.09 points) than its time:
+  replica median +0.12%, the final's estimator (the mean of the middle 3 of 5 runs) +0.14%, slow
+  runs 1.9% → 4.4% of 1,206, which the middle three absorb. Step 67 found where the slow runs came
+  from: waiters spinning on the CPU of the thread they waited for. It cut the spin before a wait
+  yields from 2^14 to 2^12 checks (`wait`), and runs over the median + 10% went from 3.6% to 1.7%
+  of 804 at the same median (PERF.md, steps 56, 65 and 67).
 - *Takeover.* If an inbox grows past 4 × threads buffers because its thread fell behind, whoever
-  files into it takes over its table. If the owner holds its table just then, it has most likely
-  lost its core to a filer, so the filer yields its core. Together these keep memory bounded.
+  files into it takes over its table and then yields its core: an owner that held its table had
+  most likely lost its core to this filer, and gets it back. Together these keep memory bounded.
   Before the yield (step 54), about 2% of runs grew inboxes of 113 to 178 buffers and peaked at up
   to 13.2 MB; with it, 200 runs peaked at 10.82 MB at most (PERF.md, step 54).
 - *Stripes.* Claims go round the file's stripes (one per thread, about 17 MB each at 12 threads),
@@ -210,7 +211,7 @@ Two names are confused only if they share every compared bit:
 **The code's layout.** `run` maps the files, derives the sizes, allocates the tables, faults in the
 main thread's share of the memory and starts the workers with `pthread_create`; its doc comment
 says who faults in what. Each thread runs `worker` (for workers 0 to 3, first their share of the
-faulting, `fault_in`; then its share of regions.csv, its pair buffers, `move_off_shared_cpu`, and
+faulting, `fault_in`; then its share of regions.csv, its pair buffers, and
 the run loop with the hand-off and the takeover), which ends in `finish` (the flush barrier, the
 input drop, the takes through `take`, the merge, then the other threads' teardown). The main thread
 runs worker 0 itself; once it returns, `run` writes the output and exits. What the threads
@@ -273,10 +274,10 @@ are exact; the distinct-name count rests on a hash (technique 6 below).
 20. Three numbers converted in one AVX2 pass (`numbers`): each word byte-reversed by `pshufb` (the amount's dot dropped), each number kept as the bytes below the word's lowest non-digit byte by `(x − 1) & !x`, then `maddubs`/`madd`/`packus`/`madd`. Exact: each number has at most 8 digits, and the byte before it is not a digit (a BOM byte, an LF, a comma or a minus sign) unless it fills the word.
 21. The next record's start from the LF bit of the tail's 32 bytes, already loaded (`fast_record`): no dot and no CR byte load on the chain from one record to the next. Exact: every record ends with an LF, and CR appears only in a CRLF terminator (spec 2.2); a record without its LF stops at the run's tripwire.
 22. `vpmovmskb` as inline asm (`bytes_eq`). Exact: the same instruction, without LLVM's bit-by-bit rebuild.
-23. Rare records (long fields, the last 256 bytes) to an out-of-line `#[cold]` walker (`walk_record`, `field`) that returns a boxed `Record`. Exact: it reads the same five fields byte by byte. Boxed, because a `Record` returned by value kept the fast path's `Record` in memory, and every field of every record was stored into it.
+23. Rare records (long fields, the last 256 bytes) to an out-of-line walker (`#[inline(never)]`; `walk_record`, `field`) that returns a boxed `Record`. Exact: it reads the same five fields byte by byte. Boxed, because a `Record` returned by value kept the fast path's `Record` in memory, and every field of every record was stored into it.
 24. The two-cursor loop bounded by `fast_end`, so `fast_record`'s own bound test is known true and dropped. Exact: records within 256 bytes of the end take the tail loops, which keep the test, and then the walker.
 25. Two halves of a run parsed in one loop (`parse_run`): two records' work in the core at once. The join-table entry is prefetched as soon as the region id is known (`record`), and each record is counted after the next is parsed (`last`), so the load has a parse to arrive. Exact: every record is counted once, the last one after the loop, and totals do not depend on record order.
-26. Non-temporal prefetch of the record stream 1 KB ahead: more of the region table stays in L2. Exact: a prefetch reads nothing the program uses.
+26. Non-temporal prefetch of the record stream 640 bytes ahead, about 10 records (60.8 bytes each on full seed 1): more of the region table stays in L2. It was 1 KB until step 63; 640 measured −0.37% to −0.68% on the replica over four pairings (PERF.md, step 64). Exact: a prefetch reads nothing the program uses.
 27. Branchy min and max: a new min or max is rare, so the branch predicts. Exact: min and max.
 28. Name and note bytes packed in one column (`<< 32`). Exact: each is below 2^31 (spec 3).
 29. Name identity from its raw bytes inside the quotes. Exact: `""` maps one to one to `"`; the empty name is empty quoted or not.
@@ -287,7 +288,7 @@ are exact; the distinct-name count rests on a hash (technique 6 below).
 34. Pair buffers handed to the owner's inbox, moved and not copied. Exact: every pair reaches its owner's table once (technique 7).
 35. One shared pool of empty buffers; a buffer that grew is dropped once emptied. Exact: memory policy only.
 36. Buffers sized at a run's mean share plus 2 standard deviations plus 4. Exact: a full buffer grows, so the size never drops a pair.
-37. An inbox past 4 × threads buffers is taken over by its filer, which yields its core if the owner holds the table (`yield_now`): memory stays bounded. Exact: the takeover is under the table's lock, so a table still has one writer at a time.
+37. An inbox past 4 × threads buffers is taken over by its filer, which then yields its core (`yield_now`): memory stays bounded. Exact: the takeover is under the table's lock, so a table still has one writer at a time.
 38. Runs claimed one at a time, 64 per thread: no barriers; a slow thread parses fewer. Exact: each run is claimed once from a counter.
 39. Claims round the file's stripes: concurrent runs rarely share a page-table page. Exact: the order of claims only.
 40. Spin, then yield, in the five waits (`wait`). Exact: the wait ends only when the counter is reached.
@@ -298,12 +299,11 @@ are exact; the distinct-name count rests on a hash (technique 6 below).
 45. Tables sized from the generator's 100,000-name pool with 8 standard deviations of room, at most 5/8 full; more names stop the program. Exact: it stops; it never drops a name.
 46. Input pages dropped after the parse in two parts, one call per thread for each (`drop_pages`): the first two thirds before the last takes, the last third by the non-writers during the write; 23 TLB-shootdown rounds instead of one per block. Exact: `MADV_DONTNEED` on a private file mapping that is never written, so a later read faults the same bytes back in.
 47. Totals summed under one lock as each thread finishes, counted by `merged`; once all are in, worker 0 returns to `run`, which writes and exits without dropping pages, while the others drop their tables' pages and a share of the join table, of regions.csv and of the input's last third (`drop_pages`). Exact: sums are added, min and max taken; the output is complete before the exit.
-48. The main thread is worker 0, and starts the others with `pthread_create` on 256 KB stacks it allocated (`STACK`, technique 8); a thread that finds another of ours on its CPU after the region wait moves to a free CPU of its affinity mask (`move_off_shared_cpu`, `sched_setaffinity`), and a failed call leaves it where it is. Exact: thread placement only.
+48. The main thread is worker 0, and starts the others with `pthread_create` on 256 KB stacks it allocated (`STACK`, technique 8). Exact: thread placement only.
 49. `#[inline(never)]` on `parse_run` and `add`: edits around them cannot change their register allocation. Exact: code placement only.
 50. Profile-guided build trained on generator seed 7, with atomic profile counters (Dockerfile). Items 50 and 51 change speed only: every check runs the Dockerfile's binary.
 51. Hot loops aligned to 64 bytes; fat LTO, one codegen unit, `panic = "abort"`, `crt-static`, `target-cpu=native`; `compile_error!` without AVX2, PCLMULQDQ or AES.
-52. Exit-code timing probes and in-process A/B probes on the box (PERF.md, "Box probes"). Measurement only, never a scored version.
-53. No dependencies: libc calls declared by hand.
+52. No dependencies: libc calls declared by hand.
 
 Each technique below names the bottleneck, what the design does about it, and why the output
 stays exact for every seed of the generator. Every total (count, sums, min, max, byte counts) is
@@ -348,7 +348,8 @@ exact. The distinct-name count rests on a hash; its odds are stated in technique
   - *Words.* The 8 bytes ending at each number go into one vector.
   - *Shuffle.* A shuffle reverses each word's bytes, so that byte k weighs 10^k, and drops the
     amount's dot.
-  - *Digits.* After subtracting `'0'`, digits are 0 to 9 and other bytes 10 or more. A number is
+  - *Digits.* After an XOR with `'0'`, which maps exactly the ten digit bytes to 0 to 9, every
+    other byte is 10 or more. A number is
     the bytes below its word's lowest other byte: `(x − 1) & !x` on the non-digit mask keeps them,
     with no table and no length.
   - *Conversion.* `maddubs`/`madd`/`packus`/`madd` convert all three numbers at once.
@@ -379,9 +380,12 @@ exact. The distinct-name count rests on a hash; its odds are stated in technique
     deferral without the prefetch was 1.22% slower (PERF.md, steps 47-48).
   - *The next record's start* comes from the LF bit of the tail's 32 bytes, not from the amount's
     end and a CR byte load: −0.57% on the replica (PERF.md, step 49).
-  - *Stream prefetch.* The record stream is prefetched non-temporally 1 KB ahead, so it takes less
-    of L2 and more of the table stays there. Without it the replica ran 0.75% slower (PERF.md,
-    experiments).
+  - *Stream prefetch.* The record stream is prefetched non-temporally 640 bytes ahead, about 10
+    records (60.8 bytes each on full seed 1), so it takes less of L2 and more of the table stays
+    there. Without it the replica ran
+    0.75% slower (PERF.md, experiments). 640 bytes instead of the earlier 1 KB measured 0.37 to
+    0.68% faster over four pairings of two builds a side; in a screen of one build each, 384 bytes
+    was 1.68% slower and 1,280 bytes 0.36% slower than 1 KB (PERF.md, step 64).
 - **Why exact.** The totals, the min and max, and the set of (name, country) pairs do not depend on
   the order in which records are counted, and every record is counted once: the last deferred one
   after the loop. The second half starts at a cut found like the run cuts, and the first half must
@@ -418,6 +422,13 @@ exact. The distinct-name count rests on a hash; its odds are stated in technique
     1. It is not a proof; on the six datasets we have, a check with the program's own `add` shows
     that no two names can be taken for one at any thread count from 1 to 20 (design, "Checked on
     our datasets").
+  - *The trade.* 47.6 bits is every bit this layout has room for: 18 key bits (32 minus the 14 row
+    bits), 11 bucket bits, the 15 bits of groups 241..255 and the partition's 3.6. More bits cost
+    memory. Step 33 went from 64-bit to 32-bit keys for 0.56 MB, about 0.25 points of M at step
+    60's rate (0.82 points for 1.8 MB). A collision's expected cost is its odds times the track's
+    points: 2.4e-5 × 84, about 0.002 points. An exact count would need the names' bytes at the
+    tables: an offset in every pair (8 → 12 bytes), one per row, and a byte compare on each of
+    3.32M hits, each a random read (analysis, not built).
   - *History.* Step 33 moved from 64-bit to 32-bit keys for 0.56 MB (server median), and step 46
     from four tables per thread to one for 2.13% of time: together, 50 → 47.6 bits at 12 threads.
     The output matched the reference on every seed tried (PERF.md, "How the final number was
@@ -500,7 +511,12 @@ exact. The distinct-name count rests on a hash; its odds are stated in technique
   10.75 to 10.80 MB against step 59's 10.79 to 11.30 (PERF.md, step 60). A worker that faults in
   pages of its own, for instance buffers past the 1 MB margin, keeps a charge stock on its CPU
   again, so a heavily contended run peaks higher: two board runs in disturbed dispatches peaked at
-  10.52 and 10.67 MB (PERF.md, steps 62 and 63). The output is the same.
+  10.52 and 10.67 MB (PERF.md, steps 62 and 63). Two runs at normal speed also peaked high:
+  run-0aed7bbdd563 (0.017127 s, 10.12 MB) and run-999b7573a7f5 (0.017202 s, 10.77 MB), with Track
+  B at its usual time in both dispatches (0.071064 and 0.067066 s). So contention does not explain
+  every high peak. The replica has the same rare tail: over 150 mem.sh runs each, the max was 10.73
+  MB for step 64's code and 9.81 MB for step 67's, against an expected max of 5 runs of 8.29 and
+  8.12 MB (PERF.md, step 63). The output is the same.
 
 ### 9. Build
 
@@ -513,6 +529,15 @@ exact. The distinct-name count rests on a hash; its odds are stated in technique
     `panic = "abort"`, a static binary, `target-cpu=native`.
   - *Code placement.* `#[inline(never)]` on `parse_run` and `add`, so that edits to the worker
     cannot change how their loops are compiled.
+  - *Training data.* `c_join.py` is a byte-identical copy of the organisers' generator, run only at
+    build time (there is no /data then). It trains on seed 7 at sample scale, not on the scored
+    seed 1, so the profile learns the generator's code paths and not the scored file, and none of
+    it reaches the output (site rule 04). S counts none of it: its 561 lines are 551 of Rust and 10
+    of the Dockerfile.
+  - *Measured.* `-align-loops=64` was within the board's spread at step 32 and is kept so that
+    unrelated edits move the hot loops less, at no line cost. A static non-PIE binary was 0.33% to
+    0.41% slower on the replica, so the binary stays PIE. PGO's own gain was not measured apart:
+    step 4, the build before it, has no board run in our log.
 - **Why exact.** The build changes speed only; each check runs the Dockerfile's binary.
 
 ## Why the output is exact
@@ -521,7 +546,8 @@ Every total (count, id and amount sums, min, max, name and note bytes) is exact 
 the generator writes (spec 2.2), at any thread count. `names_distinct` is exact unless two of the
 dataset's names agree on all 47.6 compared hash bits at 12 threads (42 on one thread), with odds
 of about 2.4e-5 per dataset (1.1e-3 on one thread); a check rules that out on all six datasets we
-have. The arguments, gathered from the techniques above:
+have; the trade against more bits is in technique 6. The arguments, gathered from the techniques
+above:
 
 - **Cuts.** Under 2.2 an LF inside quotes is followed by a letter or a quote, and a record
   terminator by the next record's id digit or BOM, so every cut is a record start and the runs
@@ -595,15 +621,15 @@ Evidence, on the binary the Dockerfile builds:
   - tiny 81 and 82 and sample 84 and 85 (steps 39 to 46);
   - earlier, tiny 61-63 and sample 64-66 (step 33), and 57, 58 and 71-73.
 - **Hostile input**: 32 mutants (truncations, stray quotes, no terminator, bad regions, more than
-  240 countries) exit 0 or stop with a message, never a segfault. Their exit codes were the same at
-  every gate from step 33 to step 48. Since step 49, two mutants whose terminator LF is replaced by
+  240 countries) exit 0 or stop with a message (a panic, never a memory fault). Their exit codes
+  were the same at every gate from step 33 to step 48. Since step 49, two mutants whose terminator LF is replaced by
   `x` stop the program where earlier steps wrote an answer; the reference rejects both inputs too.
   Since step 55, two more exit 0: one without a final terminator, with the reference's output, and
   one cut after a one-decimal amount, answered like any one-decimal amount, which the reference
   rejects.
 - **Robustness runs on the replica** (Sun 1 Nov, about 17:00 UTC), on the exact Dockerfile build
   of step 52 (steps 53, 54 and 56 to 59 change no output path, step 55 only a last record without
-  a terminator, which the generator never writes; all passed the gate; steps 60 to 63 are
+  a terminator, which the generator never writes; all passed the gate; steps 60 to 67 are
   below), with data generated on the replica by the organisers' generator (Python 3.11, which
   reproduces the official sample seed 1 and its reference output byte for byte). Every run was
   byte-exact, with no crash, no nonzero exit and no output on stderr:
@@ -624,9 +650,15 @@ Evidence, on the binary the Dockerfile builds:
 - **Steps 61 and 62** are step 60 in 12 fewer lines, with the output now written by `run` instead
   of `finish`. Both passed the gate on two builds each: the seed-1 hash at 1, 3, 7 and 12 CPUs, and
   every mutant's exit code unchanged (PERF.md, steps 61 and 62).
-- **The submitted code, step 63**, which changes when buffers are drawn and how the heap margin is
-  split, passed the same gate on two builds, and ran with a busy loop on CPU 1, 2 or 5 (15 runs
-  each) and on new full seeds 211 and 212, every output exact (PERF.md, step 63).
+- **Step 63**, which changes when buffers are drawn and how the heap margin is split, passed the
+  same gate on two builds, and ran with a busy loop on CPU 1, 2 or 5 (15 runs each) and on new
+  full seeds 211 and 212, every output exact (PERF.md, step 63).
+- **Step 64**, which changes only how far ahead the record stream is
+  prefetched, passed the same gate on two builds, with the seed-1 hash at 1 and 12 CPUs (PERF.md,
+  step 64).
+- **Steps 65 to 67, the submitted code**, which remove the CPU move and six attributes and shorten
+  the spin in `wait`, passed the same gate on two builds each, with the seed-1 hash at 1, 3, 7 and
+  12 CPUs (PERF.md, steps 65 to 67).
 - **Room for the names, measured.** The generator writes at most 100,529 distinct names (100,515
   to 100,524 measured). The fullest partition held at most 8,650 of its 10,240 rows (84.5%) at 12
   threads, 61.4% at one thread and 51.4% at 20. A table that filled up would stop the program,
@@ -668,7 +700,10 @@ edge cases of the robustness runs, each run through this program and through the
 - *Other panics.* A file that cannot be mapped, whose message names the OS error; indexing out of
   bounds, an unexpected header, a listed region id of 2^20 − 1 or more, more than 240 countries,
   and more distinct names than the tables hold. The build aborts on
-  panic (`panic = "abort"`), so each one prints its message and the exit status is nonzero.
+  panic (`panic = "abort"`), so each one prints its message and the exit status is nonzero. The
+  status is 134 (SIGABRT) when the program runs directly. As PID 1 in a container without
+  `--init`, which is how `check.py` runs it, the kernel ignores the abort signal and glibc's
+  fallback ends in SIGSEGV: status 139, after the same message.
 - *Bounds.* Every `unsafe` access is in bounds for any input, not only for 2.2 input: the fast path
   never reads outside the 256-byte margin it checks, and the walker hashes a padded copy of the
   name.
@@ -692,10 +727,28 @@ removed (PERF.md, step 25).
 
 ## Dependencies
 
-None: the Rust standard library only, with `mmap`, `madvise`, `mallopt`, `prctl`, `sched_getcpu`,
-`sched_getaffinity`, `sched_setaffinity`, `pthread_attr_init`, `pthread_attr_setstack` and
-`pthread_create` declared by hand. The build needs AVX2, PCLMULQDQ and AES (the Dockerfile builds with `target-cpu=native`);
+None: the Rust standard library only, with `mmap`, `madvise`, `mallopt`, `prctl`,
+`pthread_attr_init`, `pthread_attr_setstack` and `pthread_create` declared by hand. The build needs AVX2, PCLMULQDQ and AES (the Dockerfile builds with `target-cpu=native`);
 without them a `compile_error!` stops it.
+
+## Measured and rejected
+
+Each line is a row of PERF.md's experiments table, with its setup there:
+- a shared lock-free name table: 0.0539 against 0.0461 s on the board (run-edc1e75d5cee);
+- a simdjson stage-1 separator index, 4 KB at a time: instructions +15%, cycles +14% (server);
+- a 128-byte window in u128 bitmaps: 519 instructions per record (server);
+- an exact compact region table with an 18-instruction rank: +6.6%;
+- `MADV_POPULATE_READ` per run: +1.95%; per stripe: +3.28%;
+- every thread pinned at its start: 18 slow runs in 300, against 4;
+- 6 threads for fewer charge stocks: T +25.98% for −1.48 MB;
+- a dot-anchored kernel: 23.04-23.08 against 20.38 ms, dropped after two attempts (server);
+- separators by `pdep`: +1.10%;
+- cmov min and max: +0.4 ms (server);
+- a multiply-mix hash instead of AES rounds: +30M instructions (server);
+- three cursors: −0.76% at step 46 (21 of 31 pairs, no faster at that sample size), +2.1% at step
+  48;
+- pread instead of the mapping: no change on the box (run-4381f7c8201d);
+- `#![no_main]`, as in Track A: −0.07% for 2 more lines.
 
 ## With another 24 hours
 
