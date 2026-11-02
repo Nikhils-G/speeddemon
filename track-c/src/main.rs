@@ -383,11 +383,10 @@ fn run(data_dir: &str, out: &str) -> ! {
     // error.
     let names = (101_000 / threads).max(1);
     let slots = ((names + 8 * names.isqrt()) * 8 / 5).next_power_of_two();
-    // Pairs per partition in one run (records are about 60 bytes), and 2 standard
-    // deviations more. A buffer that overflows grows, and is dropped once emptied.
-    // (Room for nearly every run, 3.4 deviations: 0.3 MB more.)
-    let runs = threads * RUNS_PER_THREAD;
-    let mean = text.len() / (runs * 60 * threads);
+    // Pairs per partition in one of the threads * RUNS_PER_THREAD runs (records are about
+    // 60 bytes), and 2 standard deviations more. A buffer that overflows grows, and is
+    // dropped once emptied. (Room for nearly every run, 3.4 deviations: 0.3 MB more.)
+    let mean = text.len() / (threads * RUNS_PER_THREAD * 60 * threads);
     let capacity = mean + 2 * mean.isqrt() + 4;
     // The join table, zeroed, and faulted in on this thread (see above).
     // SAFETY: all zero bits are a valid AtomicU8 (0).
@@ -510,7 +509,9 @@ extern "C" fn worker(w: usize) -> usize {
     // Every chunk entered, and the faulters' first share in: the pair buffers land in the
     // faulted margin, and the parse finds the input's page tables made.
     wait(&s.ready, REGION_CHUNKS + faulters);
-    let mut pairs: Vec<_> = (0..threads).map(|_| Vec::with_capacity(capacity)).collect();
+    // An empty pair buffer.
+    let new = || Vec::with_capacity(capacity);
+    let mut pairs: Vec<_> = (0..threads).map(|_| new()).collect();
     // Runs are claimed one at a time, so a thread slowed down parses fewer of them,
     // and past the faulters' waits no thread waits for another one until the end.
     while let Some(nth) = claim(&s.next_run, runs) {
@@ -547,9 +548,7 @@ extern "C" fn worker(w: usize) -> usize {
         // (Drawn before the hand-off, they were `threads` new ones at the first run's end,
         // while the full ones waited in the inboxes: 0.3 MB more heap.)
         let mut pool = s.empties.lock().unwrap();
-        for buffer in &mut pairs {
-            *buffer = pool.pop().unwrap_or_else(|| Vec::with_capacity(capacity));
-        }
+        pairs.fill_with(|| pool.pop().unwrap_or_else(new));
     }
     finish(s, w, &mut taken, &mut totals);
     0
