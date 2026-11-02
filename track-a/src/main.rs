@@ -65,7 +65,7 @@ fn main() {
     // 2. start one pool of threads, this one included, which runs both passes;
     // 3. pass 1, in each thread: parse slices of the log into packed records;
     // 4. the merge, on the last thread to finish pass 1: the hours and the output
-    //    mapping, handed over at once, then the endpoints' byte order;
+    //    mapping, handed over together, then the endpoints' name order;
     // 5. pass 2, in each thread: per hour, group the records by endpoint, compute
     //    the statistics, and write each hour once the earlier ones have lengths and
     //    the records given back make room for it;
@@ -141,7 +141,7 @@ fn main() {
     // goes on with pass 2, so no thread is joined or started between the passes.
     let parts: Vec<OnceLock<Part>> = (0..slices).map(|_| OnceLock::new()).collect();
     // The merge's hand-off (`Merged`), then the endpoints in byte order of their names
-    // (`Order`), sorted right after it.
+    // (`Order`), which the merging thread sorts after it.
     let (merged, order) = (OnceLock::<Merged>::new(), OnceLock::<Order>::new());
     // How many hours still read each part's records: the hour that brings its
     // part's count to zero gives the rest of them back.
@@ -189,15 +189,17 @@ fn main() {
                 // SAFETY: every part is in, so nothing reads the log any more: every
                 // endpoint's bytes and key were copied, and `log` is not used again.
                 unsafe { munmap(base_addr as *mut u8, len + PAD) };
-                // The name order, sorted while the other threads start pass 2: no hour
-                // needs it before its values are placed (see `names`).
-                order.set(names()).ok(); // cannot fail: set once, here
-                // SAFETY: the keys (anonymous memory, in the table) are only looked
-                // up during the parse and by `names` (sorted just above), so nothing
-                // reads them again; names are kept.
+                // The name order, sorted while the other threads start pass 2: an hour
+                // first waits for it when it builds its groups, after placing its values.
+                // SAFETY: this is the merging thread, after the merge: every part is in,
+                // so the parse is over, as `names` requires.
+                order.set(unsafe { names() }).ok(); // cannot fail: set once, here
+                // SAFETY: the keys (in the table, in .bss: anonymous memory) are read
+                // only during the parse and by the sort just above (`names`), so
+                // nothing reads them again; names are kept.
                 unsafe { release(&TABLE.keys[..]) };
             }
-            // 5. Pass 2, once the merge has handed everything over.
+            // 5. Pass 2, once the merge's hand-off is set (the groups wait for the name order).
             let (hours, file, lens) = merged.wait();
             // The number of records in hour h: each run's end minus its first record.
             let size = |h: usize| hours[h].iter().map(|run| run.end - run.begin.at).sum();
@@ -226,7 +228,8 @@ fn main() {
                     // SAFETY: bytes at..at + len of the mapping are this hour's alone, and
                     // at + len <= total <= bound: a line is at most 213 bytes (see bound).
                     let out = unsafe { std::slice::from_raw_parts_mut((file + at) as _, len) };
-                    // The hour key's 13 bytes, and the name order (set: this hour used it).
+                    // The hour key's 13 bytes, and the name order (already set: this
+                    // hour's groups were built in it).
                     let head = (hours[hour][0].begin.key << 24).to_be_bytes();
                     let endpoints = order.wait();
                     // Last line first, each one ending where the next one starts.
@@ -389,11 +392,17 @@ fn merge(parts: &[OnceLock<Part>], readers: &[AtomicUsize], output: &File) -> Me
     (hours, file, lens)
 }
 
-/// The endpoints in byte order of their names, sorted by the merging thread right
-/// after the hand-off, while the others start pass 2: the sort takes 0.14 ms, which
-/// the other threads waited for when it was part of the merge (0.9% of the run on
-/// the replica, 201 pairs, two builds a side).
-fn names() -> Order<'static> {
+/// The endpoints in byte order of their names, sorted by the merging thread after the
+/// hand-off and the log's unmap, while the others start pass 2. In the merge, the sort
+/// and its collect (0.16 ms) held up every other thread; moved here, the run was 0.9%
+/// faster on the replica (201 pairs, two builds a side; PERF.md, step 69).
+///
+/// # Safety
+///
+/// Only once the parse is over, as the merging thread calls it (every part is in,
+/// which orders every parse thread's writes before the call): then each id up to
+/// `count` has its name and key written, and nothing writes the table any more.
+unsafe fn names() -> Order<'static> {
     // (id, name) of every id handed out (ids start at 1), in byte order of the names:
     // first by the first 32 bytes of the keys as two big-endian numbers, so few
     // comparisons need the names, then by the full bytes on ties. A key has a
@@ -401,9 +410,8 @@ fn names() -> Order<'static> {
     // proper prefix still sorts first. A spare id that was never published (see
     // `add`) is listed too, under a copy of a name that a published id holds: no
     // record holds the spare, so its group is empty in every hour and prints no line.
-    // SAFETY: called by the merging thread once every part is in (which orders every
-    // parse thread's writes before this), so the parse is over: each id up to `count`
-    // has its name written, and nothing writes the table any more.
+    // SAFETY: the parse is over (the caller's contract, see # Safety): each id up to
+    // `count` has its name written, and nothing writes the table any more.
     let count = TABLE.count.load(Relaxed);
     let name = |id: usize| unsafe { &**TABLE.names[id].get() };
     // SAFETY: as above, for the keys. A Key's first 32 bytes, read as two
@@ -517,8 +525,9 @@ type Order<'a> = Vec<(usize, &'a [u8])>;
 unsafe fn parse(chunks: [&[u8]; 2], free: &mut &'static mut [u32]) -> [Part; 2] {
     // The loop writes without capacity checks: it moves on at least MIN_LINE bytes
     // per line whatever the bytes are (the endpoint ends at byte 32 or later, then
-    // 5 + 0 + 1), so no slice has more lines than its room. The second slice's
-    // records start after room for the first one's.
+    // come the 5 bytes up to the latency, 0 or more digits and the LF: 32 + 5 + 0 + 1),
+    // so no slice has more lines than its room. The second slice's records start
+    // after room for the first one's.
     let most = chunks.map(|chunk| chunk.len() / MIN_LINE + 1);
     assert!(free.len() >= most[0] + most[1]);
     let (first, second) = std::mem::take(free).split_at_mut(most[0]);
@@ -564,13 +573,13 @@ unsafe fn parse(chunks: [&[u8]; 2], free: &mut &'static mut [u32]) -> [Part; 2] 
             let (at, escape) = (record[k].offset_from_unsigned(start[k]), escapes[k].len());
             runs[k].push(Start { key, at, escape });
         }
-        // One 64-byte window after the timestamp: its first two spaces end the
-        // method and the endpoint (no branch on the method or the length). Byte 27
-        // is the space after the timestamp and every method has 3 to 7 letters, so
-        // bytes 28-30 are letters and the window starts at byte 31, where the
-        // shortest method's space is: 3 more bytes of endpoint end in the window
-        // than from byte 28 (window misses 7.6% -> 6.6% of lines, seed 1). The
-        // endpoint starts one byte after the method's space.
+        // One 64-byte window from byte 31: its first two spaces end the method and
+        // the endpoint (no branch on the method or the length). Byte 27 is the space
+        // after the timestamp and every method has 3 to 7 letters, so bytes 28-30 are
+        // letters and the method's space is at byte 31 to 35, in the window. Started
+        // there rather than at byte 28, the window reaches 3 bytes further into the
+        // endpoint: 6.6% of seed 1's lines end past it, against 7.6%. The endpoint
+        // starts one byte after the method's space.
         let load = |p: *const u8| _mm256_loadu_si256(p.cast());
         let spaces = |at: usize| movemask(_mm256_cmpeq_epi8(load(line.add(31 + at)), space));
         let window = spaces(0) | spaces(32) << 32;
@@ -715,10 +724,12 @@ unsafe impl Sync for Interner {}
 
 const SLOTS: usize = 8 * MAX_ENDPOINTS;
 
-/// The endpoint table, in zero-initialised memory: all-zero bytes are an empty table
-/// (every field is an atomic, a SIMD vector or a raw slice pointer, null with length 0,
-/// all valid as zeros), and its pages are mapped as the parse first touches them.
-// SAFETY: see above.
+/// The endpoint table, a zeroed static (in .bss): all-zero bytes are an empty table
+/// (see `Interner`), so nothing clears it, and its pages are mapped as the parse first
+/// touches them.
+// SAFETY: all-zero bytes are a valid `Interner`: every field is an atomic or an array
+// of atomics, of SIMD vectors or of raw slice pointers (null, length 0), the last two
+// in `UnsafeCell`s, and each of these is valid as zeros.
 static TABLE: Interner = unsafe { std::mem::zeroed() };
 
 impl Interner {
@@ -768,16 +779,17 @@ impl Interner {
     #[cold]
     #[inline(never)]
     unsafe fn id(&self, from: *const u8) -> (u32, usize) {
-        // SAFETY: AVX2 and SSE4.2 are enabled; the reads stay within the 128 bytes
-        // from `from` (the caller's contract) and within KEEP (len <= 125, asserted).
-        // A published id is below MAX_ENDPOINTS, and its key and name are written (see
-        // Sync).
+        // SAFETY: AVX2, BMI2 (`bzhi`) and SSE4.2 are enabled (see `find`). The reads
+        // stay within the 128 bytes from `from` (the caller's contract; `at` reads 8
+        // bytes from byte 0 or max(len, 8) - 8, so by byte max(len, 8) <= 125) and
+        // within KEEP (len <= 125, asserted). A published id is below MAX_ENDPOINTS,
+        // and its key and name are written (see Sync).
         unsafe {
             let load = |p: *const u8| _mm256_loadu_si256(p.cast());
             let line: Key = std::array::from_fn(|i| load(from.add(32 * i)));
             let space = _mm256_set1_epi8(b' ' as i8);
-            // The space mask in two 64-bit halves: built as one u128 from the four
-            // masks, it compiled to vector inserts on the path of every later step.
+            // The space mask built from two 64-bit halves: as one u128 of the four
+            // masks, it compiled to `vpinsrd` inserts on the path of every later step.
             let mask = |i: usize| movemask(_mm256_cmpeq_epi8(line[i], space));
             let half = |i: usize| (mask(i) | mask(i + 1) << 32) as u128;
             // 128 if there is none: a 125-byte endpoint's space is in the 128 bytes.
@@ -787,11 +799,13 @@ impl Interner {
             // The key: the bytes up to and with the space after the endpoint, then zeros.
             let keep = KEEP.as_ptr().cast::<u8>().add(127 - len);
             let key = std::array::from_fn(|i| _mm256_and_si256(line[i], load(keep.add(32 * i))));
-            // The same bytes as `find` hashes, from 8 bytes up (under 8 it almost never
-            // finds one): the key's bytes, read from the line, where `bits` keeps only a
-            // short endpoint and its space, as the key does. (Read back from `key`, the
-            // loads waited on the stores of the vectors just built: this cold path took
-            // 10% of the run's cycles; reading the line made the run 0.3% faster.)
+            // The hash's words, the endpoint's first and last 8 bytes (both from byte 0
+            // under 8), read from the line: `bits` keeps only a short endpoint and its
+            // space, as the key holds them. From 8 bytes up, `find` hashes the same bytes;
+            // under 8 it hashes bytes around the endpoint, so it almost never probes this
+            // slot (see `find`). (Read back from `key`, the loads waited on the stores of
+            // the vectors just built: this cold path took 10% of the run's cycles; reading
+            // the line made the run 0.3% faster.)
             let bits = 8 * len.min(7) as u32 + 8;
             let at = |i: usize| _bzhi_u64(from.add(i).cast::<u64>().read_unaligned(), bits);
             let mut i = Self::home(len, at(0), at(len.max(8) - 8));

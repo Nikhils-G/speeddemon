@@ -204,7 +204,8 @@ constants of the parse loop.
 - *Replica* (ab.sh, 201 pairs, two PGO builds a side). Against step 67: −1.18% (150 of 201) and
   −1.19% (146 of 201), and +1.16% in reverse order (step 67 won 46 of 201). The table and the cold
   lookup together: −0.59% and −0.63% (+0.89% in reverse); alone, the static table −0.20% and
-  −0.13%, the hash from the line −0.32%, the mask from halves −0.18%. The window on top of both: a
+  −0.13%, the cold lookup's two changes −0.45% and −0.62% (the hash from the line alone −0.32%,
+  the mask from halves alone −0.18%). The window on top of both: a
   mean of −0.44% over five pairings. Memory, expected highest of 5 peaks over 40 interleaved
   rounds: 18.37 and 18.39 MB (two builds) against 18.35 and 18.51 MB for step 67, equal. At A's
   exchange rates, about +0.15 points (T +0.13, S +0.02).
