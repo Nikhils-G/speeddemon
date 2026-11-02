@@ -49,8 +49,9 @@ Each answer is the match count, the sum of the matching ids and the ten smallest
 Where the submitted code's time goes, on the replica of the scoring box (PERF.md, "How we
 measured": the same CPU, the board's own timer). These are step 86's phase marks, from a build
 that prints the time at each phase boundary (seed 1, medians of 9; PERF.md step 86, "What is
-left"). Steps 87 to 89 change only the start-up and the line count, and step 90 takes 0.92 ms off
-the plan (PERF.md, step 90).
+left"). Steps 87 to 89 change only the start-up and the line count, step 90 takes 0.92 ms off
+the plan, step 91 keeps `csr`'s running sums in registers and cuts 18 lines, and step 92 changes
+comments and names only, with step 91's machine code (PERF.md, steps 90 to 92).
 
 | Phase | Ends at (ms) | What |
 |---|---|---|
@@ -88,10 +89,13 @@ part (wrong output, timing only; PERF.md, "Where the scan's time goes"):
 
 37% of the tokens are of no row term and go to one sink row, whose word every such token ORs.
 
-The reference runs 56.35 s at 2,200 MB and S 91. The submitted code is PERF.md's step 90 (bpl-1,
-798ff2d, S 1175); its best board run, run-9c27a7fdfe8f, took 0.066749 s at 31.98 MB for 81.82
-points, 844× faster than the reference. Three ideas carry it: no index, every query answered in
-one parallel scan (step 6: 0.355 s at 203 MB → 0.267 s at 38.4 MB); a perfect hash with one
+The reference runs 56.35 s at 2,200 MB and S 91. The submitted code is PERF.md's step 92
+(b-merge-1c, 1a5a6ba, S 1157), step 91's machine code byte for byte with review fixes in comments
+and names; that machine code ran 0.066969 s at 31.81 MB for 81.83 points in run-a492afc03dad, 841×
+faster than the reference (and 0.086307 s in run-ac43df513301, with B alone slow). The best Track B run, run-96f4490eeb42, is step 90's
+code (S 1175): 0.066 s at 31.37 MB for 81.94 points, 854× faster; the board cannot separate steps
+90 and 91. Three ideas carry it: no index, every query answered in one parallel scan
+(step 6: 0.355 s at 203 MB → 0.267 s at 38.4 MB); a perfect hash with one
 branch-free probe per token, built on 12 threads (step 31: 0.1338 → 0.1199 s); and BOOL queries
 folded into truth tables and evaluated per document, 8 at a time, with the common ones per 256
 documents (steps 49 and 66; the superblocks since step 8). The board's runs of one binary spread
@@ -102,8 +106,9 @@ with its board runs and replica A/Bs, is in PERF.md.
 
 There is no index. The queries are read first, the corpus is scanned once in parallel slices of
 whole lines, and every query is answered during that scan, so nothing grows with the corpus. The
-board's M for the submitted code's runs was 31.05 to 31.98 MB, and the replica's max of 20 runs of
-it 32.00 MB, under the 44 MB credit; every step's M is in PERF.md's step table.
+board's M for the submitted machine code's two runs was 31.79 and 31.81 MB (step 90's four: 31.05
+to 31.98 MB), and the replica's max of 20 runs of it 31.62 MB, under the 44 MB credit; every
+step's M is in PERF.md's step table.
 malloc's mmap threshold is fixed at 1 MB, with transparent huge pages off (`mmap::set_up_memory`):
 at 32 MB the scan's first-id logs came from cleared heap and the peak reached 40 MB. Since step
 82 freed memory also stays in the heaps (a trim threshold of 1 GB): a trim flushes the TLB of every
@@ -142,9 +147,10 @@ peak.
        cover term) (design 3), an `always` entry, or a phrase record;
      - `csr` groups the entries by trigger term, and the same thread numbers their lines (design
        5), while two more workers (a `par(3)` round) group the phrases by anchor and sort the
-       `always` entries on one packed key. `csr` counts each key, turns the counts into run ends,
-       and writes each value into its run from the end, last value first, straight into a
-       vector's spare capacity: no zero fill and no copy.
+       `always` entries on one packed key. `csr` counts each key, turns the counts into run ends
+       by a fold whose sum stays in a register (reading the sum back from memory cost a
+       store-to-load forward per key), and writes each value into its run from the end, last
+       value first, straight into a vector's spare capacity: no zero fill and no copy.
 2. **Finding and looking up tokens.**
    - *Windows.* Each 64-byte window is classified with AVX2 into a token-byte mask and an LF mask.
      A window starts at a byte that is not inside a token and is scanned up to its last non-token
@@ -214,7 +220,7 @@ peak.
      0 wherever a cover term before c is present: that term's entry counts the document instead.
      The table is built over the k real terms, so its bits from 2^k on repeat the first 2^k, and
      the padding term's presence does not change the bit looked up. Each trigger term's range of
-     entries starts at a 16-bit index (`group`); past 2^16 BOOL terms or entries, the plan
+     entries starts at a 16-bit index (`trig_start`); past 2^16 BOOL terms or entries, the plan
      evaluates every BOOL query per superblock instead (step 83); past 2^16 lines the program
      stops (Error handling).
    - *Presence.* Each thread keeps, per term, a one-byte *stamp* of the last document that contains
@@ -367,7 +373,7 @@ What each technique measured, at the steps that brought it (PERF.md has every A/
 One line per technique: what, where in the code, and why the output stays exact. The first table
 above groups them by bottleneck. The code is in six files: `main.rs` (`main`, the slices, the
 results and their formatting), `pool.rs` (`par`, the workers, `wait`, `ahead`), `vocab.rs` (the query split
-and the perfect hash: `split_lines`, `Vocab`, `Phf`, `place_regions`, `hash`, `probe`), `plan.rs`
+and the perfect hash: `split_lines`, `Vocab`, `Phf`, `Phf::fill`, `hash`, `probe`), `plan.rs`
 (`Plan`, `DocEntry`, `records`, `classify`, `cover`, `csr`) and `scan.rs` (`Scan` with `look_up`,
 `end_doc`, `trigger` and `end_super`, `Answers`, `count_positions`), with the system calls in
 `mmap.rs`.
@@ -378,13 +384,13 @@ and the perfect hash: `split_lines`, `Vocab`, `Phf`, `place_regions`, `hash`, `p
 4. Slices of whole lines, one per thread (`slices`, `line_after`). Exact: every cut follows an LF, so each document is in one slice, and each slice's last id must meet the next slice's first.
 5. Query lines split in parallel into pre-sized 8- and 16-byte records (`split_lines`). Exact: each key is reloaded from its own bytes.
 6. Operator from the low two bits of its first byte (the bytes `A`, `N` and `O` end in binary 01, 10 and 11; `split_lines`). Exact: the grammar has only these three words.
-7. Stable counting sort `csr` for every grouping (keys by group, entries, anchors), written from each run's end into a vector's spare capacity, last value first. Exact: a permutation, and every slot is written once (the counts add up to the length).
+7. Stable counting sort `csr` for every grouping (keys by group, entries, anchors), its run ends from a fold whose sum stays in a register, written from each run's end into a vector's spare capacity, last value first. Exact: a permutation, and every slot is written once (the counts add up to the length).
 8. PTHash-style perfect hash with per-bucket pilots (`Vocab`, `place`): one slot per term. Exact: the hash says where to look; the probe decides (16).
 9. Two AES rounds as the hash, the seed (a × `SEEDS` for attempt a) in the first round key (`hash`): three instructions per token. Exact: a weak or clashing hash only fails the build, which re-seeds (13).
 10. Pilots of 1 mod 64, so each of 64 groups owns a table region: a lock-free build on every thread (`Vocab::new`). Exact: no thread writes another's region; the barrier orders the read-back.
-11. Largest buckets placed first, first free pilot taken (`place_regions`, `find_pilot`). Exact: a fixed order, so the same table on every run at one thread count (another count groups the buckets differently and builds another table, which answers the same).
+11. Largest buckets placed first, first free pilot taken (`Phf::fill`, `find_pilot`). Exact: a fixed order, so the same table on every run at one thread count (another count groups the buckets differently and builds another table, which answers the same).
 12. Keys grouped by bucket with `csr`, then each bucket's keys sorted by hash and one kept per hash (`dedup_keys`). Exact: the grouping and the sort only reorder the keys; two different keys with one hash are caught by the read-back (13).
-13. A read-back of every term's slot after the barrier (`Vocab::new`): a slot that holds another key means two keys share a hash. A bucket with no free pilot goes first in its thread's next try, up to four tries (`place_regions`); a clash or a fourth failure re-seeds, and every third seed doubles the table. Exact: a failed build never answers, and a key that a failed try left in the table matches no token (its own term looks up its final slot).
+13. A read-back of every term's slot after the barrier (`Vocab::new`): a slot that holds another key means two keys share a hash. A bucket with no free pilot goes first in its thread's next try, up to four tries (`Phf::fill`); a clash or a fourth failure re-seeds, and every third seed doubles the table. Exact: a failed build never answers, and a key that a failed try left in the table matches no token (its own term looks up its final slot).
 14. Terms of 13 to 32 bytes in a cold `HashMap`, with their slots after the hash's (`get_long`). Exact: compared byte for byte; tokens over 32 bytes find nothing.
 15. 16-byte slot: 12 key bytes under a 4-byte info word (id, ANCHOR, TRIG). Exact: 12 bytes are the whole key of every term the hash holds.
 16. Branch-free probe: one aligned load, XOR, `vptest`, inline-asm `cmov` of the info word, loaded on its own (`probe`). Exact: the full key is compared; the hash only says where.
@@ -421,8 +427,8 @@ and the perfect hash: `split_lines`, `Vocab`, `Phf`, `place_regions`, `hash`, `p
 47. The anchors' positions listed by `look_up`, and each anchor's first record prefetched before the BOOL evaluation and read after it (`look_up`, `end_doc`). Exact: prefetches read nothing the program uses; the phrases update other answers than the BOOL entries, so the order does not matter.
 48. One masked 32-byte compare per phrase, 8 ids from its start (`end_doc`). Exact: `bzhi` keeps exactly the phrase's terms in the compare mask, and the 8 `miss` ids that `look_up` writes after the document's tokens match no term, so a phrase never matches past the document's end.
 49. Per-phrase last-document marker, so a document counts once. Exact: a second match in the same document is not counted.
-50. Answer state written at allocation (`written_zeros`, `black_box`): a lazily zeroed page read first would fault twice. Exact: it writes the zeros the state starts with.
-51. The corpus, every slice's answer states, line ends and first ids, the hash table and the plan's phrase records and entries given back to the kernel in shares by the workers, and each output chunk by the main thread once written (`mmap::release`, in the last `par` round of `main`); each slice's first-id log by its thread once merged (`MADV_DONTNEED`, its empty mapping left to the exit). Exact: the output is formatted first, and none of them is read again.
+50. Answer states and superblock rows as plain zeroed vectors (`Scan::new`): the heaps hand out memory the setup freed (item 3), which calloc clears with stores, so no page is read before it is written. Writing the zeros by hand (step 13's fix, `written_zeros` until step 90) took the same page faults, about 10,900 on seed 1. Exact: the state starts at zero either way.
+51. The corpus, every slice's answer states, line ends and first ids, the hash table and the plan's phrase records given back to the kernel in shares by the workers (the plan's 0.6 MB of entries left to the exit since step 91: about 0.03 ms, under its line's price), and each output chunk by the main thread once written (`mmap::release`, in the last `par` round of `main`); each slice's first-id log by its thread once merged (`MADV_DONTNEED`, its empty mapping left to the exit). Exact: the output is formatted first, and none of them is read again.
 52. First-id logs put in line order per thread by a prefix sum of the logged counts and one scatter, no sort (`main`); merged in slice order; the later threads skip the answers whose first slice alone has ten (`full`). Exact: each answer logs its ids in order, and slices are in document order.
 53. Output formatted in parallel, states read in place through `answer_of` (`format_part`; no 4.5 MB copy). Exact: each line reads its own states.
 54. Exit right after writing, no frees. Exact: results.txt is complete before the exit.
@@ -504,7 +510,7 @@ and the perfect hash: `split_lines`, `Vocab`, `Phf`, `place_regions`, `hash`, `p
   matches are added in document order, so the first ids are logged in order. Prefetches read
   nothing the program uses.
 - **Sixteen-bit plan indices.** Terms, answers and group starts are 16 bits in the trigger's
-  entries and `group`. The spec's inputs need about 53,000 BOOL terms, 50,000 lines and 36,000
+  entries and `trig_start`. The spec's inputs need about 53,000 BOOL terms, 50,000 lines and 36,000
   entries (seed 1: 53,444, 50,000 and 36,174). Past 2^16 BOOL terms or entries, `Plan::new` plans
   again with every cover's cost raised over ALWAYS, so every BOOL query is evaluated per
   superblock, which is exact for any query (forced on seed 1: 0.35 s); nothing wraps. Past 2^16
@@ -580,7 +586,7 @@ Evidence, on the binary the Dockerfile builds:
   fresh-seed, repeat, tiny/sample and edge suites again, 1,426 runs each, all exact; steps 67 to 75
   change the setup, the page releases at the end and how `look_up` keeps anchor positions, and
   passed the gate, but of seeds 101-130 only 109 ran again, in step 70's A/B, with the same output
-  as step 69's; steps 77 to 90 ran all 30 again, below), with data generated on the replica by the
+  as step 69's; steps 77 to 92 ran all 30 again, below), with data generated on the replica by the
   organisers' generator (Python 3.11, which
   reproduces the official sample seed 1 and its reference output byte for byte). Every run was
   byte-exact, with no crash, no nonzero exit and no output on stderr:
@@ -593,12 +599,12 @@ Evidence, on the binary the Dockerfile builds:
     20 CPUs for both users: 840 of 840;
   - copies of seed 101 whose every file is an exact multiple of 4096 bytes, so that a read past
     the end of a file would fault, at 1, 3, 7, 12 and 20 CPUs: 5 of 5.
-- **The submitted code's final gate** (step 90, on the replica, Mon 2 Nov), every output
+- **The submitted code's final gate** (step 92, on the replica, Mon 2 Nov), every output
   byte-equal to the reference: fresh full seeds 101-130 at 1, 3, 7 and 12 CPUs (120 of 120 runs);
   tiny and sample seeds 201-210 as root and as uid 65534 at 1, 3, 12 and 20 CPUs (160 of 160);
   holdout 99 at nine CPU counts from 1 to 20 (9 of 9); 20 repeats of seed 101 at 12 and at 20 CPUs
   (40 of 40); 18 board-like edge cases at 1 and 12 CPUs as both users (72 of 72); and the gate's
-  144 runs and 66 hand-made edge runs. Memory, max of 20 runs, 32.00 MB. Steps 77 to 89 passed
+  144 runs and 66 hand-made edge runs. Memory, max of 20 runs, 31.62 MB. Steps 77 to 91 passed
   the same gate, with 30.91 to 32.78 MB (PERF.md, "How the final number was verified").
 - **The perfect hash, forced.** The per-region retry ran end to end from forced start seeds: in
   300 runs, 20 placed a region again, and all were exact.
@@ -669,8 +675,14 @@ Measured or modelled on seed 1; none of this was built.
   builds on step 88's code put its ceiling at about 0.6 to 0.75 ms (the idle window is about 1.9 ms
   a worker, and the pre-pass slows the plan), for about 65 to 70 lines and 5 MB, so it stays
   unbuilt (PERF.md, experiments). The lever they point at is the plan itself: 3.5 ms on every
-  thread's critical path, 1.34 ms of it serial; step 90 took the plan from 3.609 to 2.685 ms
-  (PERF.md, step 90).
+  thread's critical path, 1.34 ms of it serial; step 90 took the plan from 3.609 to 2.685 ms, and
+  step 91's running sums took about 0.09 ms more off the run (PERF.md, steps 90 and 91). What is
+  left of the plan, by step 90's marks per worker (seed 1, medians of 9): `term_order`, 0.39 ms on
+  one thread while eleven wait (counts chained on three hot keys, and the faults of a fresh
+  300 KB array); the grouping round, about 1.0 ms on two threads (page faults on fresh outputs
+  and random placement writes); and 0.15 ms on one thread after it, mostly the phrase numbering
+  reading 1.2 MB from another core. `term_order` on every thread, with per-thread counts, is
+  priced at about −0.24 ms for about 12 lines; not built.
 - **The triggered random accesses.** Two random accesses are left in the per-document evaluation,
   priced by timing-only builds (wrong output) of an earlier version of step 66: sending every
   match's state update to one answer saved 3.13 ms, and reading every entry from entry 0 also
