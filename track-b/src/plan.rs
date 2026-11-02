@@ -19,10 +19,11 @@ pub struct Entry {
 /// query's other distinct terms, padded with term 0, its answer and its truth
 /// table over their presence (c being present). The table is zero where a cover
 /// term before c is present: that term's entry counts the document. Four u32
-/// words, 16 bytes (repr(C, align(16))): `trigger` gathers word 4i + k of the
-/// entries as word k of entry i (terms 0 and 1, terms 2 and 3, term 4 and the
-/// answer, the truth table), so this layout is part of its bounds argument; 16
-/// bytes also keep each entry in one cache line.
+/// words, 16 bytes (repr(C, align(16))): `trigger` loads 8 entries with aligned
+/// 16-byte loads and transposes them, so lane j of word k is word k of entry j
+/// (terms 0 and 1, terms 2 and 3, term 4 and the answer, the truth table): this
+/// layout is part of its bounds argument, and 16 bytes keep each entry in one
+/// cache line.
 #[derive(Clone, Copy, Default)]
 #[repr(C, align(16))]
 pub struct DocEntry {
@@ -85,9 +86,9 @@ pub struct Phrase {
 /// What the scan does with each query, decided from the sample.
 #[derive(Default)]
 pub struct Plan {
-    /// BOOL entries triggered by term t: `entries[group[t]..group[t + 1]]`; then 8
+    /// BOOL entries triggered by term t: `entries[trig_start[t]..trig_start[t + 1]]`; then 8
     /// padding entries that never match (truth 0), for `trigger`'s spare lanes.
-    pub group: Vec<u16>,
+    pub trig_start: Vec<u16>,
     pub entries: Vec<DocEntry>,
     /// BOOL entries evaluated in every superblock, on rows of `Scan::wide`.
     pub always: Vec<Entry>,
@@ -107,21 +108,25 @@ pub struct Plan {
 impl Plan {
     /// `sample_df` counts the documents of each term in a sample of `sampled`
     /// documents (at least 1). The per-line work runs on one thread per part of
-    /// the queries. DocEntry and `group` keep term ids, answers and entry indices in
+    /// the queries. DocEntry and `trig_start` keep term ids, answers and entry indices in
     /// 16 bits: the spec's queries have about 53,000 BOOL terms, 50,000 lines and
-    /// 36,000 entries. Past 2^16 of any of them, every BOOL query is evaluated in
-    /// every superblock instead (slower, never wrong).
+    /// 36,000 entries. Past 2^16 BOOL terms or entries, every BOOL query is evaluated
+    /// in every superblock instead (slower, never wrong); past 2^16 lines, main stops
+    /// (the first-id log keeps an answer in 16 bits, see MIN_SLICES).
     pub fn new(queries: Queries, sample_df: &[u32], sampled: u32) -> Self {
         let plan = |force| Self::with(&queries, sample_df, sampled, force);
         plan(false).unwrap_or_else(|| plan(true).unwrap())
     }
 
-    /// The plan, if it fits DocEntry and `group` (see `new`), or with `force` every
+    /// The plan, if it fits DocEntry and `trig_start` (see `new`), or with `force` every
     /// BOOL query evaluated in every superblock.
     fn with(queries: &Queries, sample_df: &[u32], sampled: u32, force: bool) -> Option<Self> {
         let parts = queries.len();
         // The expected share of 64-document blocks that contain t: the cost of
         // triggering on it (plus 1 with `force`: every cover then costs over ALWAYS).
+        // Kept from the block engine: under ALWAYS a term's block share is within
+        // about 21% of 64 times its share of documents, the per-document cost, so
+        // covers rank nearly the same.
         let share = |t: u32| sample_df[t as usize] as f64 / sampled as f64;
         let cost = |t: u32| force as u8 as f64 + 1.0 - (1.0 - share(t)).powi(64);
         // Per old id: bit 0 for a BOOL term, bit 1 for a term of an `always` query.
@@ -157,14 +162,18 @@ impl Plan {
         let (always, entries, anchors) = (Mutex::new(always), OnceLock::new(), OnceLock::new());
         par(3, &|i| match i {
             0 => {
-                let (group, mut entries_of) = csr(entry_pairs, bool_terms + 1);
+                // SAFETY: the closure reads `out` and `pad`, which nothing changes
+                // between its two calls.
+                let (group, mut entries_of) = unsafe { csr(entry_pairs, bool_terms + 1) };
                 let mut numbers = (vec![u32::MAX; lines], Vec::with_capacity(lines));
                 for e in &mut entries_of {
                     e.answer = number(&mut numbers, e.answer as u32) as u16;
                 }
                 _ = entries.set((group, entries_of, numbers));
             }
-            1 => _ = anchors.set(csr(anchor_pairs, rank.len())),
+            // SAFETY: the closure reads `out`, which nothing changes between its two
+            // calls.
+            1 => _ = anchors.set(unsafe { csr(anchor_pairs, rank.len()) }),
             // By length and operators, so that `end_super` predicts its branches.
             _ => always.lock().unwrap().sort_unstable_by_key(|e| {
                 let ops = e.terms.iter().fold(e.len, |key, &w| key << 2 | w >> 30);
@@ -178,20 +187,19 @@ impl Plan {
             return None;
         }
         // In 16 bits, so that `trigger` reads half the lines.
-        (plan.group, plan.entries) = (group.iter().map(|&g| g as u16).collect(), entries);
+        (plan.trig_start, plan.entries) = (group.iter().map(|&g| g as u16).collect(), entries);
         (plan.anchor, plan.anchored) = anchors.into_inner().unwrap();
         (plan.always, plan.rows) = (always.into_inner().unwrap(), rows);
-        // The answers are numbered in the order the scan visits them: those of the
-        // entries' lines in the entries' order (above), then the `always` ones, so
-        // that each superblock reads and writes their state as one stream (47 KB
-        // instead of 4,000 scattered lines), then the phrases. Every line gets a
-        // number: it has an entry (a cover has at least one term), is an `always`
-        // one or is a phrase.
+        // The answers are numbered: those of the entries' lines in the entries' order
+        // (above), then the `always` ones, so that each superblock reads and writes
+        // their state as one stream (about 35 KB on seed 1 instead of about 4,300
+        // scattered lines), then the phrases. Every line gets a number: it has an
+        // entry (a cover has at least one term), is an `always` one or is a phrase.
         let mut next = |line: &mut u32| *line = number(&mut numbers, *line);
         plan.always.iter_mut().for_each(|e| next(&mut e.answer));
         plan.anchored.iter_mut().for_each(|a| next(&mut a.answer));
         (plan.answer_of, plan.line_of) = numbers;
-        let trig = |id: usize| id < bool_terms && plan.group[id] != plan.group[id + 1];
+        let trig = |id: usize| id < bool_terms && plan.trig_start[id] != plan.trig_start[id + 1];
         let anchoring = |id: usize| plan.anchor[id] != plan.anchor[id + 1];
         let flag = |id| anchoring(id) as u32 * ANCHOR | trig(id) as u32 * TRIG;
         // In parallel, a range of old ids per part, each new id made its word in
@@ -346,7 +354,12 @@ fn cover(terms: &[u32], cost: impl Fn(u32) -> f64) -> ([u32; MAX_BOOL_TERMS], us
 /// Groups values by key: values of key k are `values[start[k]..start[k + 1]]`,
 /// in their original order. `pairs` makes the (key, value) pairs, the same ones
 /// at each call: they are counted, then placed (so nothing copies them first).
-pub fn csr<T, I: DoubleEndedIterator<Item = (u32, T)>>(
+///
+/// # Safety
+///
+/// `pairs` makes the same pairs at each call, so the second pass writes exactly
+/// the slots the first one counted.
+pub unsafe fn csr<T, I: DoubleEndedIterator<Item = (u32, T)>>(
     pairs: impl Fn() -> I,
     keys: usize,
 ) -> (Vec<u32>, Vec<T>) {
@@ -365,9 +378,9 @@ pub fn csr<T, I: DoubleEndedIterator<Item = (u32, T)>>(
         start[k as usize] -= 1;
         values.spare_capacity_mut()[start[k as usize] as usize].write(value);
     });
-    // SAFETY: `pairs` made the same pairs both times (each caller's closure only
-    // reads data that nothing changes in between), so each key's run was counted,
-    // then filled down from its end: each of the start[keys] slots was written once.
+    // SAFETY: `pairs` made the same pairs both times (the caller's contract), so each
+    // key's run was counted, then filled down from its end: each of the start[keys]
+    // slots was written once.
     unsafe { values.set_len(start[keys] as usize) };
     (start, values)
 }

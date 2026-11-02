@@ -11,8 +11,8 @@ pub struct Scan<'a> {
     plan: Option<&'a Plan>,
     df: &'a [AtomicU32],
     /// Per term, the stamp of the last document that contains it (see STAMPS).
-    /// Slot `count` takes the tokens no query uses; slot count + 1 is in no
-    /// document.
+    /// Slot `count` takes the tokens no query uses; the bytes after it pad
+    /// `trigger`'s 4-byte gathers.
     lastdoc: Vec<u8>,
     /// The current document's stamp.
     stamp: u8,
@@ -25,9 +25,9 @@ pub struct Scan<'a> {
     /// Per row, its four words, one per block of this superblock: word b of row
     /// r < plan.rows, `wide[4 * r + b]`, is BOOL term r's in block b. Row `rows`
     /// takes the other terms (its bits are never read). A row's 256 bits are one
-    /// 32-byte load in end_super. (Kept block by block from step 56, a term took
-    /// four loads of four lines there; since the presence stores are prefetched
-    /// and made 8 at a time, rows of 4 words are 1.0-1.1 ms faster.)
+    /// 32-byte load in end_super (rows of 4 words replaced step 56's words block by
+    /// block once the presence stores were fetched ahead and made 8 at a time:
+    /// PERF.md, step 78).
     wide: Vec<u64>,
     /// This document's tokens to look up: per token its key (12 bytes and zero
     /// bytes), with the byte offset of its slot stored over its top 4 bytes,
@@ -55,7 +55,7 @@ impl<'a> Scan<'a> {
             vocab,
             plan,
             df,
-            // 3 bytes more: `trigger` gathers 4 bytes from a stamp.
+            // count + 1 stamps, then 4 bytes: `trigger` gathers 4 bytes from a stamp.
             lastdoc: vec![EMPTY; vocab.count as usize + 5],
             stamp: 0,
             trig: Vec::new(),
@@ -214,9 +214,8 @@ impl<'a> Scan<'a> {
     /// Looks up the tokens of this document, whose bit is `bit`, then records
     /// their presence and lists its trigger occurrences and anchors. Each step runs
     /// over the whole document, so that the memory accesses of one step overlap:
-    /// the slots were fetched when the tokens were found. (In the earlier block
-    /// design, fetching the presence words too cost more than it saved, and one
-    /// loop for the probes and the presence was slower; it still is, by 2.2 ms.)
+    /// the slots were fetched when the tokens were found (one loop for the probes
+    /// and the presence ran slower: PERF.md, step 77).
     fn look_up(&mut self, bit: u64) {
         let (miss, table) = (self.vocab.count, self.vocab.table.as_ptr());
         let (doc, rows) = (self.doc, self.wide.len() / 4 - 1);
@@ -257,8 +256,8 @@ impl<'a> Scan<'a> {
         // anchors' positions. The last 8 may take some of the `miss` ids after the
         // tokens: their stamp and the row sink's bit are written, and no list keeps
         // them.
-        let (trig, mut nt) = (self.trig.as_mut_ptr(), self.trig.len());
-        let (anchors, mut na) = (self.anchors.as_mut_ptr(), self.anchors.len());
+        let (trig, mut n_trig) = (self.trig.as_mut_ptr(), self.trig.len());
+        let (anchors, mut n_anchors) = (self.anchors.as_mut_ptr(), self.anchors.len());
         let (lastdoc, stamp) = (self.lastdoc.as_mut_ptr(), self.stamp);
         let sample = self.plan.is_none();
         let mut row = [0u32; 8];
@@ -268,8 +267,8 @@ impl<'a> Scan<'a> {
             let infos = unsafe { _mm256_loadu_si256(toks.add(at).cast()) };
             // The 8 tokens' ids replace their info words (end_doc masks them anyway),
             // and their rows' offsets, 4 * id.min(rows), go to `row`: 5 uops for the
-            // 8, where the scalar `& ID` and cmp/cmov took 3 a token (replica,
-            // non-PGO: -0.72 ms).
+            // 8, where the scalar `& ID` and cmp/cmov took 3 a token (PERF.md step 78,
+            // the second piece: -0.42 ms on seed 1 and holdout 99, PGO).
             // SAFETY: as above; `row` holds 8 u32s.
             unsafe {
                 let ids = _mm256_and_si256(infos, _mm256_set1_epi32(ID as i32));
@@ -294,19 +293,19 @@ impl<'a> Scan<'a> {
                     }
                 }
             }
-            // SAFETY: AVX2 is enabled for the whole build. nt and na grow by at most
+            // SAFETY: AVX2 is enabled for the whole build. n_trig and n_anchors grow by at most
             // one per token before at, at most at - start <= len - 1 - start past
             // their first values, so the 8 lanes stored from them end inside the room
             // reserved for them, more = len - start + 8 past those first values.
             unsafe {
                 let positions = _mm256_add_epi32(_mm256_set1_epi32(at as i32), LANES);
                 // TRIG is bit 30, shifted to the sign bit; ANCHOR is the sign bit.
-                nt += left_pack(infos, _mm256_slli_epi32::<1>(infos), trig.add(nt));
-                na += left_pack(positions, infos, anchors.add(na));
+                n_trig += left_pack(infos, _mm256_slli_epi32::<1>(infos), trig.add(n_trig));
+                n_anchors += left_pack(positions, infos, anchors.add(n_anchors));
             }
         }
-        // SAFETY: the first nt and na entries are written.
-        unsafe { (self.trig.set_len(nt), self.anchors.set_len(na)) };
+        // SAFETY: the first n_trig and n_anchors entries are written.
+        unsafe { (self.trig.set_len(n_trig), self.anchors.set_len(n_anchors)) };
     }
 
     /// Ends the current document: with the plan, counts the phrases anchored on
@@ -373,9 +372,9 @@ impl<'a> Scan<'a> {
     fn trigger(&mut self, plan: &Plan) {
         let (doc, stamp, entries) = (self.doc, self.stamp, plan.entries.as_ptr());
         let (evals, hits) = (self.evals.as_mut_ptr(), self.hits.as_mut_ptr());
-        let (group, lastdoc, mut n) = (plan.group.as_ptr(), self.lastdoc.as_mut_ptr(), 0);
+        let (starts, lastdoc, mut n) = (plan.trig_start.as_ptr(), self.lastdoc.as_mut_ptr(), 0);
         // SAFETY: trigger terms are below bool_terms <= count, so t indexes lastdoc
-        // (count + 5 bytes), and group has bool_terms + 2 entries. Fresh terms are
+        // (count + 5 bytes), and trig_start has bool_terms + 2 entries. Fresh terms are
         // distinct, so their ranges are disjoint, and n stays at most the number of
         // real entries, entries.len() - 8: a store of 8 indices from n + j (j < the
         // range's length; 0 for a repeat) ends inside evals, which is as long as the
@@ -385,7 +384,7 @@ impl<'a> Scan<'a> {
                 // Branch-free: a repeated trigger term is written again and not kept.
                 let fresh = *lastdoc.add(t) == stamp;
                 *lastdoc.add(t) = stamp | DONE;
-                let (from, to) = (*group.add(t) as u32, *group.add(t + 1) as u32);
+                let (from, to) = (*starts.add(t) as u32, *starts.add(t + 1) as u32);
                 prefetch(entries, from as usize);
                 // Its entries' indices, 8 per store: the next range overwrites the
                 // spare ones, and a range of over 8 (rare) goes on.
@@ -403,7 +402,7 @@ impl<'a> Scan<'a> {
             let padding = _mm256_set1_epi32(plan.entries.len() as i32 - 1);
             _mm256_storeu_si256(evals.add(n).cast(), padding);
         }
-        let (stamps, mut nh) = (lastdoc.cast::<i32>().cast_const(), 0);
+        let (stamps, mut n_hits) = (lastdoc.cast::<i32>().cast_const(), 0);
         for b in (0..n).step_by(8) {
             // SAFETY: AVX2 and BMI2 are enabled for the whole build. evals[b..b + 8]
             // (b < n) were written above: lanes below n by the ranges' stores (a
@@ -411,7 +410,7 @@ impl<'a> Scan<'a> {
             // padding store, so every index is below entries.len(): each 16-byte load
             // is one aligned entry (DocEntry). Entry terms are BOOL terms or 0, below
             // count + 1, and lastdoc has count + 5 bytes, so the 4 bytes gathered from
-            // each stamp are inside it. nh <= b < n, so the 8 lanes stored at hits[nh..]
+            // each stamp are inside it. n_hits <= b < n, so the 8 lanes stored at hits[n_hits..]
             // are inside hits, as long as evals.
             unsafe {
                 // Entries j and j + 4 in one vector, then transposed: lane j of word k
@@ -442,10 +441,10 @@ impl<'a> Scan<'a> {
                 // Bit 31 of a lane: bit `present` of its truth table, whether it matches.
                 let hit = _mm256_slli_epi32::<31>(_mm256_srlv_epi32(truth, present));
                 // The matches' answers to the front.
-                nh += left_pack(high(w4a), hit, hits.add(nh));
+                n_hits += left_pack(high(w4a), hit, hits.add(n_hits));
             }
         }
-        for &answer in &self.hits[..nh] {
+        for &answer in &self.hits[..n_hits] {
             // SAFETY: an entry's answer is an answer number, below state.len().
             unsafe { self.answers.add_doc(answer, doc) };
         }
@@ -616,9 +615,8 @@ fn masks(docs: &[u8], at: usize, end: usize) -> (u64, u64) {
 
 /// Stores to `out` the lanes of `values` whose lane of `signs` is negative, in
 /// order, and returns how many. All 8 lanes are stored, the rest copies of lane
-/// 0: their lane numbers are PACK's entry for the 8-bit mask, one load (pdep,
-/// imul and pext made them in 4 uops: replica, PGO, 0.32 ms slower on average
-/// over seeds 1, 99, 105 and 110).
+/// 0: their lane numbers are PACK's entry for the 8-bit mask, one load (pdep, imul
+/// and pext made them in 4 uops, and ran slower: PERF.md, step 80).
 ///
 /// # Safety
 ///

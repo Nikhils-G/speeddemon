@@ -54,7 +54,8 @@ fn split_lines(chunk: &'static [u8], padded: &'static [u8], seed: u64) -> Split 
         let hash = hash(checked_key(padded, at as usize, len as usize), seed);
         ((hash & 63) as u32, Key { hash, at, len })
     };
-    let (starts, keys) = csr(|| terms.iter().map(key), GROUPS);
+    // SAFETY: the closure reads `terms`, which nothing changes between its two calls.
+    let (starts, keys) = unsafe { csr(|| terms.iter().map(key), GROUPS) };
     Split {
         lines,
         terms,
@@ -302,7 +303,8 @@ fn dedup_keys(splits: &[Split], q: usize, bmask: u64) -> Vec<Key> {
     // above the group's, then its group.
     let bucket = |h: u64| ((h & bmask) >> 6) as usize * g.len() + (h & 63) as usize - g.start;
     let buckets = (bmask as usize + 1) / GROUPS * g.len();
-    let (start, mut keys) = csr(|| mine().map(|e| (bucket(e.hash) as u32, *e)), buckets);
+    // SAFETY: the closure reads `splits`, which nothing changes between its two calls.
+    let (start, mut keys) = unsafe { csr(|| mine().map(|e| (bucket(e.hash) as u32, *e)), buckets) };
     for b in 0..buckets {
         keys[start[b] as usize..start[b + 1] as usize].sort_unstable_by_key(|e| e.hash);
     }

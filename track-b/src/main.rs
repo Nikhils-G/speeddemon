@@ -71,7 +71,8 @@ const DONE: u8 = 0x80;
 const KEY: usize = 12;
 /// The spec's grammar: a BOOL query has 1 to 6 terms.
 const MAX_BOOL_TERMS: usize = 6;
-/// A BOOL term word is `slot | op << 30`, and TERM masks the slot.
+/// A BOOL term word is `x | op << 30`, and TERM masks x: a term's length in
+/// `split_lines`'s records, its id in the plan, its row in an `always` entry (`Entry`).
 const TERM: u32 = (1 << 30) - 1;
 const AND: u32 = 0;
 const NOT: u32 = 1;
@@ -80,24 +81,17 @@ const OR: u32 = 3;
 /// first (smallest) FIRST_IDS ids.
 const FIRST_IDS: u64 = 10;
 /// Corpus bytes sampled (spread over the slices) to estimate term frequencies:
-/// about 2,600 documents on seed 1. The better plan pays for the longer sample.
-/// On the replica (PERF.md, experiments), against 1 MB, 2.5 MB ran 0.44-0.74 ms
-/// faster on seeds 1 and 99, 1.5 MB the same, 768 KB 0.4-0.8 ms slower and
-/// 512 KB 2.1-2.5 ms slower; 2, 3 and 3.5 MB were no faster than 2.5 MB.
+/// about 2,600 documents on seed 1. The better plan pays for the longer sample: no
+/// size from 512 KB to 3.5 MB ran faster on the replica (PERF.md, experiments).
 const SAMPLE_BYTES: usize = 5 << 19;
-/// A query whose cover terms are expected in more 64-document blocks than this
-/// (as a share, summed over the terms) is evaluated in every superblock instead
-/// of per document. Raised from 0.30 to 0.40 once `end_super` read one 32-byte
-/// row per term: on the replica (PERF.md, experiments), against 0.30, 0.40 ran
-/// 0.45-0.48 ms faster on seed 1 and 0.35-0.52 ms on seed 99 (PGO, 26 to 28 of 31
-/// pairs). Without PGO: 0.25 ran 0.75 ms slower, 0.35 0.35 ms faster, 0.40 0.75,
-/// 0.45 0.47 and 0.50 0.36 ms faster, 0.60 0.23 ms slower. (Set at 0.30 in step
-/// 53; on the earlier block engine 0.25 beat 0.125, 0.30 and 0.5.)
+/// A query whose cover terms are expected in more than this share of the
+/// 64-document blocks (summed over its terms) is evaluated in every superblock
+/// instead of per document. 0.40 beat 0.25 to 0.60 on the replica (PERF.md,
+/// experiments).
 const ALWAYS: f64 = 0.40;
-/// Documents per superblock: four blocks of 64, one AVX2 vector per row. 128 ran
-/// 12.4% slower on step 66's code (half-empty vectors, evaluated twice as often),
-/// and 512 (two vectors a row) read 6.5 ms slower in a box probe on step 50's
-/// (PERF.md, experiments, and steps 50 and 51).
+/// Documents per superblock: four blocks of 64, one AVX2 vector per row. 128
+/// (half-empty vectors, evaluated twice as often) and 512 (two vectors a row) ran
+/// slower (PERF.md, experiments, and steps 50 and 51).
 const SUPER: u32 = 256;
 /// A thread's sum of matching ids is packed under its count in one u64.
 const SUM_BITS: u32 = 40;
@@ -123,7 +117,8 @@ extern "C" fn main(_: i32, _: *const *const u8) -> i32 {
     let out_dir = args.next().unwrap_or_else(|| "/out".into());
     mmap::set_up_memory();
     // Joined with concat rather than format!: that code size keeps the scan's hot functions at
-    // their 64-byte offsets of before no_main (format! moved them by 32: 0.085 ms slower).
+    // their 64-byte offsets of before no_main (format! moved them by 32: 0.085 ms slower;
+    // PERF.md, step 89).
     let open = |name: &str| mmap::map(&[&data_dir, "/", name].concat());
     let docs = open("docs.txt");
     // The corpus: `docs` without the mmap::PAD zero bytes that follow it.

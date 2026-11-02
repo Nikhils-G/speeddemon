@@ -14,6 +14,9 @@ const M_MMAP_THRESHOLD: i32 = -3;
 /// x86-64's base page size.
 const PAGE: usize = 4096;
 
+// SAFETY: glibc's x86-64 prototypes. prctl is variadic in C (int prctl(int, ...)); its
+// integer arguments go in the same registers either way, and %al, which a variadic
+// callee reads only to decide whether to save vector registers, may hold any value.
 unsafe extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
     fn prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i32;
@@ -30,13 +33,12 @@ unsafe extern "C" {
 ///   largest block freed so far, so where each step's tables come from (fresh
 ///   pages or reused ones) would depend on what the steps before it freed. The
 ///   setup's parallel steps then fault in fewer fresh pages, each in its thread's
-///   own mapping (with this setup: -1.1 ms). Larger blocks, such as the scan's
-///   first-id logs, stay mmaps, whose pages cost nothing until written: from a
-///   heap, calloc would clear them (8 MB more at 32 MB).
+///   own mapping. Larger blocks, such as the scan's first-id logs, stay mmaps,
+///   whose pages cost nothing until written: from a heap, calloc would clear them
+///   (PERF.md, step 67).
 /// - Freed memory stays in the heaps: a trim (an sbrk shrink) flushes the TLB of
 ///   every CPU the threads ran on, and each step frees tables that the next ones
-///   reuse. With trims, Plan::new's drops took 0.25 ms; without, a run is 0.2-0.5
-///   ms faster (the replica, plain build) for a peak 1.5 MB higher.
+///   reuse (PERF.md, step 82).
 pub fn set_up_memory() {
     // SAFETY: a plain syscall wrapper; failure only means THP stays on.
     unsafe { prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0) };
