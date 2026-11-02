@@ -166,6 +166,11 @@ sorted after the merge's hand-off.
   Track A alone was slow in that dispatch; B set its best time in the same dispatch
   (run-567ede8911b8, 0.074086 s). Its second, run-b3a4984e4320, took 0.015715 s (18.22 MB, 86.88
   points): the best Track A run and the fastest Track A time.
+- *Review (commit 7e77cf3).* A review of the code changed in steps 68 and 69 fixed 13 comments
+  (stale or unargued SAFETY notes, the window's bound, MIN_LINE's sum, the hand-off's order) and
+  made `names` an `unsafe fn` with a `# Safety` section, since its reads of the table are sound only
+  once the parse is over. No other token changed; S stays 456. The gate passed on its build, and
+  it ran −0.07% against step 69 (103 of 201 pairs): the same code.
 
 **Step 68 (am5-1, 9f2993f), S 452**: step 67 with three changes, in cold code and in the
 constants of the parse loop.
