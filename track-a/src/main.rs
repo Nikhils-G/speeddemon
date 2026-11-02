@@ -119,7 +119,7 @@ extern "C" fn main(_: i32, _: *const *const u8) -> i32 {
     // page reads as zero). The dataset is mounted read-only, so the bytes cannot
     // change under us.
     let (anonymous, fixed) = (MAP_PRIVATE | MAP_ANONYMOUS, MAP_PRIVATE | MAP_FIXED);
-    let base = map(std::ptr::null_mut(), len + PAD, PROT_READ, anonymous, -1);
+    let base = map(ptr::null_mut(), len + PAD, PROT_READ, anonymous, -1);
     // SAFETY: MAP_FIXED replaces only the start of the reservation just made, which
     // nothing uses yet; the assert checks that the call did.
     let at = unsafe { mmap(base, len, PROT_READ, fixed, input.as_raw_fd(), 0) };
@@ -256,9 +256,10 @@ extern "C" fn main(_: i32, _: *const *const u8) -> i32 {
                     // SAFETY: bytes at..at + len of the mapping are this hour's alone, and
                     // at + len <= total <= bound: a line is at most 213 bytes (see bound).
                     let out = unsafe { std::slice::from_raw_parts_mut((file + at) as _, len) };
-                    // The hour key's 13 bytes, and the name order (already set: this
-                    // hour's groups were built in it).
-                    let head = (hours[hour][0].begin.key << 24).to_be_bytes();
+                    // The line head, the 21-byte label "YYYY-MM-DDTHH:00:00Z " (the hour key's
+                    // 13 bytes are the last 13 of its 16 big-endian bytes), and the name order
+                    // (already set: this hour's groups were built in it).
+                    let head = [&hours[hour][0].begin.key.to_be_bytes()[3..], b":00:00Z "].concat();
                     let endpoints = order.wait();
                     // Last line first, each one ending where the next one starts.
                     let mut at = len;
@@ -387,16 +388,18 @@ extern "C" fn main(_: i32, _: *const *const u8) -> i32 {
 /// exceed. The endpoints' name order follows, from `names`.
 fn merge(parts: &[OnceLock<Part>], readers: &[AtomicUsize], output: &File) -> Merged<'static> {
     // Every part's runs, in order of hour. Every part is in (this is the last thread
-    // to finish pass 1), so no `wait` here blocks. Two adjacent starts of a part make
-    // one run, which ends at the second one's first record. Room for all of them at
-    // once (each part's starts include its end marker, one more than its runs).
+    // to finish pass 1), so no `wait` here blocks. Each start of a part begins one
+    // run, which ends at the next start's first record, the last one at the part's
+    // end. Room for all of them at once.
     let mut runs = Vec::with_capacity(parts.iter().map(|p| p.wait().starts.len()).sum());
     for (part, p) in parts.iter().enumerate() {
-        let ends = p.wait().starts.windows(2).map(|w| (w[0], w[1].at));
-        runs.extend(ends.map(|(begin, end)| Run { begin, part, end }));
+        let (starts, records) = (&p.wait().starts, p.wait().records.len());
+        let ends = starts.iter().skip(1).map(|s| s.at).chain([records]);
+        let bounds = starts.iter().copied().zip(ends);
+        runs.extend(bounds.map(|(begin, end)| Run { begin, part, end }));
         // Each run is one reader of its part: the last one placed gives the part back.
         // (Relaxed: the hand-off orders this store before every decrement in pass 2.)
-        readers[part].store(p.wait().starts.len() - 1, Relaxed);
+        readers[part].store(starts.len(), Relaxed);
     }
     // By hour only: the order of an hour's runs changes no output byte (each run reads
     // its own escapes; a group's values are counted or selected, in any order).
@@ -416,7 +419,7 @@ fn merge(parts: &[OnceLock<Part>], readers: &[AtomicUsize], output: &File) -> Me
     // Kept as an address: a raw pointer could not be shared by the threads,
     // which each write only their own hours' bytes.
     let (read_write, fd) = (PROT_READ | PROT_WRITE, output.as_raw_fd());
-    let file = map(std::ptr::null_mut(), bound, read_write, MAP_SHARED, fd) as usize;
+    let file = map(ptr::null_mut(), bound, read_write, MAP_SHARED, fd) as usize;
     let lens = hours.iter().map(|_| OnceLock::new()).collect();
     (hours, file, lens)
 }
@@ -441,12 +444,11 @@ unsafe fn names() -> Vec<(usize, &'static [u8])> {
     // record holds the spare, so its group is empty in every hour and prints no line.
     // SAFETY: the parse is over (the caller's contract, see # Safety): each id up to
     // `count` has its name written, and nothing writes the table any more.
-    let count = TABLE.count.load(Relaxed);
-    let name = |id: usize| unsafe { &**TABLE.names[id].get() };
+    let entry = |id: usize| (id, unsafe { &**TABLE.names[id].get() });
     // SAFETY: as above, for the keys. A Key's first 32 bytes, read as two
     // [u8; 16], are plain bytes: any value is valid, and their alignment is 1.
     let key = |id: usize| unsafe { *TABLE.keys[id].get().cast::<[[u8; 16]; 2]>() };
-    let mut endpoints: Vec<_> = (1..=count).map(|id| (id, name(id))).collect();
+    let mut endpoints: Vec<_> = (1..=TABLE.count.load(Relaxed)).map(entry).collect();
     endpoints.sort_unstable_by_key(|&(id, name)| (key(id).map(u128::from_be_bytes), name));
     endpoints
 }
@@ -471,7 +473,7 @@ fn line_len(name: &[u8], stat: &Stats) -> usize {
 /// copied. (Put together in a stack buffer and copied, the copy's wide loads would wait
 /// for the buffer's byte stores, a store-forwarding stall a line; the replica measured
 /// the same speed either way, and this one is 11 lines shorter: PERF.md, step 50.)
-fn write(head: &[u8; 16], name: &[u8], stat: Stats, out: &mut [u8], end: usize) -> usize {
+fn write(head: &[u8], name: &[u8], stat: Stats, out: &mut [u8], end: usize) -> usize {
     let mut at = end - 1;
     out[at] = b'\n';
     for mut value in stat.into_iter().rev() {
@@ -487,11 +489,9 @@ fn write(head: &[u8; 16], name: &[u8], stat: Stats, out: &mut [u8], end: usize) 
         at -= 2 + (value >= 10) as usize;
         out[at] = b' ';
     }
-    // The 20-byte label (the hour key's 13 bytes "YYYY-MM-DDTHH", then ":00:00Z"), its
-    // space, then the name.
+    // The head (the 20-byte label and its space: LABEL bytes), then the name.
     at -= LABEL + name.len();
-    out[at..at + 13].copy_from_slice(&head[..13]);
-    out[at + 13..at + LABEL].copy_from_slice(b":00:00Z ");
+    out[at..at + LABEL].copy_from_slice(head);
     out[at + LABEL..at + LABEL + name.len()].copy_from_slice(name);
     at
 }
@@ -503,7 +503,7 @@ static PAIRS: &[u8; 200] = b"000102030405060708091011121314151617181920212223242
 
 /// One thread's parse of its slice: one record per line, in file order (see
 /// ENDPOINT_SHIFT); the latencies of 7 or more digits, in the same order; and where
-/// each run of lines in one hour starts, then an end marker.
+/// each run of lines in one hour starts.
 /// (`repr(C)` keeps this field order: in the compiler's own, records last, the
 /// worker compiled to other registers, the parse loop included.)
 #[repr(C)]
@@ -515,8 +515,7 @@ struct Part {
 
 /// Where a run of a part's lines in one hour starts: its hour key (the timestamp's
 /// first 13 bytes "YYYY-MM-DDTHH", read as a big-endian number), the index of its
-/// first record (`at`) and of its first escape. A part's end marker, after its last
-/// run, has the key u128::MAX and the part's numbers of records and escapes.
+/// first record (`at`) and of its first escape.
 #[derive(Clone, Copy)]
 struct Start {
     key: u128,
@@ -525,7 +524,8 @@ struct Start {
 }
 
 /// A run of one part's records in one hour: where it begins, the part, and the end
-/// of its records (the part's next start). Its record count is `end - begin.at`.
+/// of its records (the part's next start, or the part's end for its last run). Its
+/// record count is `end - begin.at`.
 struct Run {
     begin: Start,
     part: usize,
@@ -566,8 +566,6 @@ unsafe fn parse(chunks: [&[u8]; 2], free: &mut &'static mut [u32]) -> [Part; 2] 
     let mut record = start;
     let (mut last, mut escapes, mut runs) = ([u64::MAX; 2], [vec![], vec![]], [vec![], vec![]]);
     // (u64::MAX is not 8 ASCII bytes, so each slice's first line starts a run.)
-    // SAFETY: AVX2 is enabled for this build.
-    let space = unsafe { _mm256_set1_epi8(b' ' as i8) };
     // Parses slice k's next line into one record, if there is one.
     // SAFETY: whatever the bytes, every load starts at a line start below its
     // slice's end and ends within PAD (256) bytes of it, which the caller makes
@@ -608,7 +606,7 @@ unsafe fn parse(chunks: [&[u8]; 2], free: &mut &'static mut [u32]) -> [Part; 2] 
         // endpoint: 6.6% of seed 1's lines end past it, against 7.6%. The endpoint
         // starts one byte after the method's space.
         let load = |p: *const u8| _mm256_loadu_si256(p.cast());
-        let window = eq_mask(load(line.add(31)), space) | eq_mask(load(line.add(63)), space) << 32;
+        let window = eq_mask(load(line.add(31)), SPACE) | eq_mask(load(line.add(63)), SPACE) << 32;
         let first = window.trailing_zeros() as usize;
         let from = line.add(32 + first);
         // The window without its lowest bit: its lowest bit is now the second space
@@ -657,10 +655,6 @@ unsafe fn parse(chunks: [&[u8]; 2], free: &mut &'static mut [u32]) -> [Part; 2] 
     let lines = [0, 1].map(|k| unsafe { record[k].offset_from_unsigned(start[k]) });
     let (second, rest) = second.split_at_mut(lines[1]);
     *free = rest;
-    for k in 0..2 {
-        let (key, at, escape) = (u128::MAX, lines[k], escapes[k].len());
-        runs[k].push(Start { key, at, escape }); // the end markers
-    }
     // Each slice's escapes (e0, e1) and run starts (s0, s1), moved into its Part. (Built
     // with `[0, 1].map` instead, the worker compiled differently under the profile.)
     let ([e0, e1], [s0, s1]) = (escapes, runs);
@@ -699,6 +693,11 @@ static DIGITS: ([i8; 72], [i16; 36]) = (
 /// An endpoint's identity: its bytes (at most 125), a space, then zeros to 128 bytes.
 /// No endpoint byte is a space or zero, so equal keys mean equal endpoints.
 type Key = [__m256i; 4];
+
+/// 32 spaces: compared with a line's bytes, they give the space masks of `parse` and
+/// `Interner::id`.
+// SAFETY: any 32 bytes are a valid `__m256i`.
+const SPACE: __m256i = unsafe { std::mem::transmute([b' '; 32]) };
 
 /// `vpcmpeqb` then `vpmovmskb`: bit i of the mask is set where byte i of `a` equals
 /// byte i of `b`.
@@ -813,10 +812,9 @@ impl Interner {
         unsafe {
             let load = |p: *const u8| _mm256_loadu_si256(p.cast());
             let line: Key = std::array::from_fn(|i| load(from.add(32 * i)));
-            let space = _mm256_set1_epi8(b' ' as i8);
             // The space mask built from two 64-bit halves: as one u128 of the four
             // masks, it compiled to `vpinsrd` inserts on the path of every later step.
-            let half = |i| (eq_mask(line[i], space) | eq_mask(line[i + 1], space) << 32) as u128;
+            let half = |i| (eq_mask(line[i], SPACE) | eq_mask(line[i + 1], SPACE) << 32) as u128;
             // 128 if there is none: a 125-byte endpoint's space is in the 128 bytes.
             let len = (half(2) << 64 | half(0)).trailing_zeros() as usize;
             // Tripwire for the spec's endpoint length: a file that breaks it stops here.
@@ -840,8 +838,7 @@ impl Interner {
                     slot => (slot >> ENDPOINT_SHIFT) as usize,
                 };
                 // The keys are equal when all 128 bytes are: each mask has its 32 bits set.
-                let known = &*self.keys[id].get();
-                let same = |i: usize| eq_mask(known[i], key[i]);
+                let same = |i: usize| eq_mask((*self.keys[id].get())[i], key[i]);
                 if same(0) & same(1) & same(2) & same(3) == 0xFFFF_FFFF {
                     return ((id as u32) << ENDPOINT_SHIFT, len);
                 }
