@@ -548,8 +548,7 @@ impl Answers {
         // SAFETY: AVX2 is enabled for the whole build.
         let has_hits = unsafe { _mm256_testz_si256(hits, hits) } == 0;
         if self.state[answer as usize] >> SUM_BITS >= FIRST_IDS {
-            let (n, positions) = count_positions(hits);
-            self.state[answer as usize] += n << SUM_BITS | (n * base as u64 + positions);
+            self.state[answer as usize] += count_positions(hits, base);
         } else if has_hits {
             // Still logging first ids: a word at a time.
             // SAFETY: __m256i and [u64; 4] have the same size, and any bits are valid.
@@ -560,13 +559,12 @@ impl Answers {
     }
 }
 
-/// The number of set bits in `v`, and the sum of their positions, from tables of
-/// the 4-bit nibbles: the nibble at bits 4m..4m + 4 adds 4m per set bit, plus its
-/// own bit positions.
-fn count_positions(v: __m256i) -> (u64, u64) {
-    // SAFETY: AVX2 is enabled for the whole build; the loads read the 16-byte
-    // tables and the 32 bytes of EIGHT_B; __m256i and [u32; 8] have the same size,
-    // and any bits are valid.
+/// The state increment of the set bits of `v`, bit i for document `base + i`:
+/// their number << SUM_BITS, plus the sum of their ids. Per 64-bit word, psadbw
+/// adds up its bytes' counts and their bits' positions in the byte (from tables of
+/// the 4-bit nibbles), and the byte's place in the word times its count.
+fn count_positions(v: __m256i, base: u32) -> u64 {
+    // SAFETY: AVX2 is enabled for the whole build; the loads read the 16-byte tables.
     unsafe {
         let table = |t: &[u8; 16]| _mm256_broadcastsi128_si256(_mm_loadu_si128(t.as_ptr().cast()));
         // `pop`: the set bits of a nibble.
@@ -579,27 +577,23 @@ fn count_positions(v: __m256i) -> (u64, u64) {
         let hi = _mm256_and_si256(hi, nibble);
         let count = _mm256_add_epi8(_mm256_shuffle_epi8(pop, lo), _mm256_shuffle_epi8(pop, hi));
         let own = _mm256_add_epi8(_mm256_shuffle_epi8(low, lo), _mm256_shuffle_epi8(high, hi));
-        // Byte b adds 8b per set bit: 16-bit sums of byte pairs, then 32-bit sums,
-        // with the count added at bit 16 (the position sum is below 2^15).
-        // maddubs reads its first operand as unsigned bytes, 0 to 248 here.
-        let eight_b = _mm256_loadu_si256(EIGHT_B.as_ptr().cast());
-        let (ones8, ones16) = (_mm256_set1_epi8(1), _mm256_set1_epi16(1));
-        let pos = _mm256_maddubs_epi16(eight_b, count);
-        let pos = _mm256_add_epi16(pos, _mm256_maddubs_epi16(own, ones8));
-        let counts = _mm256_madd_epi16(_mm256_maddubs_epi16(count, ones8), ones16);
-        let pos = _mm256_madd_epi16(pos, ones16);
-        let sums = _mm256_add_epi32(pos, _mm256_slli_epi32::<16>(counts));
-        // The eight 32-bit sums added up (they cannot overflow 32 bits).
-        let total = std::mem::transmute::<_, [u32; 8]>(sums).iter().sum::<u32>() as u64;
-        (total >> 16, total & 0xFFFF)
+        // Per word: its count n, and its bits' positions in it: own, plus 8 per set
+        // bit times the byte's place in the word (maddubs pairs those: at most 104).
+        let sum = |x| _mm256_sad_epu8(x, _mm256_setzero_si256());
+        let n = sum(count);
+        let places = _mm256_maddubs_epi16(count, _mm256_set1_epi64x(0x0706_0504_0302_0100));
+        let pos = _mm256_add_epi64(sum(own), _mm256_slli_epi64::<3>(sum(places)));
+        // Word w's documents start at base + 64w: n << SUM_BITS, n (base + 64w) and
+        // pos (vpmuludq multiplies the low 32 bits: n <= 64, and ids are below 2^20).
+        let firsts = _mm256_set_epi64x(192, 128, 64, 0);
+        let firsts = _mm256_add_epi64(_mm256_set1_epi64x(base as i64), firsts);
+        let inc = _mm256_add_epi64(_mm256_slli_epi64::<{ SUM_BITS as i32 }>(n), pos);
+        let inc = _mm256_add_epi64(inc, _mm256_mul_epu32(n, firsts));
+        let half = _mm256_extracti128_si256::<1>(inc);
+        let half = _mm_add_epi64(_mm256_castsi256_si128(inc), half);
+        _mm_cvtsi128_si64(_mm_add_epi64(half, _mm_unpackhi_epi64(half, half))) as u64
     }
 }
-
-/// 8b at byte b.
-static EIGHT_B: [u8; 32] = [
-    0, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168,
-    176, 184, 192, 200, 208, 216, 224, 232, 240, 248,
-];
 
 /// The masks of the 64 bytes from `at`: bit i of the first is set when byte
 /// `at + i` is a token byte ([A-Za-z0-9]) before `end`, of the second when it is LF.
