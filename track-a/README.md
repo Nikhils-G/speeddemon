@@ -107,6 +107,8 @@ The program has five parts. Each one exists because of one bottleneck.
 | Spinning on the merge's hand-off | +0.52 to +1.18% | sleeping on the `OnceLock` |
 | The hour's line head built once and copied whole | replica +0.23% for −1 line (step 76, taken out in step 77) | the key's 13 bytes and `:00:00Z ` copied apart (technique 10) |
 | A third 32-byte window, so that endpoints of up to about 93 bytes stay inline | not built: a probe that ran the cold lookup twice per long-way line put the whole cold path at about 1.7% of T | the cold path (technique 5) |
+| Hours closed during the parse, two designs, each with an exact fallback for out-of-order lines | replica +2.5% T at a highest of 20 peaks of 17.76 MB against 19.05, S 556; +4.2% T, +1.7 MB, S 522: about −0.9 and −1.5 points net | every hour after the whole parse (technique 11) |
+| LLVM flags `-x86-cmov-converter=false`, `-inline-threshold=500`, `-unroll-threshold=600` | replica: each within the spread between PGO builds of one source | the Dockerfile's flags (technique 13) |
 | `MADV_POPULATE_WRITE` per hour; non-temporal record stores | replica +3.30%; +0.71% | plain page faults and stores |
 
 **Parse (pass 1).**
@@ -722,13 +724,17 @@ Evidence, all on the binary built by this directory's Dockerfile:
   CPUs, with repeats and a harness-like container run: 2,224 runs, all byte-identical, no stderr.
 - **Steps 72 to 74**: the same gate on every kept build (250 malformed logs: 9 stop at a
   tripwire, none crashes).
-- **Steps 76 and 77** (step 77 is the submitted code), each on two exact Dockerfile builds: the
+- **Steps 76 and 77**, each on two exact Dockerfile builds: the
   same gate (250 malformed logs: 9 stop at a tripwire, none crashes). Both versions' builds ran 43
   seeds never used before (tiny 601-620, sample 631-645, full 651-658) on the laptop at 1, 3 and 8
   CPUs, 129 of 129 runs per build. Step 77's builds also ran 44 more (tiny 681-700, sample
   661-680, full 701-704) at 2, 4, 6, 7 and 8 CPUs, 220 of 220 per build, and the 20 tiny seeds on
   the replica at 12 and 20 threads, 40 of 40 per build: 87 new seeds and 698 laptop runs with no
   mismatch, no nonzero exit and nothing on stderr.
+- **Step 78** (the submitted code), on two PGO builds: the same gate (250 malformed
+  logs: 9 stop at a tripwire, none crashes; the new assert fires on none of them). Two logs built
+  for the assert, `spike` and `steady`, run on one E-core: step 77's build exits 139 (SIGSEGV) on
+  both, step 78's aborts with 134 and the message `requests.log: bad latency`.
 - **The id bound, measured.** Every seed has 1,842 endpoints, against 2,047 ids. With step 54's
   code up to 13 ids were lost in 20 runs of a seed; with steps 57 to 59, at most 1 id in 150 runs,
   and the bound is one per thread: at most 1,854 ids at 12 threads.
@@ -743,6 +749,8 @@ Errors are panics with a message, and the build aborts on panic, so the exit sta
 - a missing log, a summary that cannot be created or sized, or a failed `mmap`;
 - an endpoint over 125 bytes, or more than 2,047 endpoint ids;
 - records past their room;
+- an hour whose endpoint counts sum past its record count, from a malformed latency
+  (`requests.log: bad latency`, step 78);
 - an hour whose written length differs from its computed one.
 
 Ignored on purpose, as each only costs memory or time and never changes a byte: a failed `prctl`

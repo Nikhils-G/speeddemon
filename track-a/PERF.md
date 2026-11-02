@@ -144,9 +144,51 @@ file mean ours, among team SALAAR's runs.
 | 74 | 0098691 (second run from 480db54, third from 4f6e8b0, Track A unchanged) | ar-5: step 73 with the Dockerfile's `RUN` on three lines, the same commands (replica −0.10, −0.00, −0.05 and −0.00% against step 73: equal). Submitted, with step 75's comments, until step 76. Its first run was our best until step 75 (the same code); the second was slow, with B slow too; the third was slow, with Track A alone slow in that dispatch (B ran 0.067543 s) | run-977a4610bb91, run-ab14a5bbbaa8, run-870d15780bef | 0.015606, 0.020882, 0.017309 | 18.23, 18.24, 18.71 | 441 | 87.06, 83.90, 85.82 |
 | 75 | cbc99fd (later runs from f10f4b7, 60f559f, 4b997e4, 798ff2d, 9ccf3cb and 9514121, Track A unchanged) | Comments only: the comments brought up to date with the code; the token stream is step 74's. Its third run was our best Track A run until step 77 and is the fastest Track A time; the seventh was slow, in a DISTURBED dispatch (B 0.147443 s) | run-53c59d1f073c, run-f23596461c7b, run-b6e32914afe1, run-095b20a38331, run-caaee94d9976, run-546f6f8bea92, run-af63fd2ceb52 | 0.015463, 0.015818, 0.015462, 0.016568, 0.015546, 0.015581, 0.018259 | 18.36, 18.38, 18.23, 18.86, 18.75, 18.62, 18.4 | 441 | 87.13, 86.88, 87.16, 86.26, 86.98, 86.99, 85.32 |
 | 76 | 718f0af | awf-s-2: six lines cut: one `SPACE` constant for both space masks; no end-marker start per slice, the merge ending each part's last run at the part's record count; two locals folded into closures in `names` and `Interner::id`; the hour's 21-byte line head built once and copied whole (replica +0.18% against step 75, the mean of eight pairings of four PGO builds a side, and +0.24% over twelve pairings of four other builds a side: at the edge of the ±0.4% that one 201-pair run spreads between PGO builds of one source). Its one run was slow, with Track A alone slow in that dispatch: B and C set their best runs in it | run-57937b939903 | 0.018512 | 18.57 | 435 | 85.17 |
-| 77 | 008c49b (second run from 1a5a6ba, Track A unchanged) | awf-final: step 76 without its line-head hunk, so the hour key's 13 bytes and `:00:00Z ` are copied apart again, as in step 75 (replica −0.23% against step 76, four of four direct pairings; +0.04% against step 75, the mean of eight pairings, and +0.05% on holdout seed 99: step 75's speed in five fewer lines). **The submitted code**. Its second run is our best Track A run, though B ran slow in that dispatch (0.086307 s). Both runs lie within the 0.015462 to 0.016568 s of step 75's six normal runs: the board cannot separate it from step 75 | run-eb078ed3a0a7, run-0b59d8b4b145 | 0.015816, 0.015546 | 18.73, 18.04 | 436 | 86.84, 87.19 |
+| 77 | 008c49b (second run from 1a5a6ba, Track A unchanged) | awf-final: step 76 without its line-head hunk, so the hour key's 13 bytes and `:00:00Z ` are copied apart again, as in step 75 (replica −0.23% against step 76, four of four direct pairings; +0.04% against step 75, the mean of eight pairings, and +0.05% on holdout seed 99: step 75's speed in five fewer lines). Submitted until step 78. Its second run is our best Track A run, though B ran slow in that dispatch (0.086307 s). Both runs lie within the 0.015462 to 0.016568 s of step 75's six normal runs: the board cannot separate it from step 75 | run-eb078ed3a0a7, run-0b59d8b4b145 | 0.015816, 0.015546 | 18.73, 18.04 | 436 | 86.84, 87.19 |
+| 78 | 631ec7f (later runs from 4eaa885, 45920b7, 4c101fb, 3c2e860, 285539d and ab83410, Track A unchanged) | a-judge-code: step 77 with one `assert_eq!` after pass 2's prefix sum, so that a malformed latency stops with a message instead of a segfault (exit 134 against 139 on two logs built for it); the `compile_error!` guard checks BMI2 as well as AVX2; review fixes in two SAFETY texts, two comments and the Dockerfile's `-align-loops` note (replica −0.05% against step 77, the mean of four pairings, where an A/A pairing of step 77's builds read +0.06%: the same speed). **The submitted code**. Its first and third runs lie within the normal runs of steps 75 and 77; the other five were slow: the second and seventh with B slow too (0.084688 and 0.079848 s), the fourth and fifth with B at its normal speed (0.067005 and 0.067281 s), the sixth in a DISTURBED dispatch (B 0.119599 s) | run-a6a3de2bdaca, run-7ec1a7779d3f, run-1a7f895d269e, run-34a31f6fe454, run-16fa13a9f87a, run-6865a81880be, run-de92c8943b9f | 0.015946, 0.017015, 0.015777, 0.020219, 0.02239, 0.020461, 0.017747 | 18.44, 18.59, 18.35, 18.16, 18.48, 18.31, 18.42 | 437 | 86.81, 86.07, 86.95, 84.30, 83.11, 84.13, 85.65 |
 
-**The submitted code is step 77 (awf-final, 008c49b), S 436**: step 75's engine in five fewer
+**The submitted code is step 78 (a-judge-code, 631ec7f), S 437**: step 77 with one line added, an
+assert that turns a segfault on malformed latencies into a message, and review fixes in comments.
+Rust 427 → 428 lines; the Dockerfile's 9 are unchanged.
+- *The assert (+1).* After pass 2's prefix sum over an hour's endpoint counts,
+  `assert_eq!(sum as usize, size(hour), "requests.log: bad latency")`, once per hour (about 72 per
+  run). A latency of up to 6 bytes that are not all digits still takes the in-place 6-digit path,
+  and its value can spill into the record's id bits, giving an id above the endpoint count. That
+  id is not in `endpoints`, so its count is never taken back; the next hour on the same thread
+  starts with it, its prefix sum exceeds its record count, and the unchecked scatter store wrote
+  past `values`. Two logs built for it (`spike` and `steady`, two endpoints, run on one E-core so
+  that one thread takes two hours): step 77's build exits 139 (SIGSEGV) on both, step 78's
+  aborts with 134 and `requests.log: bad latency` on both.
+- *The guard.* The `compile_error!` needs BMI2 as well as AVX2: `find` and `id` use `bzhi`, so an
+  AVX2-only build would have compiled. On the box `target-cpu=native` enables both, so the machine
+  code does not change.
+- *Comments.* The scatter store's SAFETY text now rests on the assert (each cursor stays below
+  `sum`, which the assert holds to the hour's record count); `find`'s names both features the guard
+  checks; a note at the counts' take-back says which ids are never taken back; the gate's comment
+  cites the expected highest of 5 peaks, 0.84 MB lower; the Dockerfile's `-align-loops` note says
+  that no effect was measured on A's board runs and that it stays because C's best run uses it.
+- *Measured* (ab.sh, 201 pairs, two PGO builds a side). Full seed 1: −0.25, +0.12, −0.24 and
+  +0.18% (86 to 115 of 201 won), a mean of −0.05%, where an A/A pairing of step 77's two builds
+  read +0.06%; holdout seed 99: −0.06 and −0.07%. Memory (mem.sh, highest of 10 peaks per build):
+  18.56 and 18.45 MB, against 18.56 and 18.44 MB for step 77: equal. The assert costs no
+  measurable time, and S +1 costs about 0.007 points.
+- *Why exact.* On a well-formed hour the sum is its record count: `size(hour)` counts the hour's
+  records from its runs, and each record adds one to its endpoint's count. Both builds passed the
+  gate (the seed-1 hash at 1, 3, 7 and 12 CPUs, sample seeds 1-4, holdout seed 99, the empty
+  input, and 250 malformed logs: 9 stop at a tripwire, none crashes, the same as step 77; the new
+  assert fires on none of them).
+- *Board.* Seven runs, all of step 78's code (the later pushes changed B and C only). Five of the
+  seven dispatches were disturbed: the unchanged binary ran 17.0 to 22.4 ms in them
+  (run-7ec1a7779d3f, run-34a31f6fe454, run-16fa13a9f87a, run-6865a81880be, run-de92c8943b9f),
+  against 0.015946 s (run-a6a3de2bdaca, 18.44 MB, 86.81 points) and 0.015777 s
+  (run-1a7f895d269e, 18.35 MB, 86.95 points) in the other two. That is the box, not the code: the
+  replica's paired runs put step 78 at −0.05% against step 77, inside the A/A pairing's +0.06%.
+  The two normal runs lie within the 0.015462 to 0.016568 s of step 75's six normal runs and next
+  to step 77's 0.015546 and 0.015816 s: the board cannot separate step 78 from step 77. Its best,
+  86.95 points, is 0.24 below step 77's run-0b59d8b4b145 (87.19), with a T 1.5% higher and an M
+  0.31 MB higher, each inside one binary's spread.
+
+**Step 77 (awf-final, 008c49b), S 436, submitted until step 78**: step 75's engine in five fewer
 lines, cut in step 76 (awf-s-2, 718f0af, S 435) and given one back in step 77, at step 75's speed.
 Rust 432 → 427 lines; the Dockerfile's 9 are unchanged.
 - *Step 76, six cuts, S 441 → 435.*
@@ -971,6 +1013,10 @@ dispatches where B's unchanged code ran 0.1209-0.1312 s.
   0.08%. Without that hunk, step 77 runs at step 75's speed (+0.04%). A probe also bounded the
   cold lookup: run twice per long-way line, it cost about 1.7%, so no wider inline window can gain
   more than that ("Experiments").
+- **Step 78: a clean fuzzing record is not a proof.** 250 mutated logs never crashed step 77's
+  build, but a review of one SAFETY text found an input that did: a short latency that is not all
+  digits spills into the id bits, and its count, never taken back, overflows the next hour's
+  scatter. One assert per hour turns the segfault into a message at no measurable cost (−0.05%).
 
 Pass 2 per thread (replica, profile and phase timers, steps 56-57's code): counting 0.41 ms,
 placing the values 1.11 ms (bound by L1 store misses: 7.8 cycles per record per thread),
@@ -1287,7 +1333,6 @@ The earlier probes behind step 12 used 0.25 ms units; their run IDs are not in o
 | 3-byte records that keep the 11-bit id, with 12 bits of latency | Not built: on seed 1, 26.9% of latencies fit 12 bits (65.6% fit 14, 85.4% 16 and 98.8% 20), so 73% of lines would escape |
 | Records grouped by (part, hour within the part, endpoint) during the parse, 3 bytes each with 0.1% escapes | Not built. Our estimate: 9.3 MB of records and about 0.9 MB of sparse bucket directory, −2.2 MB at the merge and about −1.7 MB at the peak (+0.4 points), against a counting sort per part in the core-bound parse (+6 to 12 thread-ms, −0.3 to −0.7 points) and +60 to 80 lines (−0.45 to −0.6 points): net negative |
 | An exact two-level, variable-length latency code | Not built: a latency carries about 12 bits of entropy even given its endpoint, and variable-length records make the count and scatter loops a dependent chain (our estimate: about +1 ms) |
-| Hours computed during the parse, so that not every record is held at once | Not possible in spec: the disorder is unbounded, so no hour is complete before the last part is parsed |
 | The pending statistics in 20 bytes instead of 24 | Not built: about −0.15 MB |
 | Lines looked at and not cut (step 69 work): `map` inlined, the shape of `DIGITS`, the `File` options, `Part`'s literal | Not cut. Inlining `map` would save 4 lines but leave two raw `mmap` calls in its place |
 | The parse filling its two `Part`s in place: `#[derive(Default)]` on `Part`, the starts pushed into `parts[k]`, no `part` closure, −3 lines (steps 70 and 71 work) | Slower every time: in step 70's first batch +0.15% with it against +0.03% without it (one build), and on step 71 +0.34% and +0.45% against its builds (S 435). The worker's register allocation moves: in the objdump of a build without PGO, the parse loop has the same instructions on other registers and stack slots |
@@ -1319,6 +1364,9 @@ The earlier probes behind step 12 used 0.25 ms units; their run IDs are not in o
 | A third 32-byte window vector, so that endpoints of up to about 93 bytes stay inline (step 77 work) | Not built. A profile of step 75's code (perf record, 3 runs) put `Interner::id` at 6.8 to 8.5% of the cycles, about 70% of its calls from lines whose endpoint ends past the window. A ceiling probe ran the cold lookup twice per long-way line (same output): +1.54, +1.82, +1.73 and +1.63% (34 to 42 of 201 won). So the whole cold path costs about 1.7% of T (0.27 ms) and the long endpoints' share at most about 1.2%, against about 8 more uops on every line, a 96-byte compare in `find` and about 10 more lines. Twice the slots, which halved the home-slot misses (about 15% of the calls), measured −0.07% (step 69 work, above) |
 | The merge's runs sorted by a stable sort (`sort_by_key`) instead of an unstable one, 0 lines (step 77 work) | Against step 77's builds: seed 1 −0.11% (16 pairings, −0.41 to +0.15%), holdout seed 99 −0.02% (8 pairings); against step 75's builds +0.05% and −0.01%. Memory equal (80 peaks a side, means 18.074 and 18.133 MB). A seed-1 effect (an earlier round: −0.25% on seed 1, −0.04% on holdout), about nothing on an unseen seed: not taken |
 | LLVM's ext-TSP block layout, `-C llvm-args=-enable-ext-tsp-block-placement`, on the PGO build (step 77 work) | Slower: against step 77's builds, +0.20% on seed 1 (eight pairings, −0.26 to +0.73%) and +0.02% on holdout seed 99 |
+| Hours closed during the parse, so that not every record is held at once: a first design, with an exact fallback for out-of-order lines (a-stream, step 78 work) | Exact, but slower. Its best variant ran +2.5% T, for a highest of 20 peaks of 17.76 MB against 19.05 MB, at S 556: about −0.9 points net. Its bare schedule (variant s1) ran +3.4% T at S 524: about −0.7 points |
+| Hours closed during the parse, a second design (a-stream2, step 78 work): 8 rounds of one pair of slices a thread; the thread that parses a round's last pair closes, under a mutex, every run below the second-highest hour seen so far, and closed hours go to pass 2 between pairs; if a later line falls below a closed hour, the whole run is redone in one round | +4.20 and +4.17% (14 and 25 of 201 won, two PGO builds a side), about 1.7 MB more memory (20 peaks a build: 19.32 to 20.93 MB against 17.64 to 18.95 MB), S 522: about −1.5 points net. The 8 rounds of slices alone cost +3.21%. The peak moves to the end of the parse, where 12 values buffers, the last rounds' records and most of the output coexist: with a values buffer per thread, the output and the buffers alone come within 1 to 1.5 MB of today's peak. Both designs were byte-exact on 210 adversarial and 468 unseen-seed runs |
+| The LLVM flags `-x86-cmov-converter=false`, `-inline-threshold=500` and `-unroll-threshold=600`, each alone on the PGO build (step 78 work) | Each within the spread between PGO builds of one source on the replica: no gain |
 
 ## Lessons
 
