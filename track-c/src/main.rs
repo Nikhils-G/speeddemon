@@ -85,19 +85,19 @@ const REGION_CHUNKS: usize = 64;
 /// records that start at least this far before the end; the walker takes the rest.
 const FAST_MARGIN: usize = 256;
 
-/// A group's columns, in the order of the output line (spec section 4), amounts in
-/// cents. name_bytes and note_bytes share the last one, `BYTES`, as
+/// A group's columns, amounts in cents: the 4 summed ones first, so that `parse_run`
+/// adds them at once. name_bytes and note_bytes share one, `BYTES`, as
 /// name_bytes << 32 | note_bytes: each is below 2^31 (spec section 3).
 type Totals = [i64; 7];
 const COUNT: usize = 0;
 const ID_SUM: usize = 1;
 const AMOUNT_SUM: usize = 2;
-const AMOUNT_MIN: usize = 3;
-const AMOUNT_MAX: usize = 4;
-const NAMES_DISTINCT: usize = 5;
-const BYTES: usize = 6;
+const BYTES: usize = 3;
+const AMOUNT_MIN: usize = 4;
+const AMOUNT_MAX: usize = 5;
+const NAMES_DISTINCT: usize = 6;
 /// No records yet: the min and the max start at the far ends.
-const EMPTY: Totals = [0, 0, 0, i64::MAX, i64::MIN, 0, 0];
+const EMPTY: Totals = [0, 0, 0, 0, i64::MAX, i64::MIN, 0];
 
 /// One partition's names: an open-addressing table of 32-bit keys (0 = empty) in
 /// buckets of 8 slots, at most 5/8 full so that a lookup is nearly always one
@@ -681,7 +681,7 @@ fn write_output(dir: &str, totals: &[Totals; GROUPS], countries: &[Vec<u8>]) {
     // Writing into a String cannot fail, so the `write!` results are unwrapped.
     let mut out = String::new();
     for (key, group) in keys.into_iter().filter(|&(_, g)| totals[g][COUNT] > 0) {
-        let [count, ids, sum, min, max, names, bytes] = totals[group];
+        let [count, ids, sum, bytes, min, max, names] = totals[group];
         write!(out, "{} {count} {ids}", String::from_utf8_lossy(key)).unwrap();
         // Money: cents with a sign and two decimals ("-0.05", "0.00").
         for cents in [sum, min, max] {
@@ -868,9 +868,15 @@ fn parse_run(
         // SAFETY: `record` clamped region_id into the table.
         let group = unsafe { group_of.get_unchecked(region_id as usize) }.load(Relaxed);
         let t = &mut totals[group as usize];
-        (t[COUNT], t[ID_SUM], t[AMOUNT_SUM]) =
-            (t[COUNT] + 1, t[ID_SUM] + id as i64, t[AMOUNT_SUM] + cents);
-        t[BYTES] += bytes as i64;
+        // The 4 summed columns in one 256-bit add: left to itself, LLVM added two of them
+        // with one 128-bit add and the other two one at a time.
+        // SAFETY: AVX2 is enabled for this build (see the compile_error); `t` has 7
+        // columns, so 4 are in bounds.
+        unsafe {
+            let p = t.as_mut_ptr().cast();
+            let add = _mm256_set_epi64x(bytes as i64, cents, id as i64, 1);
+            _mm256_storeu_si256(p, _mm256_add_epi64(_mm256_loadu_si256(p), add));
+        }
         // Branches, not cmov and a store: a new min or max is rare.
         if cents < t[AMOUNT_MIN] {
             t[AMOUNT_MIN] = cents;
